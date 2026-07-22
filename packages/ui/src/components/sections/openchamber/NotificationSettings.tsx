@@ -1,20 +1,19 @@
 import React from 'react';
-import { RiInformationLine, RiRestartLine } from '@remixicon/react';
 import { useUIStore } from '@/stores/useUIStore';
-import { useConfigStore } from '@/stores/useConfigStore';
 import { isDesktopShell, isVSCodeRuntime } from '@/lib/desktop';
-import { useDeviceInfo } from '@/lib/device';
-import { updateDesktopSettings } from '@/lib/persistence';
-import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from '@/components/ui';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
 import { Input } from '@/components/ui/input';
-import { NumberInput } from '@/components/ui/number-input';
 import { Button } from '@/components/ui/button';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { cn } from '@/lib/utils';
+import { getClientPlatform } from '@/lib/platform';
 import { useI18n } from '@/lib/i18n';
+import {
+  SettingsSection,
+  SettingsTwoColumn,
+  SettingsCheckboxRow,
+  SettingsGroupTitle,
+  SETTINGS_OPTION_STACK_CLASS,
+} from '@/components/sections/shared/SettingsSection';
 
 const DEFAULT_NOTIFICATION_TEMPLATES = {
   completion: {
@@ -42,19 +41,19 @@ const TEMPLATE_EVENT_LABEL_KEYS = {
   question: 'settings.notifications.page.template.event.question',
 } as const satisfies Record<NotificationTemplateEvent, string>;
 
-const UTILITY_PREFERRED_MODEL_ID = 'big-pickle';
-const UTILITY_NOT_SELECTED_VALUE = '__not_selected__';
-
-const DEFAULT_SUMMARY_THRESHOLD = 200;
-const DEFAULT_SUMMARY_LENGTH = 100;
-const DEFAULT_MAX_LAST_MESSAGE_LENGTH = 250;
-
 export const NotificationSettings: React.FC = () => {
   const { t } = useI18n();
-  const { isMobile } = useDeviceInfo();
   const isDesktop = React.useMemo(() => isDesktopShell(), []);
   const isVSCode = React.useMemo(() => isVSCodeRuntime(), []);
-  const isBrowser = !isDesktop && !isVSCode;
+  // The native Capacitor app runs in a WKWebView with no Web Notification API; it has its
+  // own native (Local Notifications) permission. Treat it as a native runtime, not a
+  // browser, so the toggle isn't gated on Notification.permission (which is stuck there).
+  const isNativeApp = React.useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    const capacitor = (window as typeof window & { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
+    return capacitor?.isNativePlatform?.() === true || window.location.protocol === 'capacitor:';
+  }, []);
+  const isBrowser = !isDesktop && !isVSCode && !isNativeApp;
   const nativeNotificationsEnabled = useUIStore(state => state.nativeNotificationsEnabled);
   const setNativeNotificationsEnabled = useUIStore(state => state.setNativeNotificationsEnabled);
   const notificationMode = useUIStore(state => state.notificationMode);
@@ -69,92 +68,11 @@ export const NotificationSettings: React.FC = () => {
   const setNotifyOnQuestion = useUIStore(state => state.setNotifyOnQuestion);
   const notificationTemplates = useUIStore(state => state.notificationTemplates);
   const setNotificationTemplates = useUIStore(state => state.setNotificationTemplates);
-  const summarizeLastMessage = useUIStore(state => state.summarizeLastMessage);
-  const setSummarizeLastMessage = useUIStore(state => state.setSummarizeLastMessage);
-  const summaryThreshold = useUIStore(state => state.summaryThreshold);
-  const setSummaryThreshold = useUIStore(state => state.setSummaryThreshold);
-  const summaryLength = useUIStore(state => state.summaryLength);
-  const setSummaryLength = useUIStore(state => state.setSummaryLength);
-  const maxLastMessageLength = useUIStore(state => state.maxLastMessageLength);
-  const setMaxLastMessageLength = useUIStore(state => state.setMaxLastMessageLength);
-  const settingsZenModel = useConfigStore((state) => state.settingsZenModel);
-  const setSettingsZenModel = useConfigStore((state) => state.setSettingsZenModel);
 
   const [notificationPermission, setNotificationPermission] = React.useState<NotificationPermission>('default');
   const [pushSupported, setPushSupported] = React.useState(false);
   const [pushSubscribed, setPushSubscribed] = React.useState(false);
   const [pushBusy, setPushBusy] = React.useState(false);
-  const [fetchedZenModels, setFetchedZenModels] = React.useState<Array<{ id: string; name: string }>>([]);
-
-  React.useEffect(() => {
-    const controller = new AbortController();
-    void fetch('/api/zen/models', {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      signal: controller.signal,
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          return [] as Array<{ id: string; name: string }>;
-        }
-        const payload = await response.json().catch(() => ({}));
-        const models = Array.isArray(payload?.models) ? payload.models : [];
-        return models
-          .map((entry: unknown) => {
-            const id = typeof (entry as { id?: unknown })?.id === 'string'
-              ? (entry as { id: string }).id.trim()
-              : '';
-            if (!id) {
-              return null;
-            }
-            return { id, name: id };
-          })
-          .filter((entry: { id: string; name: string } | null): entry is { id: string; name: string } => entry !== null);
-      })
-      .then((models) => {
-        setFetchedZenModels(models);
-      })
-      .catch((error) => {
-        if (error?.name !== 'AbortError') {
-          console.warn('Failed to load zen utility models:', error);
-        }
-      });
-
-    return () => {
-      controller.abort();
-    };
-  }, []);
-
-  const utilityModelOptions = React.useMemo(() => {
-    return fetchedZenModels;
-  }, [fetchedZenModels]);
-
-  const utilitySelectedModelId = React.useMemo(() => {
-    if (settingsZenModel && utilityModelOptions.some((model) => model.id === settingsZenModel)) {
-      return settingsZenModel;
-    }
-    if (utilityModelOptions.some((model) => model.id === UTILITY_PREFERRED_MODEL_ID)) {
-      return UTILITY_PREFERRED_MODEL_ID;
-    }
-    return utilityModelOptions[0]?.id ?? '';
-  }, [settingsZenModel, utilityModelOptions]);
-
-  const handleUtilityModelChange = React.useCallback(
-    async (value: string) => {
-      const modelId = value === UTILITY_NOT_SELECTED_VALUE ? undefined : value;
-      setSettingsZenModel(modelId);
-      try {
-        await updateDesktopSettings({
-          zenModel: modelId ?? '',
-          gitProviderId: '',
-          gitModelId: '',
-        });
-      } catch (error) {
-        console.warn('Failed to save utility model setting:', error);
-      }
-    },
-    [setSettingsZenModel]
-  );
 
   React.useEffect(() => {
     if (!isBrowser) {
@@ -227,7 +145,7 @@ export const NotificationSettings: React.FC = () => {
     }
   };
 
-  const canShowNotifications = isDesktop || isVSCode || (isBrowser && typeof Notification !== 'undefined' && Notification.permission === 'granted');
+  const canShowNotifications = isDesktop || isVSCode || isNativeApp || (isBrowser && typeof Notification !== 'undefined' && Notification.permission === 'granted');
 
   const updateTemplate = (
     event: 'completion' | 'error' | 'question' | 'subtask',
@@ -479,6 +397,7 @@ export const NotificationSettings: React.FC = () => {
             auth: keys.auth,
           },
           origin: typeof window !== 'undefined' ? window.location.origin : undefined,
+          platform: getClientPlatform(),
         }),
         15000,
         'Push subscribe request timed out'
@@ -534,64 +453,40 @@ export const NotificationSettings: React.FC = () => {
   };
 
   return (
-    <div className="space-y-8">
-
-        {/* --- Global Delivery Settings --- */}
-        <div className="mb-8">
-          <div className="mb-1 px-1">
-              <h3 className="typography-ui-header font-medium text-foreground">
-                {t('settings.notifications.page.delivery.title')}
-              </h3>
-          </div>
-
-          <section className="px-2 pb-2 pt-0 space-y-0.5">
-            <div
-              className="group flex cursor-pointer items-center gap-2 py-1.5"
-              role="button"
-              tabIndex={0}
-              aria-pressed={nativeNotificationsEnabled && canShowNotifications}
-              onClick={() => {
-                void handleToggleChange(!(nativeNotificationsEnabled && canShowNotifications));
+    <>
+        <SettingsSection
+          settingsItem="notifications.delivery"
+          title={t('settings.notifications.page.delivery.title')}
+          divider={false}
+        >
+          <div className={SETTINGS_OPTION_STACK_CLASS}>
+            <SettingsCheckboxRow
+              checked={nativeNotificationsEnabled && canShowNotifications}
+              onChange={(checked) => {
+                void handleToggleChange(checked);
               }}
-              onKeyDown={(event) => {
-                if (event.key === ' ' || event.key === 'Enter') {
-                  event.preventDefault();
-                  void handleToggleChange(!(nativeNotificationsEnabled && canShowNotifications));
-                }
-              }}
-            >
-              <Checkbox
-                checked={nativeNotificationsEnabled && canShowNotifications}
-                onChange={(checked) => {
-                  void handleToggleChange(checked);
-                }}
-                ariaLabel={t('settings.notifications.page.delivery.enableAria')}
-              />
-              <span className="typography-ui-label text-foreground">{t('settings.notifications.page.delivery.enableLabel')}</span>
-            </div>
+              label={t('settings.notifications.page.delivery.enableLabel')}
+              info={
+                isBrowser
+                  ? t('settings.notifications.page.delivery.browserPermissionHint')
+                  : isVSCode
+                    ? t('settings.notifications.page.delivery.vscodeHint')
+                    : undefined
+              }
+              ariaLabel={t('settings.notifications.page.delivery.enableAria')}
+            />
 
-            {nativeNotificationsEnabled && canShowNotifications && (
+            {/* The native Capacitor app never notifies while focused (hard rule) and uses
+                generic, non-customizable text, so the "notify while focused" toggle and the
+                test button are hidden there. */}
+            {nativeNotificationsEnabled && canShowNotifications && !isNativeApp && (
               <>
-                <div
-                  className="group flex cursor-pointer items-center gap-2 py-1.5"
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={notificationMode === 'always'}
-                  onClick={() => setNotificationMode(notificationMode === 'always' ? 'hidden-only' : 'always')}
-                  onKeyDown={(event) => {
-                    if (event.key === ' ' || event.key === 'Enter') {
-                      event.preventDefault();
-                      setNotificationMode(notificationMode === 'always' ? 'hidden-only' : 'always');
-                    }
-                  }}
-                >
-                  <Checkbox
-                    checked={notificationMode === 'always'}
-                    onChange={(checked) => setNotificationMode(checked ? 'always' : 'hidden-only')}
-                    ariaLabel={t('settings.notifications.page.delivery.focusedAria')}
-                  />
-                  <span className="typography-ui-label text-foreground">{t('settings.notifications.page.delivery.focusedLabel')}</span>
-                </div>
+                <SettingsCheckboxRow
+                  checked={notificationMode === 'always'}
+                  onChange={(checked) => setNotificationMode(checked ? 'always' : 'hidden-only')}
+                  label={t('settings.notifications.page.delivery.focusedLabel')}
+                  ariaLabel={t('settings.notifications.page.delivery.focusedAria')}
+                />
 
                 <div className="py-2">
                   <Button
@@ -605,13 +500,10 @@ export const NotificationSettings: React.FC = () => {
                 </div>
               </>
             )}
-          </section>
+          </div>
 
           {isBrowser && (
-            <div className="mt-1 px-2">
-              <p className="typography-meta text-muted-foreground/70">
-                {t('settings.notifications.page.delivery.browserPermissionHint')}
-              </p>
+            <div className="mt-1">
               {notificationPermission === 'denied' && (
                 <p className="typography-meta text-[var(--status-error)] mt-1">
                   {t('settings.notifications.page.delivery.permissionDenied')}
@@ -624,103 +516,50 @@ export const NotificationSettings: React.FC = () => {
               )}
             </div>
           )}
-          {isVSCode && (
-            <div className="mt-1 px-2">
-              <p className="typography-meta text-muted-foreground/70">
-                {t('settings.notifications.page.delivery.vscodeHint')}
-              </p>
-            </div>
-          )}
-        </div>
+        </SettingsSection>
 
         {nativeNotificationsEnabled && canShowNotifications && (
           <>
-            {/* --- Events --- */}
-            <div className="mb-8">
-              <div className="mb-1 px-1">
-                <h3 className="typography-ui-header font-medium text-foreground">
-                  {t('settings.notifications.page.events.title')}
-                </h3>
+            <SettingsSection
+              settingsItem="notifications.events"
+              title={t('settings.notifications.page.events.title')}
+            >
+              <div className={SETTINGS_OPTION_STACK_CLASS}>
+                <SettingsCheckboxRow
+                  checked={notifyOnCompletion}
+                  onChange={setNotifyOnCompletion}
+                  label={t('settings.notifications.page.events.completionLabel')}
+                  ariaLabel={t('settings.notifications.page.events.completionAria')}
+                />
+
+                <SettingsCheckboxRow
+                  checked={notifyOnSubtasks}
+                  onChange={setNotifyOnSubtasks}
+                  label={t('settings.notifications.page.events.subtaskLabel')}
+                  ariaLabel={t('settings.notifications.page.events.subtaskAria')}
+                />
+
+                <SettingsCheckboxRow
+                  checked={notifyOnError}
+                  onChange={setNotifyOnError}
+                  label={t('settings.notifications.page.events.errorLabel')}
+                  ariaLabel={t('settings.notifications.page.events.errorAria')}
+                />
+
+                <SettingsCheckboxRow
+                  checked={notifyOnQuestion}
+                  onChange={setNotifyOnQuestion}
+                  label={t('settings.notifications.page.events.questionLabel')}
+                  ariaLabel={t('settings.notifications.page.events.questionAria')}
+                />
               </div>
+            </SettingsSection>
 
-              <section className="px-2 pb-2 pt-0 space-y-0.5">
-                <div
-                  className="group flex cursor-pointer items-center gap-2 py-1.5"
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={notifyOnCompletion}
-                  onClick={() => setNotifyOnCompletion(!notifyOnCompletion)}
-                  onKeyDown={(event) => {
-                    if (event.key === ' ' || event.key === 'Enter') {
-                      event.preventDefault();
-                      setNotifyOnCompletion(!notifyOnCompletion);
-                    }
-                  }}
-                >
-                  <Checkbox checked={notifyOnCompletion} onChange={setNotifyOnCompletion} ariaLabel={t('settings.notifications.page.events.completionAria')} />
-                  <span className="typography-ui-label text-foreground">{t('settings.notifications.page.events.completionLabel')}</span>
-                </div>
-
-                <div
-                  className="group flex cursor-pointer items-center gap-2 py-1.5"
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={notifyOnSubtasks}
-                  onClick={() => setNotifyOnSubtasks(!notifyOnSubtasks)}
-                  onKeyDown={(event) => {
-                    if (event.key === ' ' || event.key === 'Enter') {
-                      event.preventDefault();
-                      setNotifyOnSubtasks(!notifyOnSubtasks);
-                    }
-                  }}
-                >
-                  <Checkbox checked={notifyOnSubtasks} onChange={setNotifyOnSubtasks} ariaLabel={t('settings.notifications.page.events.subtaskAria')} />
-                  <span className="typography-ui-label text-foreground">{t('settings.notifications.page.events.subtaskLabel')}</span>
-                </div>
-
-                <div
-                  className="group flex cursor-pointer items-center gap-2 py-1.5"
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={notifyOnError}
-                  onClick={() => setNotifyOnError(!notifyOnError)}
-                  onKeyDown={(event) => {
-                    if (event.key === ' ' || event.key === 'Enter') {
-                      event.preventDefault();
-                      setNotifyOnError(!notifyOnError);
-                    }
-                  }}
-                >
-                  <Checkbox checked={notifyOnError} onChange={setNotifyOnError} ariaLabel={t('settings.notifications.page.events.errorAria')} />
-                  <span className="typography-ui-label text-foreground">{t('settings.notifications.page.events.errorLabel')}</span>
-                </div>
-
-                <div
-                  className="group flex cursor-pointer items-center gap-2 py-1.5"
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={notifyOnQuestion}
-                  onClick={() => setNotifyOnQuestion(!notifyOnQuestion)}
-                  onKeyDown={(event) => {
-                    if (event.key === ' ' || event.key === 'Enter') {
-                      event.preventDefault();
-                      setNotifyOnQuestion(!notifyOnQuestion);
-                    }
-                  }}
-                >
-                  <Checkbox checked={notifyOnQuestion} onChange={setNotifyOnQuestion} ariaLabel={t('settings.notifications.page.events.questionAria')} />
-                  <span className="typography-ui-label text-foreground">{t('settings.notifications.page.events.questionLabel')}</span>
-                </div>
-              </section>
-            </div>
-
-            {/* --- Template Customization --- */}
-            <div className="mb-8">
-              <div className="mb-1 px-1">
-                <h3 className="typography-ui-header font-medium text-foreground">
-                  {t('settings.notifications.page.template.title')}
-                </h3>
-                <p className="typography-meta text-muted-foreground mt-0.5">
+            {!isNativeApp && (
+            <SettingsSection
+              title={t('settings.notifications.page.template.title')}
+              description={(
+                <>
                   {t('settings.notifications.page.template.variablesLabel')}{' '}
                   <code className="text-[var(--primary-base)]">{'{project_name}'}</code>{' '}
                   <code className="text-[var(--primary-base)]">{'{worktree}'}</code>{' '}
@@ -729,15 +568,15 @@ export const NotificationSettings: React.FC = () => {
                   <code className="text-[var(--primary-base)]">{'{agent_name}'}</code>{' '}
                   <code className="text-[var(--primary-base)]">{'{model_name}'}</code>{' '}
                   <code className="text-[var(--primary-base)]">{'{last_message}'}</code>
-                </p>
-              </div>
-
-              <div className="grid grid-cols-1 gap-2 md:grid-cols-2 md:gap-3">
+                </>
+              )}
+            >
+              <SettingsTwoColumn className="gap-2 md:grid-cols-2 md:gap-3 lg:gap-3">
                 {(['completion', 'subtask', 'error', 'question'] as const).map((event: NotificationTemplateEvent) => (
                   <section key={event} className="p-2">
-                    <span className="typography-ui-label text-foreground font-normal capitalize block">
+                    <SettingsGroupTitle className="capitalize">
                       {t(TEMPLATE_EVENT_LABEL_KEYS[event])}
-                    </span>
+                    </SettingsGroupTitle>
                     <div className="mt-1.5 space-y-2">
                       <div>
                         <label className="typography-micro text-muted-foreground block mb-1">{t('settings.notifications.page.template.field.title')}</label>
@@ -760,214 +599,40 @@ export const NotificationSettings: React.FC = () => {
                     </div>
                   </section>
                 ))}
-              </div>
-            </div>
+              </SettingsTwoColumn>
+            </SettingsSection>
+            )}
 
-            {/* --- Summarization --- */}
-            <div className="mb-8">
-              <div className="mb-1 px-1">
-                <h3 className="typography-ui-header font-medium text-foreground">
-                  {t('settings.notifications.page.summary.title')}
-                </h3>
-              </div>
-
-              <section className="px-2 pb-2 pt-0 space-y-0.5">
-                <div
-                  className="group flex cursor-pointer items-center gap-2 py-1.5"
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={summarizeLastMessage}
-                  onClick={() => setSummarizeLastMessage(!summarizeLastMessage)}
-                  onKeyDown={(event) => {
-                    if (event.key === ' ' || event.key === 'Enter') {
-                      event.preventDefault();
-                      setSummarizeLastMessage(!summarizeLastMessage);
-                    }
-                  }}
-                >
-                  <Checkbox
-                    checked={summarizeLastMessage}
-                    onChange={setSummarizeLastMessage}
-                    ariaLabel={t('settings.notifications.page.summary.toggleAria')}
-                  />
-                  <span className="typography-ui-label text-foreground">{t('settings.notifications.page.summary.toggleLabel')}</span>
-                </div>
-                <div className="pl-6 pb-1">
-                  <span className="typography-meta text-muted-foreground">
-                    {t('settings.notifications.page.summary.requiresTemplateVariable')}
-                    {' '}
-                    <code className="text-[var(--primary-base)]">{'{last_message}'}</code>.
-                  </span>
-                </div>
-
-                <div className={cn("flex flex-col gap-2 py-1 sm:flex-row sm:items-center sm:gap-8")}>
-                  <div className="flex min-w-0 flex-col sm:w-56 shrink-0">
-                    <div className="flex items-center gap-2">
-                      <span className="typography-ui-label text-foreground">{t('settings.notifications.page.summary.modelLabel')}</span>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <RiInformationLine className="h-3.5 w-3.5 text-muted-foreground/60 cursor-help" />
-                        </TooltipTrigger>
-                        <TooltipContent sideOffset={8} className="max-w-xs">
-                          {t('settings.notifications.page.summary.modelTooltip')}
-                        </TooltipContent>
-                      </Tooltip>
-                    </div>
-                  </div>
-                  <div className="flex min-w-0 flex-1 items-center gap-2 sm:w-fit sm:flex-initial">
-                    <Select
-                      value={utilitySelectedModelId || UTILITY_NOT_SELECTED_VALUE}
-                      onValueChange={handleUtilityModelChange}
-                    >
-                      <SelectTrigger className="w-fit min-w-[220px]">
-                        <SelectValue placeholder={t('settings.notifications.page.summary.notSelected')} />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value={UTILITY_NOT_SELECTED_VALUE}>{t('settings.notifications.page.summary.notSelected')}</SelectItem>
-                        {utilityModelOptions.map((model) => (
-                          <SelectItem key={model.id} value={model.id}>
-                            {model.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-
-                {summarizeLastMessage ? (
-                  <>
-                    <div className="flex items-center gap-8 py-1.5 mt-1 border-t border-[var(--surface-subtle)]">
-                      <div className="flex min-w-0 flex-col w-56 shrink-0">
-                        <span className="typography-ui-label text-foreground">{t('settings.notifications.page.summary.thresholdLabel')}</span>
-                        <span className="typography-meta text-muted-foreground">{t('settings.notifications.page.summary.thresholdHint')}</span>
-                      </div>
-                      <div className="flex items-center gap-2 w-fit">
-                        <NumberInput
-                          value={summaryThreshold}
-                          onValueChange={setSummaryThreshold}
-                          min={50}
-                          max={2000}
-                          step={50}
-                          className="w-20 tabular-nums"
-                        />
-                        <Button size="sm"
-                          type="button"
-                          variant="ghost"
-                          onClick={() => setSummaryThreshold(DEFAULT_SUMMARY_THRESHOLD)}
-                          disabled={summaryThreshold === DEFAULT_SUMMARY_THRESHOLD}
-                          className="h-7 w-7 px-0 text-muted-foreground hover:text-foreground"
-                          aria-label={t('settings.notifications.page.summary.resetThresholdAria')}
-                          title={t('settings.common.actions.reset')}
-                        >
-                          <RiRestartLine className="h-3.5 w-3.5" />
-                        </Button>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-8 py-1.5">
-                      <div className="flex min-w-0 flex-col w-56 shrink-0">
-                        <span className="typography-ui-label text-foreground">{t('settings.notifications.page.summary.lengthLabel')}</span>
-                        <span className="typography-meta text-muted-foreground">{t('settings.notifications.page.summary.lengthHint')}</span>
-                      </div>
-                      <div className="flex items-center gap-2 w-fit">
-                        <NumberInput
-                          value={summaryLength}
-                          onValueChange={setSummaryLength}
-                          min={20}
-                          max={500}
-                          step={10}
-                          className="w-20 tabular-nums"
-                        />
-                        <Button size="sm"
-                          type="button"
-                          variant="ghost"
-                          onClick={() => setSummaryLength(DEFAULT_SUMMARY_LENGTH)}
-                          disabled={summaryLength === DEFAULT_SUMMARY_LENGTH}
-                          className="h-7 w-7 px-0 text-muted-foreground hover:text-foreground"
-                          aria-label={t('settings.notifications.page.summary.resetLengthAria')}
-                          title={t('settings.common.actions.reset')}
-                        >
-                          <RiRestartLine className="h-3.5 w-3.5" />
-                        </Button>
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div className={cn("py-1.5 mt-1 border-t border-[var(--surface-subtle)]", isMobile ? "flex flex-col gap-3" : "flex items-center gap-8")}>
-                    <div className={cn("flex min-w-0 flex-col", isMobile ? "w-full" : "w-56 shrink-0")}>
-                      <span className="typography-ui-label text-foreground">{t('settings.notifications.page.summary.maxLengthLabel')}</span>
-                      <span className="typography-meta text-muted-foreground">{t('settings.notifications.page.summary.maxLengthHint')}</span>
-                    </div>
-                    <div className={cn("flex items-center gap-2", isMobile ? "w-full" : "w-fit")}>
-                      <NumberInput
-                        value={maxLastMessageLength}
-                        onValueChange={setMaxLastMessageLength}
-                        min={50}
-                        max={1000}
-                        step={10}
-                        className="w-20 tabular-nums"
-                      />
-                      <Button size="sm"
-                        type="button"
-                        variant="ghost"
-                        onClick={() => setMaxLastMessageLength(DEFAULT_MAX_LAST_MESSAGE_LENGTH)}
-                        disabled={maxLastMessageLength === DEFAULT_MAX_LAST_MESSAGE_LENGTH}
-                        className="h-7 w-7 px-0 text-muted-foreground hover:text-foreground"
-                        aria-label={t('settings.notifications.page.summary.resetMaxLengthAria')}
-                        title={t('settings.common.actions.reset')}
-                      >
-                        <RiRestartLine className="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  </div>
-                )}
-              </section>
-            </div>
           </>
         )}
 
-        {/* --- Background Push Notifications --- */}
         {isBrowser && (
-          <div className="mb-8">
-            <div className="mb-1 px-1">
-              <h3 className="typography-ui-header font-medium text-foreground">
-                {t('settings.notifications.page.push.title')}
-              </h3>
-            </div>
-
-            <section className="px-2 pb-2 pt-0">
-              <div className="flex items-start gap-2 py-1.5">
-                <Checkbox
-                  checked={pushSupported ? pushSubscribed : false}
-                  disabled={!pushSupported || pushBusy}
-                  onChange={(checked: boolean) => {
-                    if (checked) {
-                      void handleEnableBackgroundNotifications();
-                    } else {
-                      void handleDisableBackgroundNotifications();
-                    }
-                  }}
-                  ariaLabel={t('settings.notifications.page.push.enableAria')}
-                />
-                <div className="flex min-w-0 flex-col">
-                  <span className={cn("typography-ui-label", !pushSupported ? "text-muted-foreground" : "text-foreground")}>
-                    {t('settings.notifications.page.push.enableLabel')}
-                  </span>
-                  <span className="typography-meta text-muted-foreground">
-                    {!pushSupported
-                      ? t('settings.notifications.page.push.unsupportedHint')
-                      : t('settings.notifications.page.push.supportedHint')}
-                  </span>
-                </div>
-                {pushBusy && (
-                  <div className="pt-0.5 text-muted-foreground">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-current animate-busy-pulse" aria-label={t('settings.notifications.page.push.loadingAria')} />
-                  </div>
-                )}
-              </div>
-            </section>
-          </div>
+          <SettingsSection
+            settingsItem="notifications.push"
+            title={t('settings.notifications.page.push.title')}
+          >
+            <SettingsCheckboxRow
+              checked={pushSupported ? pushSubscribed : false}
+              disabled={!pushSupported || pushBusy}
+              onChange={(checked) => {
+                if (checked) {
+                  void handleEnableBackgroundNotifications();
+                } else {
+                  void handleDisableBackgroundNotifications();
+                }
+              }}
+              label={t('settings.notifications.page.push.enableLabel')}
+              description={!pushSupported ? t('settings.notifications.page.push.unsupportedHint') : undefined}
+              info={pushSupported ? t('settings.notifications.page.push.supportedHint') : undefined}
+              ariaLabel={t('settings.notifications.page.push.enableAria')}
+              labelAccessory={
+                pushBusy ? (
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-current text-muted-foreground animate-busy-pulse" aria-label={t('settings.notifications.page.push.loadingAria')} />
+                ) : null
+              }
+            />
+          </SettingsSection>
         )}
-
-    </div>
+    </>
   );
 };

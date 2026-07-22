@@ -1,11 +1,14 @@
 import React from 'react';
 import { projectTurnRecords } from '../lib/turns/projectTurnRecords';
 import type { ChatMessageEntry, TurnProjectionResult, TurnRecord } from '../lib/turns/types';
+import { buildProjectionCacheKey, getCachedProjection, setCachedProjection } from '../lib/turns/turnProjectionCache';
 import { streamPerfMeasure } from '@/stores/utils/streamDebug';
 
 interface UseTurnRecordsOptions {
     sessionKey?: string;
     showTextJustificationActivity: boolean;
+    showTurnChangedFiles: boolean;
+    planModeEnabled: boolean;
 }
 
 export interface TurnRecordsResult {
@@ -22,9 +25,20 @@ export const useTurnRecords = (
     const staticTurnsRef = React.useRef<TurnRecord[]>([]);
     const streamingTurnRef = React.useRef<TurnRecord | undefined>(undefined);
     const previousSessionKeyRef = React.useRef<string | undefined>(options.sessionKey);
+    const previousShowTextJustificationActivityRef = React.useRef(options.showTextJustificationActivity);
+    const previousShowTurnChangedFilesRef = React.useRef(options.showTurnChangedFiles);
+    const previousPlanModeEnabledRef = React.useRef(options.planModeEnabled);
 
-    if (previousSessionKeyRef.current !== options.sessionKey) {
+    if (
+        previousSessionKeyRef.current !== options.sessionKey
+        || previousShowTextJustificationActivityRef.current !== options.showTextJustificationActivity
+        || previousShowTurnChangedFilesRef.current !== options.showTurnChangedFiles
+        || previousPlanModeEnabledRef.current !== options.planModeEnabled
+    ) {
         previousSessionKeyRef.current = options.sessionKey;
+        previousShowTextJustificationActivityRef.current = options.showTextJustificationActivity;
+        previousShowTurnChangedFilesRef.current = options.showTurnChangedFiles;
+        previousPlanModeEnabledRef.current = options.planModeEnabled;
         previousProjectionRef.current = null;
         staticTurnsRef.current = [];
         streamingTurnRef.current = undefined;
@@ -34,18 +48,38 @@ export const useTurnRecords = (
         previousProjectionRef.current = null;
         staticTurnsRef.current = [];
         streamingTurnRef.current = undefined;
-    }, [options.sessionKey, options.showTextJustificationActivity]);
+    }, [options.sessionKey, options.showTextJustificationActivity, options.showTurnChangedFiles, options.planModeEnabled]);
 
     const projection = React.useMemo(() => {
+        const sessionKey = options.sessionKey ?? '';
+        const mergeKey = options.planModeEnabled ? 'merge:plan' : 'merge';
+        const cacheKey = buildProjectionCacheKey(
+            sessionKey,
+            messages,
+            options.showTextJustificationActivity,
+            options.showTurnChangedFiles,
+            mergeKey,
+        );
+        const cached = getCachedProjection(cacheKey);
+        if (cached) {
+            previousProjectionRef.current = cached;
+            return cached;
+        }
+
         return streamPerfMeasure('ui.turns.projection_ms', () => {
             const nextProjection = projectTurnRecords(messages, {
                 previousProjection: previousProjectionRef.current,
                 showTextJustificationActivity: options.showTextJustificationActivity,
+                showTurnChangedFiles: options.showTurnChangedFiles,
+                mergeHiddenUserTurns: { planModeEnabled: options.planModeEnabled },
             });
             previousProjectionRef.current = nextProjection;
+
+            setCachedProjection(cacheKey, nextProjection);
+
             return nextProjection;
         });
-    }, [messages, options.showTextJustificationActivity]);
+    }, [messages, options.showTextJustificationActivity, options.showTurnChangedFiles, options.sessionKey, options.planModeEnabled]);
 
     const staticTurns = React.useMemo(() => {
         const nextStatic = projection.turns.length <= 1

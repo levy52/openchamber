@@ -1,5 +1,8 @@
 import type { OpencodeClient, Session } from "@opencode-ai/sdk/v2";
 import { retry } from "@/sync/retry";
+import { stripSessionListDetails } from "@/sync/sanitize";
+import { getRuntimeKey } from "@/lib/runtime-switch";
+import { startSessionLoadPerformanceEvent } from "@/sync/session-load-performance";
 
 export type GlobalSessionRecord = Session & {
     project?: {
@@ -37,33 +40,47 @@ const readResponseHeader = (response: unknown, header: string): string | null =>
     return typeof direct === "string" ? direct : null;
 };
 
-export const readNextCursor = (response: unknown): number | null => {
-    return toNumber(readResponseHeader(response, "x-next-cursor"));
+const formatSdkError = (error: unknown): string => {
+    if (error instanceof Error) return error.message;
+    if (typeof error === "string") return error;
+    if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") {
+        return (error as { message: string }).message;
+    }
+    try {
+        return JSON.stringify(error);
+    } catch {
+        return String(error);
+    }
 };
 
-export const isMissingGlobalSessionsEndpointError = (error: unknown): boolean => {
-    if (!error || typeof error !== "object") {
-        return false;
+const unwrapSessionList = (
+    result: { data?: Session[]; error?: unknown; response?: { status?: number } },
+    operation: string,
+): GlobalSessionRecord[] => {
+    if (result.error) {
+        const status = result.response?.status;
+        const error = new Error(`${operation} failed${status ? ` (${status})` : ""}: ${formatSdkError(result.error)}`);
+        if (status !== undefined) {
+            (error as Error & { status?: number }).status = status;
+        }
+        throw error;
     }
 
-    const value = error as {
-        status?: number;
-        response?: { status?: number };
-        cause?: { status?: number; response?: { status?: number } };
-    };
+    if (!Array.isArray(result.data)) {
+        const error = new Error(`${operation} returned no data`);
+        (error as Error & { status?: number }).status = 503;
+        throw error;
+    }
 
-    const status = value.status
-        ?? value.response?.status
-        ?? value.cause?.status
-        ?? value.cause?.response?.status;
-
-    return status === 404;
+    return result.data as GlobalSessionRecord[];
 };
 
 export async function listGlobalSessionPages(
     apiClient: OpencodeClient,
     options: {
+        directory?: string;
         archived: boolean;
+        roots?: boolean;
         pageSize: number;
         onPage?: (sessions: GlobalSessionRecord[]) => void;
     },
@@ -71,18 +88,49 @@ export async function listGlobalSessionPages(
     const all: GlobalSessionRecord[] = [];
     const seenIds = new Set<string>();
     let cursor: number | undefined;
+    let operation: string;
+    if (!options.directory) {
+        operation = `global-sessions.${options.archived ? "archived" : "active"}`;
+    } else if (options.roots === true) {
+        operation = "bootstrap.sessions.roots";
+    } else if (options.archived) {
+        operation = "bootstrap.sessions.archived";
+    } else {
+        operation = "bootstrap.sessions.all";
+    }
 
     while (true) {
-        const response = await retry(
-            () => apiClient.experimental.session.list({
-                archived: options.archived,
-                limit: options.pageSize,
-                ...(cursor !== undefined ? { cursor } : {}),
-            }),
+        let attempts = 0;
+        const finishPerformanceEvent = startSessionLoadPerformanceEvent({
+            operation,
+            runtimeKey: getRuntimeKey(),
+            directory: options.directory,
+            caller: cursor === undefined ? "initial-page" : "pagination",
+        });
+        const { response, payload } = await retry(
+            async () => {
+                attempts += 1;
+                const response = await apiClient.experimental.session.list({
+                    ...(options.directory ? { directory: options.directory } : {}),
+                    archived: options.archived,
+                    ...(options.roots !== undefined ? { roots: options.roots } : {}),
+                    limit: options.pageSize,
+                    ...(cursor !== undefined ? { cursor } : {}),
+                });
+                const payload = unwrapSessionList(response, "experimental.session.list")
+                    .map((session) => stripSessionListDetails(session) as GlobalSessionRecord);
+                return { response, payload };
+            },
             { attempts: 3, delay: 500, retryIf: () => true },
-        );
+        ).catch((error) => {
+            finishPerformanceEvent("error", { retryCount: Math.max(0, attempts - 1) });
+            throw error;
+        });
 
-        const payload = Array.isArray(response.data) ? (response.data as GlobalSessionRecord[]) : [];
+        finishPerformanceEvent("complete", {
+            retryCount: Math.max(0, attempts - 1),
+            recordCount: payload.length,
+        });
         if (payload.length === 0) break;
 
         let appended = 0;

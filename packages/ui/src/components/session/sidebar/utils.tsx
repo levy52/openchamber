@@ -1,6 +1,38 @@
 import React from 'react';
 import type { Session } from '@opencode-ai/sdk/v2';
-import type { SessionSummaryMeta } from './types';
+import { resolveGlobalSessionDirectory } from '@/stores/useGlobalSessionsStore';
+import { isSessionPinned } from '@/stores/useSessionPinnedStore';
+import { getCurrentIntlLocale } from '@/lib/i18n';
+import { formatMessage, useI18nStore } from '@/lib/i18n/store';
+
+import { normalizePath } from '@/lib/pathNormalization';
+export { normalizePath };
+
+export const selectExpandedParentKeysForContext = (
+  previous: Set<string>,
+  expanded: ReadonlySet<string>,
+  context: 'project' | 'recent',
+): Set<string> => {
+  const prefix = `${context}:`;
+  const next = new Set([...expanded].filter((key) => key.startsWith(prefix)));
+  if (previous.size === next.size && [...next].every((key) => previous.has(key))) {
+    return previous;
+  }
+  return next;
+};
+
+export const toggleExpandedParentKey = (
+  expanded: Set<string>,
+  key: string,
+): Set<string> => {
+  const next = new Set(expanded);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next;
+};
+
+const t = (key: Parameters<typeof formatMessage>[1], params?: Parameters<typeof formatMessage>[2]) =>
+  formatMessage(useI18nStore.getState().dictionary, key, params);
 
 const formatDateLabel = (value: string | number) => {
   const targetDate = new Date(value);
@@ -14,12 +46,12 @@ const formatDateLabel = (value: string | number) => {
   yesterday.setDate(today.getDate() - 1);
 
   if (isSameDay(targetDate, today)) {
-    return 'Today';
+    return t('common.date.today');
   }
   if (isSameDay(targetDate, yesterday)) {
-    return 'Yesterday';
+    return t('common.date.yesterday');
   }
-  const formatted = targetDate.toLocaleDateString('en-US', {
+  const formatted = targetDate.toLocaleDateString(getCurrentIntlLocale(), {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
@@ -37,9 +69,9 @@ export const formatSessionDateLabel = (updatedMs: number): string => {
 
   if (isSameDay(updatedDate, today)) {
     const diff = Date.now() - updatedMs;
-    if (diff < 60_000) return 'Just now';
-    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}min ago`;
-    return `${Math.floor(diff / 3_600_000)}h ago`;
+    if (diff < 60_000) return t('common.relative.justNow');
+    if (diff < 3_600_000) return t('common.relative.minutesAgoShort', { count: Math.floor(diff / 60_000) });
+    return t('common.relative.hoursAgoShort', { count: Math.floor(diff / 3_600_000) });
   }
 
   return formatDateLabel(updatedMs);
@@ -62,23 +94,28 @@ export const formatSessionCompactDateLabel = (updatedMs: number): string => {
     return `${Math.floor(diff / hour)}h`;
   }
   if (diff < week) {
-    return `${Math.floor(diff / day)}d`;
+    return t('common.relative.daysAgoCompact', { count: Math.floor(diff / day) });
   }
   if (diff < 5 * week) {
-    return `${Math.floor(diff / week)}w`;
+    return t('common.relative.weeksAgoCompact', { count: Math.floor(diff / week) });
   }
   if (diff < year) {
     return `${Math.floor(diff / month)}mo`;
   }
-  return `${Math.floor(diff / year)}y`;
+  return t('common.relative.yearsAgoCompact', { count: Math.floor(diff / year) });
 };
 
-export const normalizePath = (value?: string | null) => {
-  if (!value) {
-    return null;
-  }
-  const normalized = value.replace(/\\/g, '/').replace(/\/+$/, '');
-  return normalized.length === 0 ? '/' : normalized;
+export const isPathWithinProject = (directory?: string | null, projectPath?: string | null): boolean => {
+  const normalizedDirectory = normalizePath(directory);
+  const normalizedProjectPath = normalizePath(projectPath);
+  return isNormalizedPathWithinProject(normalizedDirectory, normalizedProjectPath);
+};
+
+const isNormalizedPathWithinProject = (normalizedDirectory: string | null, normalizedProjectPath: string | null): boolean => {
+  if (!normalizedDirectory || !normalizedProjectPath) return false;
+  if (normalizedDirectory === normalizedProjectPath) return true;
+  if (normalizedProjectPath === '/') return normalizedDirectory.startsWith('/');
+  return normalizedDirectory.startsWith(`${normalizedProjectPath}/`);
 };
 
 export const normalizeForBranchComparison = (value: string): string => {
@@ -120,8 +157,8 @@ export const compareSessionsByPinnedAndTime = (
   b: Session,
   pinnedSessionIds: Set<string>,
 ): number => {
-  const aPinned = pinnedSessionIds.has(a.id);
-  const bPinned = pinnedSessionIds.has(b.id);
+  const aPinned = isSessionPinned(pinnedSessionIds, resolveGlobalSessionDirectory(a), a.id);
+  const bPinned = isSessionPinned(pinnedSessionIds, resolveGlobalSessionDirectory(b), b.id);
   if (aPinned !== bPinned) {
     return aPinned ? -1 : 1;
   }
@@ -131,20 +168,6 @@ export const compareSessionsByPinnedAndTime = (
   }
 
   return getSessionUpdatedAt(b) - getSessionUpdatedAt(a);
-};
-
-export const compareSessionsByPinnedAndCreated = (
-  a: Session,
-  b: Session,
-  pinnedSessionIds: Set<string>,
-): number => {
-  const aPinned = pinnedSessionIds.has(a.id);
-  const bPinned = pinnedSessionIds.has(b.id);
-  if (aPinned !== bPinned) {
-    return aPinned ? -1 : 1;
-  }
-
-  return getSessionCreatedAt(b) - getSessionCreatedAt(a);
 };
 
 export const dedupeSessionsById = (sessions: Session[]): Session[] => {
@@ -172,69 +195,6 @@ export const resolveArchivedFolderName = (session: Session, projectRoot: string 
     : resolved;
   const segments = source.split('/').filter(Boolean);
   return segments[segments.length - 1] ?? 'unassigned';
-};
-
-export const isSessionRelatedToProject = (
-  session: Session,
-  projectRoot: string,
-  validDirectories?: Set<string>,
-): boolean => {
-  const sessionDirectory = normalizePath((session as Session & { directory?: string | null }).directory ?? null);
-  const projectWorktree = normalizePath((session as Session & { project?: { worktree?: string | null } | null }).project?.worktree ?? null);
-
-  if (projectWorktree && (projectWorktree === projectRoot || projectWorktree.startsWith(`${projectRoot}/`))) {
-    return true;
-  }
-
-  if (!sessionDirectory) {
-    return false;
-  }
-  if (validDirectories && validDirectories.has(sessionDirectory)) {
-    return true;
-  }
-  return sessionDirectory === projectRoot || sessionDirectory.startsWith(`${projectRoot}/`);
-};
-
-const parseSummaryCount = (value: number | string | null | undefined): number | null => {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === 'string') {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) {
-      return parsed;
-    }
-  }
-  return null;
-};
-
-export const resolveSessionDiffStats = (summary?: SessionSummaryMeta): { additions: number; deletions: number } | null => {
-  if (!summary) {
-    return null;
-  }
-
-  const directAdditions = parseSummaryCount(summary.additions);
-  const directDeletions = parseSummaryCount(summary.deletions);
-  if (directAdditions !== null || directDeletions !== null) {
-    const stats = {
-      additions: Math.max(0, directAdditions ?? 0),
-      deletions: Math.max(0, directDeletions ?? 0),
-    };
-    return stats.additions === 0 && stats.deletions === 0 ? null : stats;
-  }
-
-  const diffs = Array.isArray(summary.diffs) ? summary.diffs : [];
-  if (diffs.length === 0) {
-    return null;
-  }
-
-  let additions = 0;
-  let deletions = 0;
-  diffs.forEach((diff) => {
-    additions += Math.max(0, parseSummaryCount(diff.additions) ?? 0);
-    deletions += Math.max(0, parseSummaryCount(diff.deletions) ?? 0);
-  });
-  return additions === 0 && deletions === 0 ? null : { additions, deletions };
 };
 
 export const formatProjectLabel = (label: string): string => {

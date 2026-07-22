@@ -1,6 +1,7 @@
 const SESSION_COOLDOWN_DURATION_MS = 2000;
 const SESSION_STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SESSION_ATTENTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SESSION_ACTIVITY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SESSION_STATE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
 const extractSessionStatusUpdate = (payload) => {
@@ -9,9 +10,13 @@ const extractSessionStatusUpdate = (payload) => {
   }
 
   const properties = payload.properties && typeof payload.properties === 'object' ? payload.properties : {};
+  const status = properties.status && typeof properties.status === 'object' ? properties.status : {};
   const info = properties.info && typeof properties.info === 'object' ? properties.info : {};
   const sessionId = typeof properties.sessionID === 'string' ? properties.sessionID.trim() : '';
-  const type = typeof info.type === 'string' ? info.type.trim() : '';
+  // Canonical OpenCode schema uses properties.status.type. Keep legacy info.type fallback for compatibility.
+  const type = typeof status.type === 'string'
+    ? status.type.trim()
+    : (typeof info.type === 'string' ? info.type.trim() : '');
 
   if (!sessionId || !type) {
     return null;
@@ -21,25 +26,16 @@ const extractSessionStatusUpdate = (payload) => {
     sessionId,
     type,
     eventId: typeof payload.id === 'string' ? payload.id : '',
-    attempt: typeof info.attempt === 'number' ? info.attempt : undefined,
-    message: typeof info.message === 'string' ? info.message : undefined,
-    next: typeof info.next === 'number' ? info.next : undefined,
+    attempt: typeof status.attempt === 'number'
+      ? status.attempt
+      : (typeof info.attempt === 'number' ? info.attempt : undefined),
+    message: typeof status.message === 'string'
+      ? status.message
+      : (typeof info.message === 'string' ? info.message : undefined),
+    next: typeof status.next === 'number'
+      ? status.next
+      : (typeof info.next === 'number' ? info.next : undefined),
   };
-};
-
-const deriveSessionActivityTransitions = (payload) => {
-  const update = extractSessionStatusUpdate(payload);
-  if (!update) {
-    return [];
-  }
-
-  if (update.type === 'busy' || update.type === 'retry') {
-    return [{ sessionId: update.sessionId, phase: 'busy' }];
-  }
-  if (update.type === 'idle') {
-    return [{ sessionId: update.sessionId, phase: 'cooldown' }];
-  }
-  return [];
 };
 
 export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, broadcastEvent }) => {
@@ -47,6 +43,7 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
   const sessionActivityCooldowns = new Map();
   const sessionStates = new Map();
   const sessionAttentionStates = new Map();
+  let activeSessionCount = 0;
 
   const getOrCreateAttentionState = (sessionId) => {
     if (!sessionId || typeof sessionId !== 'string') return null;
@@ -80,13 +77,19 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
       sessionActivityCooldowns.delete(sessionId);
     }
 
+    const wasActive = current?.phase === 'busy';
+    const isActive = phase === 'busy';
+    if (wasActive !== isActive) {
+      activeSessionCount = Math.max(0, activeSessionCount + (isActive ? 1 : -1));
+    }
     sessionActivityPhases.set(sessionId, { phase, updatedAt: Date.now() });
 
     if (phase === 'cooldown') {
       const timer = setTimeout(() => {
         const now = sessionActivityPhases.get(sessionId);
         if (now?.phase === 'cooldown') {
-          sessionActivityPhases.set(sessionId, { phase: 'idle', updatedAt: Date.now() });
+          setSessionActivityPhase(sessionId, 'idle');
+          return;
         }
         sessionActivityCooldowns.delete(sessionId);
       }, SESSION_COOLDOWN_DURATION_MS);
@@ -147,7 +150,7 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
       const syntheticPayload = {
         type: 'openchamber:session-status',
         properties: {
-          sessionId,
+          sessionID: sessionId,
           status: state.status,
           timestamp: state.lastUpdateAt,
           metadata: state.metadata,
@@ -168,7 +171,9 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
     }
 
     const phase = status === 'busy' || status === 'retry' ? 'busy' : 'idle';
-    setSessionActivityPhase(sessionId, phase);
+    if (phase !== 'idle' || sessionActivityPhases.get(sessionId)?.phase !== 'cooldown') {
+      setSessionActivityPhase(sessionId, phase);
+    }
   };
 
   const getSessionStateSnapshot = () => {
@@ -203,7 +208,7 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
       const syntheticPayload = {
         type: 'openchamber:session-status',
         properties: {
-          sessionId,
+          sessionID: sessionId,
           status: state.status,
           timestamp: Date.now(),
           metadata: {},
@@ -274,11 +279,14 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
     return result;
   };
 
+  const getActiveSessionCount = () => activeSessionCount;
+
   const resetAllSessionActivityToIdle = () => {
     for (const timer of sessionActivityCooldowns.values()) {
       clearTimeout(timer);
     }
     sessionActivityCooldowns.clear();
+    activeSessionCount = 0;
     const now = Date.now();
     for (const [sessionId] of sessionActivityPhases) {
       sessionActivityPhases.set(sessionId, { phase: 'idle', updatedAt: now });
@@ -297,26 +305,33 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
         sessionAttentionStates.delete(sessionId);
       }
     }
+    for (const [sessionId, data] of sessionActivityPhases) {
+      if (now - data.updatedAt <= SESSION_ACTIVITY_MAX_AGE_MS) continue;
+      const timer = sessionActivityCooldowns.get(sessionId);
+      if (timer) clearTimeout(timer);
+      sessionActivityCooldowns.delete(sessionId);
+      sessionActivityPhases.delete(sessionId);
+      if (data.phase === 'busy') activeSessionCount = Math.max(0, activeSessionCount - 1);
+    }
   };
 
   const cleanupInterval = setInterval(cleanupOldSessionStates, SESSION_STATE_CLEANUP_INTERVAL_MS);
 
   const processOpenCodeSsePayload = (payload) => {
-    const transitions = deriveSessionActivityTransitions(payload);
-    for (const activity of transitions) {
-      setSessionActivityPhase(activity.sessionId, activity.phase);
+    const update = extractSessionStatusUpdate(payload);
+    if (!update) return;
+
+    if (update.type === 'busy' || update.type === 'retry') {
+      setSessionActivityPhase(update.sessionId, 'busy');
+    } else if (update.type === 'idle') {
+      setSessionActivityPhase(update.sessionId, 'cooldown');
     }
 
-    if (payload && payload.type === 'session.status') {
-      const update = extractSessionStatusUpdate(payload);
-      if (update) {
-        updateSessionState(update.sessionId, update.type, update.eventId || `sse-${Date.now()}`, {
-          attempt: update.attempt,
-          message: update.message,
-          next: update.next,
-        });
-      }
-    }
+    updateSessionState(update.sessionId, update.type, update.eventId || `sse-${Date.now()}`, {
+      attempt: update.attempt,
+      message: update.message,
+      next: update.next,
+    });
   };
 
   const dispose = () => {
@@ -325,11 +340,16 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
       clearTimeout(timer);
     }
     sessionActivityCooldowns.clear();
+    sessionActivityPhases.clear();
+    sessionStates.clear();
+    sessionAttentionStates.clear();
+    activeSessionCount = 0;
   };
 
   return {
     processOpenCodeSsePayload,
     getSessionActivitySnapshot,
+    getActiveSessionCount,
     getSessionStateSnapshot,
     getSessionAttentionSnapshot,
     getSessionState,

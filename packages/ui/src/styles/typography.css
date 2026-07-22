@@ -10,18 +10,74 @@
 
   .typography-ui-header {
     font-size: var(--text-ui-header);
+    line-height: round(1.45em, 1px);
   }
 
   .typography-ui-label {
     font-size: var(--text-ui-label);
+    line-height: round(1.45em, 1px);
   }
 
   .typography-meta {
     font-size: var(--text-meta);
+    line-height: round(1.45em, 1px);
   }
 
   .typography-micro {
     font-size: var(--text-micro);
+    line-height: round(1.45em, 1px);
+  }
+
+  /*
+   * Settings heading scale (by context):
+   * L1 page title  → typography-settings-page-title (+ text-muted-foreground)
+   * L2 section     → typography-settings-section-title (+ text-foreground)
+   * L3 group       → typography-settings-group-title (+ text-foreground)
+   * L4 field label → typography-settings-field-label (+ text-foreground)
+   * typography-settings-title remains as L2 alias for older call sites.
+   */
+  .typography-settings-page-title {
+    font-size: var(--text-settings-page-title);
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
+  }
+
+  .typography-settings-section-title,
+  .typography-settings-title {
+    font-size: var(--text-ui-header);
+    font-weight: 600;
+    line-height: 1.2;
+  }
+
+  .typography-settings-group-title {
+    font-size: var(--text-ui-label);
+    font-weight: 500;
+    line-height: 1.2;
+  }
+
+  .typography-settings-field-label {
+    font-size: var(--text-ui-label);
+    font-weight: 400;
+    line-height: 1.2;
+  }
+
+  .typography-settings-description {
+    font-size: var(--text-meta);
+    font-weight: 400;
+    line-height: 1.5;
+  }
+
+  .typography-settings-link {
+    font-size: 0.8125rem; /* 13px */
+    font-weight: 500;
+    line-height: 1.2;
+    color: var(--primary-base);
+    transition: color var(--transition-fast, 150ms ease-in-out);
+  }
+
+  .typography-settings-link:hover {
+    text-decoration: underline;
   }
 
   .chat-column {
@@ -38,6 +94,10 @@
     width: min(100%, 48rem);
     margin-inline: auto;
     padding-inline: calc(clamp(0.75rem, 2.5vw, 1rem) * var(--padding-scale, 1));
+  }
+
+  .wide-chat-layout .chat-input-column {
+    width: min(100%, 64rem);
   }
 
   .chat-message-column {
@@ -153,4 +213,19 @@
     letter-spacing: var(--markdown-h4-letter-spacing);
     font-weight: var(--markdown-h4-font-weight);
   }
+}
+
+/* Chat message column width — intentionally UNLAYERED so it always wins the
+   cascade. The same rule inside `@layer components` above is correct in steady
+   state, but a layered rule can be momentarily out-ranked during a heavy style
+   recalc (e.g. a large session's virtualized list re-laying-out when the
+   background history prepend lands, or a late-loaded CSS chunk re-establishing
+   layer order). That dropped the clamp for a frame and flashed message text to
+   full width. An unlayered duplicate of just the width keeps it robust. */
+.chat-message-column {
+  width: min(100%, 48rem);
+}
+
+.wide-chat-layout .chat-message-column {
+  width: min(100%, 64rem);
 }

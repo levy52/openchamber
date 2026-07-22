@@ -1,16 +1,9 @@
 import React from 'react';
-import {
-  RiGitBranchLine,
-  RiArrowDownSLine,
-  RiCheckLine,
-  RiMore2Line,
-  RiFileCopyLine,
-  RiLoader4Line,
-} from '@remixicon/react';
 import { toast } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { cn } from '@/lib/utils';
+import { dropdownTriggerVariants } from '@/components/ui/dropdown-trigger';
 import { ProviderLogo } from '@/components/ui/ProviderLogo';
 import { useAgentGroupsStore, type AgentGroup, type AgentGroupSession } from '@/stores/useAgentGroupsStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
@@ -31,6 +24,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { Icon } from "@/components/icon/Icon";
 import { useI18n } from '@/lib/i18n';
 
 interface AgentGroupDetailProps {
@@ -163,7 +157,7 @@ export const AgentGroupDetail: React.FC<AgentGroupDetailProps> = ({
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <h1 className="typography-heading-lg text-foreground truncate">{group.name}</h1>
-              {groupBusy && <RiLoader4Line className="h-4 w-4 animate-spin text-amber-500 flex-shrink-0" />}
+              {groupBusy && <Icon name="loader-4" className="h-4 w-4 animate-spin text-amber-500 flex-shrink-0" />}
             </div>
             <div className="flex items-center gap-2 mt-1 typography-meta text-muted-foreground">
               <span>
@@ -173,7 +167,7 @@ export const AgentGroupDetail: React.FC<AgentGroupDetailProps> = ({
               </span>
               <span>·</span>
               <span className="flex items-center gap-1">
-                <RiGitBranchLine className="h-3.5 w-3.5" />
+                <Icon name="git-branch" className="h-3.5 w-3.5" />
                 {selectedSession?.worktreeMetadata?.label || selectedSession?.branch || t('agentManager.detail.header.noBranch')}
               </span>
             </div>
@@ -186,9 +180,9 @@ export const AgentGroupDetail: React.FC<AgentGroupDetailProps> = ({
             <div className="flex-1 min-w-0">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button
-                  variant="outline"
-                  className="w-full justify-between h-10 px-3"
+                <button
+                  type="button"
+                  className={cn(dropdownTriggerVariants({ size: 'default' }), 'w-full')}
                 >
                   <div className="flex items-center gap-2 min-w-0">
                     {selectedSession && (
@@ -209,8 +203,8 @@ export const AgentGroupDetail: React.FC<AgentGroupDetailProps> = ({
                       </>
                     )}
                   </div>
-                  <RiArrowDownSLine className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-                </Button>
+                  <Icon name="arrow-down-s" className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
+                </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" className="w-[var(--anchor-width)]">
                 {group.sessions.map((session) => (
@@ -237,13 +231,13 @@ export const AgentGroupDetail: React.FC<AgentGroupDetailProps> = ({
                       </div>
                       {session.branch && (
                         <div className="flex items-center gap-1 typography-micro text-muted-foreground/60">
-                          <RiGitBranchLine className="h-3 w-3" />
+                          <Icon name="git-branch" className="h-3 w-3" />
                           <span className="truncate">{session.worktreeMetadata?.label || session.branch}</span>
                         </div>
                       )}
                     </div>
                     {selectedSession?.id === session.id && (
-                      <RiCheckLine className="h-4 w-4 text-primary flex-shrink-0" />
+                      <Icon name="check" className="h-4 w-4 text-primary flex-shrink-0" />
                     )}
                   </DropdownMenuItem>
                 ))}
@@ -254,7 +248,7 @@ export const AgentGroupDetail: React.FC<AgentGroupDetailProps> = ({
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="outline" size="icon" className="flex-shrink-0" aria-label={t('agentManager.detail.actions.worktreeActionsAria')}>
-                  <RiMore2Line className="h-4 w-4" />
+                  <Icon name="more-2" className="h-4 w-4" />
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="min-w-[220px]">
@@ -278,7 +272,7 @@ export const AgentGroupDetail: React.FC<AgentGroupDetailProps> = ({
                 }}
                 disabled={!selectedSession?.path}
               >
-                <RiFileCopyLine className="h-4 w-4 mr-px" />
+                <Icon name="file-copy" className="h-4 w-4 mr-px" />
                 {t('agentManager.detail.actions.copyWorktreePath')}
               </DropdownMenuItem>
               </DropdownMenuContent>

@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import type { PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2/client"
+import type { Message, Part, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2/client"
 import {
   canDisposeDirectory,
   hasPendingBlockingRequests,
   pickDirectoriesToEvict,
 } from "../eviction"
+import { dropSessionCaches, getProtectedSessionCacheIds, pickSessionCacheEvictions } from "../session-cache"
 import { INITIAL_STATE, type DirState, type State } from "../types"
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -131,5 +132,60 @@ describe("canDisposeDirectory", () => {
 
   test("permits disposal when no blocking requests are pending", () => {
     expect(canDisposeDirectory(baseInput)).toBe(true)
+  })
+})
+
+describe("session cache eviction", () => {
+  test("protects live and blocking sessions from per-directory cache eviction", () => {
+    const protectedIds = getProtectedSessionCacheIds({
+      session_status: {
+        ses_busy: { type: "busy" },
+        ses_idle: { type: "idle" },
+      },
+      session_diff: {},
+      todo: {},
+      message: {
+        ses_streaming: [{ id: "msg_1", role: "assistant", time: { created: 1 } } as Message],
+      },
+      part: {},
+      permission: {
+        ses_permission: [buildPermission({ sessionID: "ses_permission" })],
+      },
+      question: {
+        ses_question: [buildQuestion({ sessionID: "ses_question" })],
+      },
+    })
+
+    expect(protectedIds).toEqual(new Set(["ses_busy", "ses_streaming", "ses_permission", "ses_question"]))
+
+    const seen = new Set(["ses_old", "ses_busy", "ses_permission", "ses_question", "ses_streaming", "ses_current"])
+    const evicted = pickSessionCacheEvictions({
+      seen,
+      keep: "ses_current",
+      preserve: protectedIds,
+      limit: 2,
+    })
+
+    expect(evicted).toEqual(["ses_old"])
+    expect(seen.has("ses_busy")).toBe(true)
+    expect(seen.has("ses_permission")).toBe(true)
+    expect(seen.has("ses_question")).toBe(true)
+    expect(seen.has("ses_streaming")).toBe(true)
+  })
+
+  test("drops parts for evicted messages without part session ids", () => {
+    const store = buildState({
+      message: {
+        ses_old: [{ id: "msg_1", role: "user", time: { created: 1 } } as Message],
+      },
+      part: {
+        msg_1: [{ id: "prt_1", messageID: "msg_1" } as Part],
+      },
+    })
+
+    dropSessionCaches(store, ["ses_old"])
+
+    expect(store.message.ses_old).toBe(undefined)
+    expect(store.part.msg_1).toBe(undefined)
   })
 })

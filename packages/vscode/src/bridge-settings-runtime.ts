@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { type DiscoveredSkill, type SkillScope, type SkillSource } from './opencodeConfig';
+import { BUILT_IN_SKILL_LOCATION, type DiscoveredSkill, type SkillScope, type SkillSource } from './opencodeConfig';
 import type { BridgeContext } from './bridge';
 
 const SETTINGS_KEY = 'openchamber.settings';
@@ -129,8 +129,19 @@ export const fetchOpenCodeSkillsFromApi = async (
         const name = typeof item?.name === 'string' ? item.name.trim() : '';
         const location = typeof item?.location === 'string' ? item.location : '';
         const description = typeof item?.description === 'string' ? item.description : '';
+        const content = typeof item?.content === 'string' ? item.content : '';
         if (!name || !location) {
           return null;
+        }
+        if (location === BUILT_IN_SKILL_LOCATION) {
+          return {
+            name,
+            path: location,
+            scope: 'user',
+            source: 'opencode',
+            description,
+            content,
+          } as DiscoveredSkill;
         }
         const inferred = inferSkillScopeAndSourceFromLocation(location, workingDirectory);
         return {
@@ -139,6 +150,7 @@ export const fetchOpenCodeSkillsFromApi = async (
           scope: inferred.scope,
           source: inferred.source,
           description,
+          content,
         } as DiscoveredSkill;
       })
       .filter((item): item is DiscoveredSkill => item !== null);
@@ -279,7 +291,7 @@ export const persistSettings = async (changes: Record<string, unknown>, ctx?: Br
 
   const keysToClear = new Set<string>();
 
-  for (const key of ['defaultModel', 'defaultVariant', 'defaultAgent', 'defaultGitIdentityId', 'opencodeBinary']) {
+  for (const key of ['defaultModel', 'defaultVariant', 'defaultAgent', 'defaultGitIdentityId', 'opencodeBinary', 'smallModelOverride']) {
     const value = restChanges[key];
     if (typeof value === 'string' && value.trim().length === 0) {
       keysToClear.add(key);
@@ -287,8 +299,39 @@ export const persistSettings = async (changes: Record<string, unknown>, ctx?: Br
     }
   }
 
+  if ('smallModelUseDefault' in restChanges && typeof restChanges.smallModelUseDefault !== 'boolean') {
+    delete restChanges.smallModelUseDefault;
+  }
+
+  if ('sessionRecapEnabled' in restChanges && typeof restChanges.sessionRecapEnabled !== 'boolean') {
+    delete restChanges.sessionRecapEnabled;
+  }
+
+  if ('sessionSuggestionEnabled' in restChanges && typeof restChanges.sessionSuggestionEnabled !== 'boolean') {
+    delete restChanges.sessionSuggestionEnabled;
+  }
+
+  if ('sessionGoalEnabled' in restChanges && typeof restChanges.sessionGoalEnabled !== 'boolean') {
+    delete restChanges.sessionGoalEnabled;
+  }
+
+  if ('sessionGoalDefaultBudgetEnabled' in restChanges && typeof restChanges.sessionGoalDefaultBudgetEnabled !== 'boolean') {
+    delete restChanges.sessionGoalDefaultBudgetEnabled;
+  }
+
+  if ('sessionGoalDefaultBudget' in restChanges) {
+    const budget = restChanges.sessionGoalDefaultBudget;
+    if (typeof budget !== 'number' || !Number.isFinite(budget) || budget <= 0) {
+      delete restChanges.sessionGoalDefaultBudget;
+    }
+  }
+
   if (typeof restChanges.usageAutoRefresh !== 'boolean') {
     delete restChanges.usageAutoRefresh;
+  }
+
+  if (typeof restChanges.usageShowPredValues !== 'boolean') {
+    delete restChanges.usageShowPredValues;
   }
 
   if (typeof restChanges.usageRefreshIntervalMs === 'number' && Number.isFinite(restChanges.usageRefreshIntervalMs)) {

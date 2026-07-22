@@ -213,6 +213,13 @@ const normalizeExecution = (value) => {
   const modelID = asNonEmptyString(value.modelID);
   const variant = asNonEmptyString(value.variant);
   const agent = asNonEmptyString(value.agent);
+  const goalEnabled = value.goalEnabled === true;
+  const permissionAutoAccept = value.permissionAutoAccept === true;
+  const goalTokenBudget = typeof value.goalTokenBudget === 'number'
+    && Number.isFinite(value.goalTokenBudget)
+    && value.goalTokenBudget > 0
+    ? Math.floor(value.goalTokenBudget)
+    : undefined;
 
   if (!prompt) {
     throw new Error('execution.prompt is required');
@@ -230,6 +237,9 @@ const normalizeExecution = (value) => {
     modelID,
     ...(variant ? { variant } : {}),
     ...(agent ? { agent } : {}),
+    ...(goalEnabled ? { goalEnabled: true } : {}),
+    ...(goalEnabled && goalTokenBudget ? { goalTokenBudget } : {}),
+    ...(permissionAutoAccept ? { permissionAutoAccept: true } : {}),
   };
 };
 
@@ -270,6 +280,7 @@ const normalizeTaskForStorage = (value, options) => {
     createId,
     existingTask,
     allowCreate,
+    refreshUpdatedAt = true,
   } = options;
 
   if (!value || typeof value !== 'object') {
@@ -307,7 +318,7 @@ const normalizeTaskForStorage = (value, options) => {
   const state = {
     ...baseState,
     createdAt: existingTask?.state?.createdAt ?? baseState.createdAt ?? nowMs,
-    updatedAt: nowMs,
+    updatedAt: refreshUpdatedAt ? nowMs : baseState.updatedAt ?? nowMs,
   };
 
   return {
@@ -386,6 +397,7 @@ export const createProjectConfigRuntime = (deps) => {
           createId: taskIDFactory,
           existingTask: null,
           allowCreate: true,
+          refreshUpdatedAt: false,
         });
         scheduledTasks.push(normalized);
       } catch {
@@ -554,12 +566,4 @@ export const createProjectConfigRuntime = (deps) => {
     updateScheduledTaskState,
     resolveProjectConfigPath,
   };
-};
-
-export {
-  MAX_TASK_NAME_LENGTH,
-  MAX_TASK_PROMPT_LENGTH,
-  MAX_CRON_LENGTH,
-  MAX_LAST_ERROR_LENGTH,
-  normalizeTaskForStorage,
 };

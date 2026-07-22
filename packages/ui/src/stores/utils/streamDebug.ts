@@ -7,15 +7,6 @@ export const streamDebugEnabled = (): boolean => {
     }
 };
 
-export const sessionStatusDebugEnabled = (): boolean => {
-    if (typeof window === 'undefined') return false;
-    try {
-        return window.localStorage.getItem('openchamber_session_status_debug') === '1';
-    } catch {
-        return false;
-    }
-};
-
 const STREAM_PERF_STORAGE_KEY = 'openchamber_stream_perf';
 
 type PerfCounter = {
@@ -31,7 +22,7 @@ type StreamPerfState = {
     lastUpdatedAt: number;
 };
 
-export type StreamPerfEntry = {
+type StreamPerfEntry = {
     metric: string;
     count: number;
     avg: number;
@@ -51,6 +42,11 @@ export type StreamPerfSnapshot = {
 declare global {
     interface Window {
         __openchamberStreamPerfState?: StreamPerfState;
+        __openchamberStreamPerformance?: {
+            setEnabled: (enabled: boolean) => void;
+            reset: () => void;
+            getSnapshot: () => StreamPerfSnapshot;
+        };
         __openchamberVsCodeStreamPerfState?: {
             counters: Map<string, PerfCounter>;
             lastReportAt?: number;
@@ -61,7 +57,7 @@ declare global {
     }
 }
 
-export const streamPerfEnabled = (): boolean => {
+const readInitialStreamPerfEnabled = (): boolean => {
     if (typeof window === 'undefined') return false;
     try {
         return window.localStorage.getItem(STREAM_PERF_STORAGE_KEY) === '1';
@@ -69,6 +65,8 @@ export const streamPerfEnabled = (): boolean => {
         return false;
     }
 };
+
+let streamPerfEnabled = readInitialStreamPerfEnabled();
 
 const nowMs = (): number => {
     if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -78,7 +76,7 @@ const nowMs = (): number => {
 };
 
 const ensureStreamPerfState = (): StreamPerfState | null => {
-    if (!streamPerfEnabled() || typeof window === 'undefined') {
+    if (!streamPerfEnabled || typeof window === 'undefined') {
         return null;
     }
 
@@ -123,6 +121,7 @@ const updatePerfCounter = (metric: string, amount: number): void => {
 };
 
 export const setStreamPerfEnabled = (enabled: boolean): void => {
+    streamPerfEnabled = enabled;
     if (typeof window === 'undefined') {
         return;
     }
@@ -151,7 +150,7 @@ export const resetStreamPerf = (): void => {
         return;
     }
 
-    if (streamPerfEnabled()) {
+    if (streamPerfEnabled) {
         window.__openchamberStreamPerfState = {
             counters: new Map<string, PerfCounter>(),
             startedAt: Date.now(),
@@ -181,7 +180,7 @@ export const getStreamPerfSnapshot = (): StreamPerfSnapshot => {
     }
 
     const state = window.__openchamberStreamPerfState;
-    if (!streamPerfEnabled() || !state) {
+    if (!streamPerfEnabled || !state) {
         return {
             enabled: false,
             startedAt: null,
@@ -212,7 +211,7 @@ export const getVsCodeStreamPerfSnapshot = (): StreamPerfSnapshot => {
     }
 
     const state = window.__openchamberVsCodeStreamPerfState;
-    if (!streamPerfEnabled() || !state) {
+    if (!streamPerfEnabled || !state) {
         return {
             enabled: false,
             startedAt: null,
@@ -241,8 +240,15 @@ export const streamPerfObserve = (metric: string, value: number): void => {
     updatePerfCounter(metric, value);
 };
 
+export const streamPerfMark = (metric: string): void => {
+    if (!streamPerfEnabled || typeof performance === 'undefined' || typeof performance.mark !== 'function') {
+        return;
+    }
+    performance.mark(`openchamber.${metric}`);
+};
+
 export const streamPerfMeasure = <T>(metric: string, fn: () => T): T => {
-    if (!streamPerfEnabled()) {
+    if (!streamPerfEnabled) {
         return fn();
     }
 
@@ -253,3 +259,11 @@ export const streamPerfMeasure = <T>(metric: string, fn: () => T): T => {
         updatePerfCounter(metric, nowMs() - start);
     }
 };
+
+if (typeof window !== 'undefined') {
+    window.__openchamberStreamPerformance = {
+        setEnabled: setStreamPerfEnabled,
+        reset: resetStreamPerf,
+        getSnapshot: getStreamPerfSnapshot,
+    };
+}

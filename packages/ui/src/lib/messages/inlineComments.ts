@@ -1,10 +1,11 @@
 import type { InlineCommentDraft } from '@/stores/useInlineCommentDraftStore';
+import { appendTerminalContexts } from './terminalContext';
 
 /**
  * Format a single inline comment draft into the standard message format
  * used by diff, plan, and file viewers
  */
-export function formatInlineCommentDraft(draft: InlineCommentDraft): string {
+function formatInlineCommentDraft(draft: InlineCommentDraft): string {
   const { fileLabel, startLine, endLine, side, language, code, text } = draft;
   
   // Diff format includes side (original/modified)
@@ -28,7 +29,7 @@ export function formatInlineCommentDraft(draft: InlineCommentDraft): string {
  * Format multiple inline comment drafts into a single string
  * with each comment separated by a blank line
  */
-export function formatInlineCommentDrafts(drafts: InlineCommentDraft[]): string {
+function formatInlineCommentDrafts(drafts: InlineCommentDraft[]): string {
   if (drafts.length === 0) return '';
 
   if (drafts.every((draft) => draft.source === 'preview-annotation')) {
@@ -45,26 +46,19 @@ export function formatInlineCommentDrafts(drafts: InlineCommentDraft[]): string 
  */
 export function appendInlineComments(text: string, drafts: InlineCommentDraft[]): string {
   if (drafts.length === 0) return text;
-  
-  const formattedComments = formatInlineCommentDrafts(drafts);
-  
-  if (!text.trim()) {
-    return formattedComments;
+  const terminalDrafts = drafts.filter((draft) => draft.source === 'terminal');
+  const otherDrafts = drafts.filter((draft) => draft.source !== 'terminal');
+  const withComments = otherDrafts.length > 0
+    ? (text.trim() ? `${text}\n\n${formatInlineCommentDrafts(otherDrafts)}` : formatInlineCommentDrafts(otherDrafts))
+    : text;
+  if (terminalDrafts.length > 0) {
+    return appendTerminalContexts(withComments, terminalDrafts.map((draft) => ({
+      terminalId: draft.language,
+      terminalLabel: draft.fileLabel,
+      startLine: draft.startLine,
+      endLine: draft.endLine,
+      text: draft.code,
+    })));
   }
-  
-  return `${text}\n\n${formattedComments}`;
-}
-
-/**
- * Check if a message text contains inline comments (for validation purposes)
- */
-export function hasInlineComments(text: string): boolean {
-  return text.includes('Comment on `') && text.includes('```');
-}
-
-/**
- * Extract the file label from a draft for display purposes
- */
-export function getDraftDisplayLabel(draft: InlineCommentDraft): string {
-  return `${draft.fileLabel}:${draft.startLine}-${draft.endLine}`;
+  return withComments;
 }

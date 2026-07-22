@@ -2,6 +2,9 @@ import React from 'react';
 import { Button } from '@/components/ui/button';
 import { useMcpStore } from '@/stores/useMcpStore';
 import { parseMcpOAuthCallbackContext, parseMcpOAuthCallbackStateKey } from '@/components/sections/mcp/mcpOAuth';
+import { runtimeFetch } from '@/lib/runtime-fetch';
+import { SETTINGS_PAGE_TITLE_CLASS } from '@/components/sections/shared/SettingsSection';
+import { cn } from '@/lib/utils';
 
 const parseQueryParam = (params: URLSearchParams, key: string): string | null => {
   const value = params.get(key);
@@ -42,7 +45,7 @@ export const McpOAuthCallbackPage: React.FC = () => {
 
     if (error) {
       if (callbackStateKey) {
-        void fetch(`/api/mcp/auth/pending?state=${encodeURIComponent(callbackStateKey)}`, { method: 'DELETE' }).catch(() => undefined);
+        void runtimeFetch(`/api/mcp/auth/pending?state=${encodeURIComponent(callbackStateKey)}`, { method: 'DELETE' }).catch(() => undefined);
       }
       setStatus('error');
       setMessage(errorDescription ?? error);
@@ -57,7 +60,7 @@ export const McpOAuthCallbackPage: React.FC = () => {
 
         let pendingContext = callbackContext;
         if (!pendingContext && callbackStateKey) {
-          const response = await fetch(`/api/mcp/auth/pending?state=${encodeURIComponent(callbackStateKey)}`);
+          const response = await runtimeFetch(`/api/mcp/auth/pending?state=${encodeURIComponent(callbackStateKey)}`);
           if (response.ok) {
             const payload = await response.json().catch(() => null) as { name?: string; directory?: string | null } | null;
             if (payload?.name?.trim()) {
@@ -75,13 +78,13 @@ export const McpOAuthCallbackPage: React.FC = () => {
 
         await completeAuth(pendingContext.name, code, pendingContext.directory);
         if (callbackStateKey) {
-          await fetch(`/api/mcp/auth/pending?state=${encodeURIComponent(callbackStateKey)}`, { method: 'DELETE' }).catch(() => undefined);
+          await runtimeFetch(`/api/mcp/auth/pending?state=${encodeURIComponent(callbackStateKey)}`, { method: 'DELETE' }).catch(() => undefined);
         }
         setStatus('success');
         setMessage('Authorization completed. You can close this tab and return to OpenChamber.');
       } catch (authError) {
         if (callbackStateKey) {
-          await fetch(`/api/mcp/auth/pending?state=${encodeURIComponent(callbackStateKey)}`, { method: 'DELETE' }).catch(() => undefined);
+          await runtimeFetch(`/api/mcp/auth/pending?state=${encodeURIComponent(callbackStateKey)}`, { method: 'DELETE' }).catch(() => undefined);
         }
         setStatus('error');
         setMessage(normalizeMcpAuthErrorMessage(authError, 'Failed to complete MCP authorization.'));
@@ -93,14 +96,21 @@ export const McpOAuthCallbackPage: React.FC = () => {
     <div className="flex min-h-screen items-center justify-center bg-background px-6 py-12 text-foreground">
       <div className="w-full max-w-xl rounded-xl border border-[var(--interactive-border)] bg-[var(--surface-elevated)] p-8 shadow-sm">
         <div className="space-y-3 text-center">
-          <div
-            className={status === 'error' ? 'text-[var(--status-error)]' : status === 'success' ? 'text-[var(--status-success)]' : 'text-[var(--status-info)]'}
+          <h1 className={SETTINGS_PAGE_TITLE_CLASS}>
+            {status === 'working' ? 'Completing Authorization' : status === 'success' ? 'Authorization Complete' : 'Authorization Failed'}
+          </h1>
+          <p
+            className={cn(
+              'typography-body',
+              status === 'error'
+                ? 'text-[var(--status-error)]'
+                : status === 'success'
+                  ? 'text-[var(--status-success)]'
+                  : 'text-[var(--status-info)]',
+            )}
           >
-            <h1 className="typography-hero font-semibold">
-              {status === 'working' ? 'Completing Authorization' : status === 'success' ? 'Authorization Complete' : 'Authorization Failed'}
-            </h1>
-          </div>
-          <p className="typography-body text-muted-foreground">{message}</p>
+            {message}
+          </p>
         </div>
 
         {status !== 'working' && (

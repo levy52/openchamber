@@ -1,8 +1,8 @@
 import React from 'react';
-import { RiFileCopyLine, RiCheckLine, RiExternalLinkLine, RiArrowDownSLine } from '@remixicon/react';
-import { isDesktopShell, isTauriShell, startDesktopWindowDrag } from '@/lib/desktop';
+import { isDesktopShell, requestFileAccess, startDesktopWindowDrag } from '@/lib/desktop';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { Icon } from "@/components/icon/Icon";
 import { updateDesktopSettings } from '@/lib/persistence';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { restartDesktopApp } from '@/lib/desktop';
@@ -10,10 +10,10 @@ import { cn } from '@/lib/utils';
 import { RemoteConnectionForm } from './RemoteConnectionForm';
 import { desktopHostsGet, desktopHostsSet } from '@/lib/desktopHosts';
 import { useI18n } from '@/lib/i18n';
+import { runtimeFetch } from '@/lib/runtime-fetch';
 
 const INSTALL_COMMAND = 'curl -fsSL https://opencode.ai/install | bash';
 const DOCS_URL = 'https://opencode.ai/docs';
-const WINDOWS_WSL_DOCS_URL = 'https://opencode.ai/docs/windows-wsl';
 const POLL_INTERVAL_MS = 2500;
 
 type OnboardingPlatform = 'macos' | 'linux' | 'windows' | 'unknown';
@@ -21,6 +21,7 @@ type OnboardingPlatform = 'macos' | 'linux' | 'windows' | 'unknown';
 type ChooserScreenProps = {
   /** Callback when CLI becomes available */
   onCliAvailable?: () => void;
+  localAvailable?: boolean;
 };
 
 function BashCommand({ onCopy, copyTitle }: { onCopy: () => void; copyTitle: string }) {
@@ -39,13 +40,13 @@ function BashCommand({ onCopy, copyTitle }: { onCopy: () => void; copyTitle: str
         title={copyTitle}
         aria-label={copyTitle}
       >
-        <RiFileCopyLine className="h-4 w-4" />
+        <Icon name="file-copy" className="h-4 w-4" />
       </button>
     </div>
   );
 }
 
-export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
+export function ChooserScreen({ onCliAvailable, localAvailable = true }: ChooserScreenProps) {
   const { t } = useI18n();
   const [copied, setCopied] = React.useState(false);
   const [isDesktopApp, setIsDesktopApp] = React.useState(false);
@@ -53,7 +54,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
   const [isManualChecking, setIsManualChecking] = React.useState(false);
   const [opencodeBinary, setOpencodeBinary] = React.useState('');
   const [platform, setPlatform] = React.useState<OnboardingPlatform>('unknown');
-  const [activeTab, setActiveTab] = React.useState<'local' | 'remote'>('local');
+  const [activeTab, setActiveTab] = React.useState<'local' | 'remote'>(() => localAvailable ? 'local' : 'remote');
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [troubleOpen, setTroubleOpen] = React.useState(false);
 
@@ -78,7 +79,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
     let cancelled = false;
     void (async () => {
       try {
-        const response = await fetch('/api/config/settings', { method: 'GET', headers: { Accept: 'application/json' } });
+        const response = await runtimeFetch('/api/config/settings', { method: 'GET', headers: { Accept: 'application/json' } });
         if (!response.ok) return;
         const data = (await response.json().catch(() => null)) as null | { opencodeBinary?: unknown };
         if (!data || cancelled) return;
@@ -105,7 +106,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
 
   const checkCliAvailability = React.useCallback(async (): Promise<boolean> => {
     try {
-      const response = await fetch('/health');
+      const response = await runtimeFetch('/health');
       if (!response.ok) return false;
       const data = await response.json();
       return data.openCodeRunning === true || data.isOpenCodeReady === true;
@@ -115,7 +116,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
   }, []);
 
   const persistFirstChoice = React.useCallback(async (choice: 'local' | 'remote') => {
-    if (!isTauriShell()) return;
+    if (!isDesktopApp) return;
 
     const config = await desktopHostsGet();
     await desktopHostsSet({
@@ -123,20 +124,20 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
       ...(choice === 'local' ? { defaultHostId: 'local' } : {}),
       initialHostChoiceCompleted: true,
     });
-  }, []);
+  }, [isDesktopApp]);
 
   const announceAvailable = React.useCallback(async () => {
-    if (isTauriShell()) {
+    if (isDesktopApp) {
       await persistFirstChoice('local');
     }
     onCliAvailable?.();
-  }, [onCliAvailable, persistFirstChoice]);
+  }, [isDesktopApp, onCliAvailable, persistFirstChoice]);
 
   // Background polling: while the local tab is visible, periodically check
   // whether the OpenCode CLI is reachable. As soon as it is, transition
   // automatically — the user doesn't have to click anything.
   React.useEffect(() => {
-    if (activeTab !== 'local') return;
+    if (!localAvailable || activeTab !== 'local') return;
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -164,7 +165,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [activeTab, checkCliAvailability, announceAvailable]);
+  }, [activeTab, checkCliAvailability, announceAvailable, localAvailable]);
 
   const handleManualCheck = React.useCallback(async () => {
     setIsManualChecking(true);
@@ -178,39 +179,32 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
 
   const handleBrowse = React.useCallback(async () => {
     if (typeof window === 'undefined') return;
-    if (!isDesktopApp || !isTauriShell()) return;
-
-    const tauri = (window as unknown as { __TAURI__?: { dialog?: { open?: (opts: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-    if (!tauri?.dialog?.open) return;
+    if (!isDesktopApp) return;
 
     try {
-      const selected = await tauri.dialog.open({
-        title: t('onboarding.localSetup.dialog.selectOpencodeBinary'),
-        multiple: false,
-        directory: false,
-      });
-      if (typeof selected === 'string' && selected.trim().length > 0) {
-        setOpencodeBinary(selected.trim());
+      const selected = await requestFileAccess();
+      if (selected.success && selected.path && selected.path.trim().length > 0) {
+        setOpencodeBinary(selected.path.trim());
       }
     } catch {
       // ignore
     }
-  }, [isDesktopApp, t]);
+  }, [isDesktopApp]);
 
   const handleApplyPath = React.useCallback(async () => {
     setIsApplyingPath(true);
     try {
       await updateDesktopSettings({ opencodeBinary: opencodeBinary.trim() });
-      if (isTauriShell()) {
+      if (isDesktopApp) {
         await persistFirstChoice('local');
         await restartDesktopApp();
         return;
       }
-      await fetch('/api/config/reload', { method: 'POST' });
+      await runtimeFetch('/api/config/reload', { method: 'POST' });
     } finally {
       setTimeout(() => setIsApplyingPath(false), 1000);
     }
-  }, [opencodeBinary, persistFirstChoice]);
+  }, [isDesktopApp, opencodeBinary, persistFirstChoice]);
 
   const handleCopy = React.useCallback(async () => {
     const result = await copyTextToClipboard(INSTALL_COMMAND);
@@ -222,7 +216,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
     }
   }, []);
 
-  const docsUrl = platform === 'windows' ? WINDOWS_WSL_DOCS_URL : DOCS_URL;
+  const docsUrl = DOCS_URL;
   const binaryPlaceholder =
     platform === 'windows'
       ? 'C:\\Users\\you\\AppData\\Roaming\\npm\\opencode.cmd'
@@ -230,7 +224,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
         ? '/home/you/.bun/bin/opencode'
         : '/Users/you/.bun/bin/opencode';
 
-  const showLocal = !isDesktopApp || !isTauriShell() || activeTab === 'local';
+  const showLocal = localAvailable && (!isDesktopApp || activeTab === 'local');
 
   return (
     <div
@@ -247,7 +241,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
           </p>
         </header>
 
-        {isDesktopApp && isTauriShell() && (
+        {isDesktopApp && localAvailable && (
           <div className="app-region-no-drag flex gap-1.5">
             <button
               type="button"
@@ -276,12 +270,13 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
           </div>
         )}
 
-        {isDesktopApp && isTauriShell() && activeTab === 'remote' ? (
+        {isDesktopApp && activeTab === 'remote' ? (
           <div className="app-region-no-drag">
             <RemoteConnectionForm
-              onBack={() => setActiveTab('local')}
+              onBack={() => localAvailable && setActiveTab('local')}
               showBackButton={false}
-              onSwitchToLocal={() => setActiveTab('local')}
+              showInstancePicker={!localAvailable}
+              onSwitchToLocal={localAvailable ? () => setActiveTab('local') : undefined}
             />
           </div>
         ) : null}
@@ -292,7 +287,6 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
               <div className="rounded-lg border border-border bg-background/50 p-4">
                 <div className="text-sm text-foreground">{t('onboarding.localSetup.windows.title')}</div>
                 <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-muted-foreground">
-                  <li>{t('onboarding.localSetup.windows.stepInstallWsl')} <code className="text-foreground/80">wsl --install</code> {t('onboarding.localSetup.windows.stepInstallWslSuffix')}</li>
                   <li>{t('onboarding.localSetup.windows.stepRunInstallInWsl')}</li>
                   <li>{t('onboarding.localSetup.windows.stepSetBinaryPath')}</li>
                 </ol>
@@ -306,7 +300,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
             <div className="app-region-no-drag rounded-lg border border-border bg-background/60 backdrop-blur-sm px-4 py-3 font-mono text-sm">
               {copied ? (
                 <div className="flex items-center gap-2" style={{ color: 'var(--status-success)' }}>
-                  <RiCheckLine className="h-4 w-4" />
+                  <Icon name="check" className="h-4 w-4" />
                   {t('onboarding.common.status.copiedToClipboard')}
                 </div>
               ) : (
@@ -322,7 +316,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
                 className="text-xs text-muted-foreground hover:text-foreground transition-colors inline-flex items-center gap-1"
               >
                 {platform === 'windows' ? t('onboarding.localSetup.docs.windows') : t('onboarding.localSetup.docs.default')}
-                <RiExternalLinkLine className="h-3 w-3" />
+                <Icon name="external-link" className="h-3 w-3" />
               </a>
               <button
                 type="button"
@@ -377,7 +371,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
             >
               <summary className="flex items-center justify-between cursor-pointer py-2.5 text-sm text-muted-foreground hover:text-foreground transition-colors list-none [&::-webkit-details-marker]:hidden">
                 <span>{t('onboarding.localSetup.advanced.title')}</span>
-                <RiArrowDownSLine className="h-4 w-4 transition-transform group-open:rotate-180" />
+                <Icon name="arrow-down-s" className="h-4 w-4 transition-transform group-open:rotate-180" />
               </summary>
               <div className="pb-4 space-y-2">
                 <div className="flex gap-2">
@@ -393,7 +387,7 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
                     variant="secondary"
                     size="sm"
                     onClick={handleBrowse}
-                    disabled={isApplyingPath || !isDesktopApp || !isTauriShell()}
+                    disabled={isApplyingPath || !isDesktopApp}
                   >
                     {t('onboarding.localSetup.actions.browse')}
                   </Button>
@@ -419,12 +413,11 @@ export function ChooserScreen({ onCliAvailable }: ChooserScreenProps) {
             >
               <summary className="flex items-center justify-between cursor-pointer py-2.5 text-sm text-muted-foreground hover:text-foreground transition-colors list-none [&::-webkit-details-marker]:hidden">
                 <span>{t('onboarding.localSetup.troubleshoot.title')}</span>
-                <RiArrowDownSLine className="h-4 w-4 transition-transform group-open:rotate-180" />
+                <Icon name="arrow-down-s" className="h-4 w-4 transition-transform group-open:rotate-180" />
               </summary>
               <ul className="pb-4 space-y-1.5 text-xs text-muted-foreground list-disc pl-4">
                 {platform === 'windows' ? (
                   <>
-                    <li>{t('onboarding.localSetup.windows.hintInstallInWsl')}</li>
                     <li>{t('onboarding.localSetup.windows.hintDetectionFailed')}</li>
                   </>
                 ) : (

@@ -1,6 +1,5 @@
 import React from 'react';
 import { Button } from '@/components/ui/button';
-import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from '@/components/ui';
@@ -20,22 +19,21 @@ import {
 } from './mcpImport';
 import { useMcpStore } from '@/stores/useMcpStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
-import {
-  RiAddLine,
-  RiArrowDownSLine,
-  RiArrowRightSLine,
-  RiClipboardLine,
-  RiDeleteBinLine,
-  RiEyeLine,
-  RiEyeOffLine,
-  RiExternalLinkLine,
-  RiFileCodeLine,
-  RiFolderLine,
-  RiPlugLine,
-  RiUser3Line,
-} from '@remixicon/react';
+import { runtimeFetch } from '@/lib/runtime-fetch';
+import { getRuntimeApiBaseUrl } from '@/lib/runtime-switch';
 import { cn } from '@/lib/utils';
-import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
+import { SettingsPageLayout } from '@/components/sections/shared/SettingsPageLayout';
+import {
+  SettingsSection,
+  SettingsFieldRow,
+  SettingsCheckboxRow,
+  SettingsStackedField,
+  SettingsChipGroup,
+  SettingsGroupTitle,
+  SETTINGS_SELECT_SIZE,
+  SETTINGS_FIELD_LABEL_CLASS,
+} from '@/components/sections/shared/SettingsSection';
+import { SettingsInfoHint } from '@/components/sections/shared/SettingsInfoHint';
 import { MCP_OAUTH_CALLBACK_PATH, parseMcpOAuthCallbackContext, parseMcpOAuthCallbackStateKey } from '@/components/sections/mcp/mcpOAuth';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import {
@@ -52,6 +50,7 @@ import {
   SelectItem,
   SelectTrigger,
 } from '@/components/ui/select';
+import { Icon } from "@/components/icon/Icon";
 import { useI18n } from '@/lib/i18n';
 
 // ─────────────────────────────────────────────────────────────
@@ -175,7 +174,7 @@ const CommandTextarea: React.FC<CommandTextareaProps> = ({
           type="button"
           title={pasteCommandTitle}
         >
-          <RiClipboardLine className="h-3 w-3" />
+          <Icon name="clipboard" className="h-3 w-3" />
           {pasteCommandLabel}
         </Button>
       </div>
@@ -354,7 +353,7 @@ const EnvEditor: React.FC<EnvEditorProps> = ({
           type="button"
           title={pasteTitle}
         >
-          <RiClipboardLine className="h-3 w-3" />
+          <Icon name="clipboard" className="h-3 w-3" />
           {pasteLabel}
         </Button>
       </div>
@@ -395,8 +394,8 @@ const EnvEditor: React.FC<EnvEditorProps> = ({
                 title={revealedKeys.has(idx) ? hideValueTitle : showValueTitle}
               >
                 {revealedKeys.has(idx)
-                  ? <RiEyeOffLine className="h-3.5 w-3.5" />
-                  : <RiEyeLine className="h-3.5 w-3.5" />}
+                  ? <Icon name="eye-off" className="h-3.5 w-3.5" />
+                  : <Icon name="eye" className="h-3.5 w-3.5" />}
               </button>
             </div>
             {/* Remove */}
@@ -406,7 +405,7 @@ const EnvEditor: React.FC<EnvEditorProps> = ({
               onClick={() => removeRow(idx)}
               aria-label={removeVariableAria}
             >
-              <RiDeleteBinLine className="h-3.5 w-3.5" />
+              <Icon name="delete-bin" className="h-3.5 w-3.5" />
             </Button>
           </div>
         ))}
@@ -419,7 +418,7 @@ const EnvEditor: React.FC<EnvEditorProps> = ({
         onClick={addRow}
         type="button"
       >
-        <RiAddLine className="h-3.5 w-3.5" />
+        <Icon name="add" className="h-3.5 w-3.5" />
         {addVariable}
       </Button>
 
@@ -514,7 +513,7 @@ const buildMcpOAuthRedirectUri = (name?: string | null, directory?: string | nul
     return null;
   }
 
-  const url = new URL(MCP_OAUTH_CALLBACK_PATH, window.location.origin);
+  const url = new URL(MCP_OAUTH_CALLBACK_PATH, getRuntimeApiBaseUrl() || window.location.origin);
   if (typeof name === 'string' && name.trim()) {
     url.searchParams.set('server', name.trim());
   }
@@ -529,7 +528,7 @@ const queuePendingMcpAuthContext = async (input: {
   name: string;
   directory?: string | null;
 }): Promise<void> => {
-  const response = await fetch('/api/mcp/auth/pending', {
+  const response = await runtimeFetch('/api/mcp/auth/pending', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -546,7 +545,7 @@ const queuePendingMcpAuthContext = async (input: {
 };
 
 const getPendingMcpAuthContext = async (stateKey: string): Promise<{ name: string; directory: string | null } | null> => {
-  const response = await fetch(`/api/mcp/auth/pending?state=${encodeURIComponent(stateKey)}`);
+  const response = await runtimeFetch(`/api/mcp/auth/pending?state=${encodeURIComponent(stateKey)}`);
   if (!response.ok) {
     return null;
   }
@@ -567,7 +566,7 @@ const clearPendingMcpAuthContext = async (stateKey: string | null | undefined): 
     return;
   }
 
-  await fetch(`/api/mcp/auth/pending?state=${encodeURIComponent(stateKey.trim())}`, { method: 'DELETE' }).catch(() => undefined);
+  await runtimeFetch(`/api/mcp/auth/pending?state=${encodeURIComponent(stateKey.trim())}`, { method: 'DELETE' }).catch(() => undefined);
 };
 
 const normalizeMcpAuthErrorMessage = (
@@ -1299,7 +1298,7 @@ export const McpPage: React.FC = () => {
     return (
       <div className="flex h-full items-center justify-center">
         <div className="text-center text-muted-foreground">
-          <RiPlugLine className="mx-auto mb-3 h-12 w-12 opacity-50" />
+          <Icon name="plug" className="mx-auto mb-3 h-12 w-12 opacity-50" />
           <p className="typography-body">{t('settings.mcp.page.empty.selectServer')}</p>
           <p className="typography-meta mt-1 opacity-75">{t('settings.mcp.page.empty.addNewOne')}</p>
         </div>
@@ -1334,88 +1333,78 @@ export const McpPage: React.FC = () => {
   };
 
   return (
-    <ScrollableOverlay outerClassName="h-full" className="w-full">
-      <div className="mx-auto w-full max-w-3xl p-3 sm:p-6 sm:pt-8">
-
-        {/* Header */}
-        <div className="mb-4">
-          <div className="min-w-0">
-            {isNewServer ? (
-              <h2 className="typography-ui-header font-semibold text-foreground truncate">{t('settings.mcp.page.header.newServer')}</h2>
-            ) : (
-              <div className="flex items-center gap-2 min-w-0">
-                <h2 className="typography-ui-header font-semibold text-foreground truncate">{selectedMcpName}</h2>
-                <StatusBadge status={effectiveRuntimeStatus?.status} enabled={enabled} getStatusLabel={getStatusLabel} variant="pill" />
-              </div>
-            )}
-            <div className="flex items-center gap-2 mt-0.5">
-              <p className="typography-meta text-muted-foreground truncate">
-                {isNewServer
-                  ? t('settings.mcp.page.header.configureNewServer')
-                  : t('settings.mcp.page.header.transport', { type: mcpType === 'local' ? t('settings.mcp.page.transport.local') : t('settings.mcp.page.transport.remote') })}
-              </p>
-              {!isNewServer && (
-                <>
-                  <Button
-                    variant={isConnected ? 'outline' : 'default'}
-                    size="xs"
-                    className="!font-normal"
-                    onClick={handleToggleConnect}
-                    disabled={isConnecting || !enabled}
-                    >
-                      {isConnecting ? t('settings.mcp.page.actions.working') : isConnected ? t('settings.mcp.page.actions.disconnect') : t('settings.mcp.page.actions.connect')}
-                    </Button>
-                  {mcpType === 'remote' && (
-                    <>
-                      <Button
-                        variant={needsAuthorization ? 'default' : 'outline'}
-                        size="xs"
-                        className="!font-normal"
-                        onClick={() => void handleStartAuthorization()}
-                        disabled={isAuthorizing || !enabled}
-                      >
-                        {isAuthorizing
-                          ? t('settings.mcp.page.actions.starting')
-                          : needsAuthorization
-                            ? t('settings.mcp.page.actions.authorize')
-                            : t('settings.mcp.page.actions.reauthorize')}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="xs"
-                        className="!font-normal gap-1 text-muted-foreground"
-                        onClick={() => void handleClearAuthorization()}
-                        disabled={isClearingAuth || !enabled}
-                      >
-                        {isClearingAuth ? t('settings.mcp.page.actions.clearing') : t('settings.mcp.page.actions.clearAuth')}
-                      </Button>
-                    </>
-                  )}
-                  {isConnected && (
-                    <Button
-                      variant="ghost"
-                      size="xs"
-                      className="!font-normal gap-1 text-muted-foreground"
-                      onClick={() => void handleTestConnection()}
-                      disabled={isTestingConnection || !enabled}
-                    >
-                      {isTestingConnection ? t('settings.mcp.page.actions.testing') : t('settings.mcp.page.actions.test')}
-                    </Button>
-                  )}
-                </>
-              )}
-            </div>
-          </div>
+    <>
+      <SettingsPageLayout
+        title={isNewServer ? t('settings.mcp.page.header.newServer') : selectedMcpName}
+        titleAccessory={!isNewServer ? (
+          <StatusBadge status={effectiveRuntimeStatus?.status} enabled={enabled} getStatusLabel={getStatusLabel} variant="pill" />
+        ) : undefined}
+        description={isNewServer
+          ? t('settings.mcp.page.header.configureNewServer')
+          : t('settings.mcp.page.header.transport', { type: mcpType === 'local' ? t('settings.mcp.page.transport.local') : t('settings.mcp.page.transport.remote') })}
+        headerEnd={!isNewServer ? (
+          <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant={isConnected ? 'outline' : 'default'}
+            size="xs"
+            className="!font-normal"
+            onClick={handleToggleConnect}
+            disabled={isConnecting || !enabled}
+          >
+            {isConnecting ? t('settings.mcp.page.actions.working') : isConnected ? t('settings.mcp.page.actions.disconnect') : t('settings.mcp.page.actions.connect')}
+          </Button>
+          {mcpType === 'remote' && (
+            <>
+              <Button
+                variant={needsAuthorization ? 'default' : 'outline'}
+                size="xs"
+                className="!font-normal"
+                onClick={() => void handleStartAuthorization()}
+                disabled={isAuthorizing || !enabled}
+              >
+                {isAuthorizing
+                  ? t('settings.mcp.page.actions.starting')
+                  : needsAuthorization
+                    ? t('settings.mcp.page.actions.authorize')
+                    : t('settings.mcp.page.actions.reauthorize')}
+              </Button>
+              <Button
+                variant="ghost"
+                size="xs"
+                className="!font-normal gap-1 text-muted-foreground"
+                onClick={() => void handleClearAuthorization()}
+                disabled={isClearingAuth || !enabled}
+              >
+                {isClearingAuth ? t('settings.mcp.page.actions.clearing') : t('settings.mcp.page.actions.clearAuth')}
+              </Button>
+            </>
+          )}
+          {isConnected && (
+            <Button
+              variant="ghost"
+              size="xs"
+              className="!font-normal gap-1 text-muted-foreground"
+              onClick={() => void handleTestConnection()}
+              disabled={isTestingConnection || !enabled}
+            >
+              {isTestingConnection ? t('settings.mcp.page.actions.testing') : t('settings.mcp.page.actions.test')}
+            </Button>
+          )}
         </div>
+      ) : undefined}
+      showSaveStatus={false}
+    >
+
+
 
         {/* Runtime Status - Simplified for connected, expanded for errors */}
         {!isNewServer && shouldShowFullStatusCard(effectiveRuntimeStatus?.status, authUrl, needsAuthorization, isAuthPolling) && (
-          <div className="mb-6 px-2">
+          <SettingsSection divider={false}>
             <div className={cn('rounded-lg border p-3', statusCardClass(effectiveRuntimeStatus?.status))}>
               <div className="space-y-4">
                 <div className="min-w-0 space-y-1">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="typography-ui-label text-foreground">{t('settings.mcp.page.status.runtimeStatus')}</span>
+                    <span className={SETTINGS_FIELD_LABEL_CLASS}>{t('settings.mcp.page.status.runtimeStatus')}</span>
                     <StatusBadge status={effectiveRuntimeStatus?.status} enabled={enabled} getStatusLabel={getStatusLabel} />
                   </div>
                   <p className="typography-meta text-muted-foreground">{runtimeDescription}</p>
@@ -1447,11 +1436,11 @@ export const McpPage: React.FC = () => {
                       <div className="break-all typography-micro text-foreground font-mono">{authUrl}</div>
                       <div className="flex flex-wrap items-center gap-2">
                         <Button variant="outline" size="xs" className="!font-normal" onClick={() => void openExternalUrl(authUrl)}>
-                          <RiExternalLinkLine className="h-3.5 w-3.5" />
+                          <Icon name="external-link" className="h-3.5 w-3.5" />
                           {t('settings.mcp.page.actions.openInBrowser')}
                         </Button>
                         <Button variant="outline" size="xs" className="!font-normal" onClick={() => void handleCopyAuthUrl()}>
-                          <RiClipboardLine className="h-3.5 w-3.5" />
+                          <Icon name="clipboard" className="h-3.5 w-3.5" />
                           {t('settings.mcp.page.actions.copyLink')}
                         </Button>
                       </div>
@@ -1463,7 +1452,7 @@ export const McpPage: React.FC = () => {
                   <div className="rounded-md border border-[var(--interactive-border)] bg-[var(--surface-background)] px-3 py-3">
                     <div className="space-y-2">
                       <div>
-                        <div className="typography-ui-label text-foreground">{t('settings.mcp.page.auth.manualFallbackTitle')}</div>
+                        <SettingsGroupTitle as="div">{t('settings.mcp.page.auth.manualFallbackTitle')}</SettingsGroupTitle>
                         <p className="mt-1 typography-micro text-muted-foreground">
                           {t('settings.mcp.page.auth.manualFallbackDescription')}
                         </p>
@@ -1500,23 +1489,18 @@ export const McpPage: React.FC = () => {
                 </p>
               )}
             </div>
-          </div>
+          </SettingsSection>
         )}
 
-        {/* Server Identity */}
-        <div className="mb-6">
-          <div className="mb-1 px-1">
-            <h3 className="typography-ui-header font-medium text-foreground">{t('settings.mcp.page.server.title')}</h3>
-          </div>
-
-          <section className="px-2 pb-2 pt-0 space-y-0">
+        <SettingsSection
+          title={t('settings.mcp.page.server.title')}
+          divider={false}
+          settingsItem="mcp.server"
+          contentClassName="space-y-0"
+        >
 
             {isNewServer && (
-              <div className="flex flex-col gap-2 py-1.5 sm:flex-row sm:items-center sm:gap-8">
-                <div className="flex min-w-0 flex-col sm:w-56 shrink-0">
-                  <span className="typography-ui-label text-foreground">{t('settings.mcp.page.server.name')}</span>
-                </div>
-                <div className="flex min-w-0 flex-1 items-center gap-2 sm:w-fit sm:flex-initial">
+              <SettingsFieldRow label={t('settings.mcp.page.server.name')}>
                   <Input
                     value={draftName}
                     onChange={(e) => setDraftName(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '-'))}
@@ -1525,26 +1509,25 @@ export const McpPage: React.FC = () => {
                     autoFocus
                   />
                   <Select value={draftScope} onValueChange={(value) => setDraftScope(value as McpScope)}>
-                    <SelectTrigger className="!h-7 !w-7 !min-w-0 !px-0 !py-0 justify-center [&>svg:last-child]:hidden" title={draftScope === 'user' ? t('settings.common.scope.global') : t('settings.common.scope.project')}>
-                      {draftScope === 'user' ? <RiUser3Line className="h-3.5 w-3.5" /> : <RiFolderLine className="h-3.5 w-3.5" />}
+                    <SelectTrigger size={SETTINGS_SELECT_SIZE} className="!h-7 !w-7 !min-w-0 !px-0 !py-0 justify-center [&>svg:last-child]:hidden" title={draftScope === 'user' ? t('settings.common.scope.global') : t('settings.common.scope.project')}>
+                      {draftScope === 'user' ? <Icon name="user-3" className="h-3.5 w-3.5" /> : <Icon name="folder" className="h-3.5 w-3.5" />}
                     </SelectTrigger>
                     <SelectContent align="end">
                       <SelectItem value="user">
                         <div className="flex items-center gap-2">
-                          <RiUser3Line className="h-3.5 w-3.5" />
+                          <Icon name="user-3" className="h-3.5 w-3.5" />
                           <span>{t('settings.common.scope.global')}</span>
                         </div>
                       </SelectItem>
                       <SelectItem value="project">
                         <div className="flex items-center gap-2">
-                          <RiFolderLine className="h-3.5 w-3.5" />
+                          <Icon name="folder" className="h-3.5 w-3.5" />
                           <span>{t('settings.common.scope.project')}</span>
                         </div>
                       </SelectItem>
                     </SelectContent>
                   </Select>
-                </div>
-              </div>
+              </SettingsFieldRow>
             )}
 
             {/* Import JSON - prominent placement for new servers */}
@@ -1558,71 +1541,37 @@ export const McpPage: React.FC = () => {
                   type="button"
                   title={t('settings.mcp.page.server.importJsonTitle')}
                 >
-                  <RiFileCodeLine className="h-3.5 w-3.5" />
+                  <Icon name="file-code" className="h-3.5 w-3.5" />
                   {t('settings.mcp.page.server.importJson')}
                 </Button>
               </div>
             )}
 
-            <div
-              className="group flex cursor-pointer items-center gap-2 py-1.5"
-              role="button"
-              tabIndex={0}
-              aria-pressed={enabled}
-              onClick={() => setEnabled(!enabled)}
-              onKeyDown={(event) => {
-                if (event.key === ' ' || event.key === 'Enter') {
-                  event.preventDefault();
-                  setEnabled(!enabled);
-                }
-              }}
-            >
-              <Checkbox
-                checked={enabled}
-                onChange={setEnabled}
-                ariaLabel={t('settings.mcp.page.server.enableAria')}
+            <SettingsCheckboxRow
+              checked={enabled}
+              onChange={setEnabled}
+              label={t('settings.mcp.page.server.enable')}
+              ariaLabel={t('settings.mcp.page.server.enableAria')}
+            />
+
+            <SettingsStackedField label={t('settings.mcp.page.server.transportMode')}>
+              <SettingsChipGroup
+                aria-label={t('settings.mcp.page.server.transportMode')}
+                value={mcpType}
+                onChange={setMcpType}
+                options={[
+                  { value: 'local', label: t('settings.mcp.page.transport.local') },
+                  { value: 'remote', label: t('settings.mcp.page.transport.remote') },
+                ]}
               />
-              <span className="typography-ui-label text-foreground">{t('settings.mcp.page.server.enable')}</span>
-            </div>
+            </SettingsStackedField>
 
-            <div className="flex flex-col gap-2 py-1.5 sm:flex-row sm:items-center sm:gap-8">
-              <div className="flex min-w-0 flex-col sm:w-56 shrink-0">
-                <span className="typography-ui-label text-foreground">{t('settings.mcp.page.server.transportMode')}</span>
-                <div className="flex flex-wrap items-center gap-1">
-                  <Button
-                    variant="chip"
-                    size="xs"
-                    aria-pressed={mcpType === 'local'}
-                    onClick={() => setMcpType('local')}
-                    className="!font-normal"
-                  >
-                    {t('settings.mcp.page.transport.local')}
-                  </Button>
-                  <Button
-                    variant="chip"
-                    size="xs"
-                    aria-pressed={mcpType === 'remote'}
-                    onClick={() => setMcpType('remote')}
-                    className="!font-normal"
-                  >
-                    {t('settings.mcp.page.transport.remote')}
-                  </Button>
-                </div>
-              </div>
-            </div>
+        </SettingsSection>
 
-          </section>
-        </div>
-
-        {/* Connection */}
-        <div className="mb-6">
-          <div className="mb-1 px-1">
-            <h3 className="typography-ui-header font-medium text-foreground">
-              {mcpType === 'local' ? t('settings.mcp.page.connection.command') : t('settings.mcp.page.connection.serverUrl')}
-            </h3>
-          </div>
-
-          <section className="px-2 pb-2 pt-0">
+        <SettingsSection
+          title={mcpType === 'local' ? t('settings.mcp.page.connection.command') : t('settings.mcp.page.connection.serverUrl')}
+          settingsItem="mcp.command"
+        >
             {mcpType === 'local' ? (
               <CommandTextarea
                 value={command}
@@ -1641,16 +1590,13 @@ export const McpPage: React.FC = () => {
                 className="font-mono typography-meta"
               />
             )}
-          </section>
-        </div>
+        </SettingsSection>
 
         {mcpType === 'remote' && (
-          <div className="mb-6">
-            <div className="mb-1 px-1">
-              <h3 className="typography-ui-header font-medium text-foreground">{t('settings.mcp.page.advanced.title')}</h3>
-            </div>
-
-            <section className="px-2 pb-2 pt-0">
+          <SettingsSection
+            title={t('settings.mcp.page.advanced.title')}
+            settingsItem="mcp.advanced"
+          >
               <Collapsible
                 open={isAdvancedRemoteOptionsOpen}
                 onOpenChange={setIsAdvancedRemoteOptionsOpen}
@@ -1663,17 +1609,18 @@ export const McpPage: React.FC = () => {
                     </span>
                   </div>
                   {isAdvancedRemoteOptionsOpen ? (
-                    <RiArrowDownSLine className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors" />
+                    <Icon name="arrow-down-s" className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors" />
                   ) : (
-                    <RiArrowRightSLine className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors" />
+                    <Icon name="arrow-right-s" className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors" />
                   )}
                 </CollapsibleTrigger>
                 <CollapsibleContent className="pt-2">
                   <div className="space-y-4">
                     <div className="space-y-2">
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-8">
-                        <div className="flex min-w-0 flex-col sm:w-56 shrink-0">
-                          <span className="typography-ui-label text-foreground">{t('settings.mcp.page.advanced.timeoutMs')}</span>
+                      <div className="flex flex-col gap-2 @xl:flex-row @xl:items-center @xl:gap-8">
+                        <div className="flex min-w-0 flex-row items-center gap-1 @xl:w-56 shrink-0">
+                          <span className={SETTINGS_FIELD_LABEL_CLASS}>{t('settings.mcp.page.advanced.timeoutMs')}</span>
+                          <SettingsInfoHint>{t('settings.mcp.page.advanced.timeoutHint')}</SettingsInfoHint>
                         </div>
                         <div className="flex items-center gap-2">
                           <Input
@@ -1689,18 +1636,15 @@ export const McpPage: React.FC = () => {
                           />
                         </div>
                       </div>
-                      <p className="typography-micro text-muted-foreground sm:pl-64">
-                        {t('settings.mcp.page.advanced.timeoutHint')}
-                      </p>
                     </div>
 
                     <div>
-                      <div className="mb-2 typography-ui-label text-foreground">
+                      <SettingsGroupTitle as="div" className="mb-2">
                         {t('settings.mcp.page.advanced.requestHeaders')}
                         {headerEntries.length > 0 && (
                           <span className="ml-1.5 typography-micro text-muted-foreground font-normal">({headerEntries.length})</span>
                         )}
-                      </div>
+                      </SettingsGroupTitle>
                       <EnvEditor
                         value={headerEntries}
                         onChange={setHeaderEntries}
@@ -1724,24 +1668,15 @@ export const McpPage: React.FC = () => {
                     </div>
 
                     <div className="space-y-3">
-                      <div
-                        className="group flex cursor-pointer items-center gap-2 py-1.5"
-                        role="button"
-                        tabIndex={0}
-                        aria-pressed={oauthEnabled}
-                        onClick={() => setOauthEnabled(!oauthEnabled)}
-                        onKeyDown={(event) => {
-                          if (event.key === ' ' || event.key === 'Enter') {
-                            event.preventDefault();
-                            setOauthEnabled(!oauthEnabled);
-                          }
-                        }}
-                      >
-                        <Checkbox checked={oauthEnabled} onChange={setOauthEnabled} ariaLabel={t('settings.mcp.page.advanced.oauthAutoDetectionAria')} />
-                        <span className="typography-ui-label text-foreground">{t('settings.mcp.page.advanced.oauthAutoDetection')}</span>
-                      </div>
+                      <SettingsCheckboxRow
+                        checked={oauthEnabled}
+                        onChange={setOauthEnabled}
+                        label={t('settings.mcp.page.advanced.oauthAutoDetection')}
+                        ariaLabel={t('settings.mcp.page.advanced.oauthAutoDetectionAria')}
+                        info={t('settings.mcp.page.advanced.oauthHint')}
+                      />
 
-                      <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="grid gap-3 @xl:grid-cols-2">
                         <Input
                           value={oauthClientId}
                           onChange={(e) => setOauthClientId(e.target.value)}
@@ -1780,9 +1715,6 @@ export const McpPage: React.FC = () => {
                         />
                       </div>
 
-                      <p className="typography-micro text-muted-foreground">
-                        {t('settings.mcp.page.advanced.oauthHint')}
-                      </p>
                       {suggestedRedirectUri && (
                         <p className="typography-micro text-muted-foreground">
                           {t('settings.mcp.page.advanced.oauthCallbackHint')}
@@ -1793,24 +1725,20 @@ export const McpPage: React.FC = () => {
                   </div>
                 </CollapsibleContent>
               </Collapsible>
-            </section>
-          </div>
+          </SettingsSection>
         )}
 
-        {/* Environment Variables */}
-        <div className="mb-2">
-          <div className="mb-1 px-1">
-            <h3 className="typography-ui-header font-medium text-foreground">
-              {t('settings.mcp.page.env.title')}
-              {envEntries.length > 0 && (
-                <span className="ml-1.5 typography-micro text-muted-foreground font-normal">
-                  ({envEntries.length})
-                </span>
-              )}
-            </h3>
-          </div>
-
-          <section className="px-2 pb-2 pt-0">
+        <SettingsSection
+          title={t('settings.mcp.page.env.title')}
+          titleAccessory={
+            envEntries.length > 0 ? (
+              <span className="typography-micro text-muted-foreground font-normal">
+                ({envEntries.length})
+              </span>
+            ) : null
+          }
+          settingsItem="mcp.environment"
+        >
             {envEntries.length === 0 ? (
               <Button
                 variant="outline"
@@ -1818,7 +1746,7 @@ export const McpPage: React.FC = () => {
                 className="!font-normal gap-1.5"
                 onClick={() => setEnvEntries([{ key: '', value: '' }])}
               >
-                <RiAddLine className="h-3.5 w-3.5" />
+                <Icon name="add" className="h-3.5 w-3.5" />
                 {t('settings.mcp.page.env.addEnvironmentVariable')}
               </Button>
             ) : (
@@ -1841,11 +1769,9 @@ export const McpPage: React.FC = () => {
                 removeVariableAria={t('settings.mcp.page.env.removeVariableAria')}
               />
             )}
-          </section>
-        </div>
+        </SettingsSection>
 
-        {/* Actions */}
-        <div className="flex items-center gap-2 px-2 py-1">
+        <div className="flex items-center gap-2 pb-8">
           <Button
             onClick={handleSave}
             disabled={isSaving || (!isDirty && !isNewServer)}
@@ -1864,8 +1790,8 @@ export const McpPage: React.FC = () => {
               {t('settings.common.actions.delete')}
             </Button>
           )}
-        </div>
-      </div>
+        </div>      </SettingsPageLayout>
+
 
       {/* Import JSON dialog */}
       <Dialog
@@ -1913,7 +1839,7 @@ export const McpPage: React.FC = () => {
                 onClick={handlePasteImportClipboard}
                 type="button"
               >
-                <RiClipboardLine className="h-3.5 w-3.5" />
+                <Icon name="clipboard" className="h-3.5 w-3.5" />
                 {t('settings.mcp.page.importDialog.pasteFromClipboard')}
               </Button>
             </div>
@@ -1973,6 +1899,7 @@ export const McpPage: React.FC = () => {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </ScrollableOverlay>
+
+    </>
   );
 };

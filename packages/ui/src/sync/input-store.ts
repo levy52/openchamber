@@ -5,9 +5,12 @@
 
 import { create } from "zustand"
 import type { AttachedFile } from "@/stores/types/sessionTypes"
+import { prepareAttachmentFiles } from "./attachment-files"
 
 const FILE_URI_PREFIX = "file://"
+const MAX_ATTACHMENT_PREPARATION_ATTEMPTS = 3
 const pendingVSCodeSelectionKeys = new Set<string>()
+let attachmentReadGeneration = 0
 
 const encodeFilePath = (filepath: string): string => {
   let normalized = filepath.replace(/\\/g, "/")
@@ -32,6 +35,40 @@ const toFileUrl = (filepath: string): string => {
 }
 
 const getVSCodeSelectionKey = (path: string, filename: string): string => `${path}\u0000${filename}`
+
+const hasGeneratedFilenameCollision = (filenames: string[], attachedFiles: AttachedFile[]): boolean => {
+  if (filenames.length === 0) return false
+  const attachedFilenames = new Set(attachedFiles.map((attachment) => attachment.filename.toLowerCase()))
+  return filenames.some((filename) => attachedFilenames.has(filename.toLowerCase()))
+}
+
+const readFileAsDataUrl = (file: File, mime: string): Promise<string> => new Promise((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = () => {
+    const value = typeof reader.result === "string" ? reader.result : ""
+    const commaIndex = value.indexOf(",")
+    resolve(commaIndex === -1 ? value : `data:${mime};base64,${value.slice(commaIndex + 1)}`)
+  }
+  reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"))
+  reader.onabort = () => reject(new Error("File read aborted"))
+  reader.readAsDataURL(file)
+})
+
+const getDataUrlByteSize = (url: string): number => {
+  if (!url.startsWith("data:")) return 0
+  const commaIndex = url.indexOf(",")
+  if (commaIndex < 0) return 0
+  const metadata = url.slice(0, commaIndex).toLowerCase()
+  const payload = url.slice(commaIndex + 1)
+  if (!metadata.endsWith(";base64")) return 0
+  let padding = 0
+  if (payload.endsWith("==")) {
+    padding = 2
+  } else if (payload.endsWith("=")) {
+    padding = 1
+  }
+  return Math.max(0, Math.floor((payload.length * 3) / 4) - padding)
+}
 
 const isSameVSCodeActiveEditorFile = (a: VSCodeActiveEditorFile | null, b: VSCodeActiveEditorFile | null): boolean => {
   if (a === b) return true
@@ -63,25 +100,37 @@ export type InputState = {
   pendingInputText: string | null
   pendingInputMode: "replace" | "append" | "append-inline"
   pendingSyntheticParts: SyntheticContextPart[] | null
+  /**
+   * Text a draft preset chip asked to submit immediately. Set by surfaces that
+   * render the chips outside ChatInput (e.g. under the welcome message on
+   * narrow layouts); consumed by ChatInput, which owns the command-aware submit.
+   */
+  pendingPresetSubmit: string | null
   attachedFiles: AttachedFile[]
   activeEditorFile: VSCodeActiveEditorFile | null
 
   setPendingInputText: (text: string | null, mode?: "replace" | "append" | "append-inline") => void
   consumePendingInputText: () => { text: string; mode: "replace" | "append" | "append-inline" } | null
+  requestPresetSubmit: (text: string) => void
+  consumePendingPresetSubmit: () => string | null
   setPendingSyntheticParts: (parts: SyntheticContextPart[] | null) => void
   consumePendingSyntheticParts: () => SyntheticContextPart[] | null
-  addAttachedFile: (file: File) => Promise<void>
+  addAttachedFile: (file: File) => Promise<boolean>
   removeAttachedFile: (id: string) => void
+  setAttachedFiles: (files: AttachedFile[]) => void
   clearAttachedFiles: () => void
   addVSCodeFileAttachment: (path: string, name: string, fileSize: number | null) => void
   addVSCodeSelectionAttachment: (path: string, file: File) => Promise<void>
   setActiveEditorFile: (file: VSCodeActiveEditorFile | null) => void
+  /** Add attachments restored from a reverted message (file already on server) */
+  addRestoredAttachment: (file: { url: string; mimeType: string; filename: string }) => void
 }
 
 export const useInputStore = create<InputState>()((set, get) => ({
   pendingInputText: null,
   pendingInputMode: "replace",
   pendingSyntheticParts: null,
+  pendingPresetSubmit: null,
   attachedFiles: [],
   activeEditorFile: null,
 
@@ -95,6 +144,15 @@ export const useInputStore = create<InputState>()((set, get) => ({
     return { text: pendingInputText, mode: pendingInputMode }
   },
 
+  requestPresetSubmit: (text) => set({ pendingPresetSubmit: text }),
+
+  consumePendingPresetSubmit: () => {
+    const { pendingPresetSubmit } = get()
+    if (pendingPresetSubmit === null) return null
+    set({ pendingPresetSubmit: null })
+    return pendingPresetSubmit
+  },
+
   setPendingSyntheticParts: (parts) => set({ pendingSyntheticParts: parts }),
 
   consumePendingSyntheticParts: () => {
@@ -106,28 +164,55 @@ export const useInputStore = create<InputState>()((set, get) => ({
   },
 
   addAttachedFile: async (file: File) => {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    const dataUrl = await new Promise<string>((resolve) => {
-      const reader = new FileReader()
-      reader.onload = () => resolve(reader.result as string)
-      reader.readAsDataURL(file)
-    })
-    const attached: AttachedFile = {
-      id,
-      file,
-      dataUrl,
-      mimeType: file.type,
-      filename: file.name,
-      size: file.size,
-      source: "local",
+    const generation = attachmentReadGeneration
+    for (let attempt = 0; attempt < MAX_ATTACHMENT_PREPARATION_ATTEMPTS; attempt += 1) {
+      const reservedFilenames = get().attachedFiles.map((attachment) => attachment.filename)
+      const preparedOrPending = prepareAttachmentFiles(file, reservedFilenames)
+      const preparedFiles = preparedOrPending instanceof Promise ? await preparedOrPending : preparedOrPending
+      if (!preparedFiles || preparedFiles.length === 0 || generation !== attachmentReadGeneration) return false
+
+      const generatedFilenames = preparedFiles.slice(1).map((prepared) => prepared.file.name)
+      if (hasGeneratedFilenameCollision(generatedFilenames, get().attachedFiles)) continue
+
+      const attachedFiles: AttachedFile[] = []
+      for (const prepared of preparedFiles) {
+        let dataUrl: string
+        try {
+          dataUrl = await readFileAsDataUrl(prepared.file, prepared.mimeType)
+        } catch {
+          return false
+        }
+        if (!dataUrl || generation !== attachmentReadGeneration) return false
+        attachedFiles.push({
+          id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          file: prepared.file,
+          dataUrl,
+          mimeType: prepared.mimeType,
+          filename: prepared.file.name,
+          size: prepared.file.size,
+          source: "local",
+        })
+      }
+
+      if (hasGeneratedFilenameCollision(generatedFilenames, get().attachedFiles)) continue
+      set((state) => ({ attachedFiles: [...state.attachedFiles, ...attachedFiles] }))
+      return true
     }
-    set((s) => ({ attachedFiles: [...s.attachedFiles, attached] }))
+    return false
   },
 
   removeAttachedFile: (id) =>
     set((s) => ({ attachedFiles: s.attachedFiles.filter((f) => f.id !== id) })),
 
-  clearAttachedFiles: () => set({ attachedFiles: [] }),
+  setAttachedFiles: (files) => {
+    attachmentReadGeneration += 1
+    set({ attachedFiles: files })
+  },
+
+  clearAttachedFiles: () => {
+    attachmentReadGeneration += 1
+    set({ attachedFiles: [] })
+  },
 
   addVSCodeFileAttachment: (path: string, name: string, fileSize: number | null) => {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -155,6 +240,7 @@ export const useInputStore = create<InputState>()((set, get) => ({
 
   addVSCodeSelectionAttachment: async (path: string, file: File) => {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const generation = attachmentReadGeneration
     const selectionKey = getVSCodeSelectionKey(path, file.name)
     const isDuplicate = get().attachedFiles.some(
       (f) => f.source === 'vscode' && f.vscodeSource === 'selection' && f.filename === file.name && f.vscodePath === path
@@ -163,14 +249,13 @@ export const useInputStore = create<InputState>()((set, get) => ({
     pendingVSCodeSelectionKeys.add(selectionKey)
     let dataUrl: string
     try {
-      dataUrl = await new Promise<string>((resolve) => {
-        const reader = new FileReader()
-        reader.onload = () => resolve(reader.result as string)
-        reader.readAsDataURL(file)
-      })
+      dataUrl = await readFileAsDataUrl(file, file.type)
+    } catch {
+      return
     } finally {
       pendingVSCodeSelectionKeys.delete(selectionKey)
     }
+    if (generation !== attachmentReadGeneration) return
     const attached: AttachedFile = {
       id,
       file,
@@ -188,5 +273,24 @@ export const useInputStore = create<InputState>()((set, get) => ({
   setActiveEditorFile: (file) => {
     if (isSameVSCodeActiveEditorFile(get().activeEditorFile, file)) return
     set({ activeEditorFile: file })
+  },
+
+  addRestoredAttachment: ({ url, mimeType, filename }) => {
+    const id = `restored-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    // Use "local" source so the file renders in AttachedFilesList.
+    // Set serverPath to the URL so ImagePreview can use it as the img src
+    // when dataUrl is not a data: URL. sanitizeAttachmentsForSend leaves
+    // dataUrl alone for non-server sources, so the URL stays intact on send.
+    const attached: AttachedFile = {
+      id,
+      file: new File([], filename, { type: mimeType }),
+      dataUrl: url,
+      mimeType,
+      filename,
+      size: getDataUrlByteSize(url),
+      source: "local",
+      serverPath: url,
+    }
+    set((s) => ({ attachedFiles: [...s.attachedFiles, attached] }))
   },
 }))

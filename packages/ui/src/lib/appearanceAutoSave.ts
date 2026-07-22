@@ -3,9 +3,16 @@ import { updateDesktopSettings } from '@/lib/persistence';
 import type { DesktopSettings } from '@/lib/desktop';
 import type { MonoFontOption, UiFontOption } from '@/lib/fontOptions';
 import type { MobileKeyboardMode } from '@/lib/mobileKeyboardMode';
+import type { TerminalShell } from '@/lib/api/types';
 
 type AppearanceSlice = {
   showReasoningTraces: boolean;
+  sessionRecapEnabled: boolean;
+  sessionSuggestionEnabled: boolean;
+  sessionGoalEnabled: boolean;
+  sessionGoalDefaultBudgetEnabled: boolean;
+  sessionGoalDefaultBudget: number;
+  collapsibleThinkingBlocks: boolean;
   showDeletionDialog: boolean;
   nativeNotificationsEnabled: boolean;
   notificationMode: 'always' | 'hidden-only';
@@ -28,6 +35,9 @@ type AppearanceSlice = {
   sessionRetentionAction: 'archive' | 'delete';
   fontSize: number;
   terminalFontSize: number;
+  terminalShell: TerminalShell;
+  terminalLoginShells: TerminalShell[];
+  editorFontSize: number;
   uiFont: UiFontOption;
   monoFont: MonoFontOption;
   padding: number;
@@ -35,7 +45,6 @@ type AppearanceSlice = {
   inputBarOffset: number;
   mobileKeyboardMode: MobileKeyboardMode;
   diffLayoutPreference: 'dynamic' | 'inline' | 'side-by-side';
-  diffViewMode: 'single' | 'stacked';
   gitChangesViewMode: 'flat' | 'tree';
 };
 
@@ -50,6 +59,12 @@ export const startAppearanceAutoSave = (): void => {
 
   let previous: AppearanceSlice = {
     showReasoningTraces: useUIStore.getState().showReasoningTraces,
+    sessionRecapEnabled: useUIStore.getState().sessionRecapEnabled,
+    sessionSuggestionEnabled: useUIStore.getState().sessionSuggestionEnabled,
+    sessionGoalEnabled: useUIStore.getState().sessionGoalEnabled,
+    sessionGoalDefaultBudgetEnabled: useUIStore.getState().sessionGoalDefaultBudgetEnabled,
+    sessionGoalDefaultBudget: useUIStore.getState().sessionGoalDefaultBudget,
+    collapsibleThinkingBlocks: useUIStore.getState().collapsibleThinkingBlocks,
     showDeletionDialog: useUIStore.getState().showDeletionDialog,
     nativeNotificationsEnabled: useUIStore.getState().nativeNotificationsEnabled,
     notificationMode: useUIStore.getState().notificationMode,
@@ -67,6 +82,9 @@ export const startAppearanceAutoSave = (): void => {
     sessionRetentionAction: useUIStore.getState().sessionRetentionAction,
     fontSize: useUIStore.getState().fontSize,
     terminalFontSize: useUIStore.getState().terminalFontSize,
+    terminalShell: useUIStore.getState().terminalShell,
+    terminalLoginShells: useUIStore.getState().terminalLoginShells,
+    editorFontSize: useUIStore.getState().editorFontSize,
     uiFont: useUIStore.getState().uiFont,
     monoFont: useUIStore.getState().monoFont,
     padding: useUIStore.getState().padding,
@@ -74,33 +92,18 @@ export const startAppearanceAutoSave = (): void => {
     inputBarOffset: useUIStore.getState().inputBarOffset,
     mobileKeyboardMode: useUIStore.getState().mobileKeyboardMode,
     diffLayoutPreference: useUIStore.getState().diffLayoutPreference,
-    diffViewMode: useUIStore.getState().diffViewMode,
     gitChangesViewMode: useUIStore.getState().gitChangesViewMode,
-  };
-
-  let pending: Partial<DesktopSettings> | null = null;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
-  const flush = () => {
-    const payload = pending;
-    pending = null;
-    timer = null;
-    if (payload && Object.keys(payload).length > 0) {
-      void updateDesktopSettings(payload);
-    }
-  };
-
-  const schedule = (changes: Partial<DesktopSettings>) => {
-    pending = { ...(pending ?? {}), ...changes };
-    if (timer) {
-      return;
-    }
-    timer = setTimeout(flush, 150);
   };
 
   useUIStore.subscribe((state) => {
     const current: AppearanceSlice = {
       showReasoningTraces: state.showReasoningTraces,
+      sessionRecapEnabled: state.sessionRecapEnabled,
+      sessionSuggestionEnabled: state.sessionSuggestionEnabled,
+      sessionGoalEnabled: state.sessionGoalEnabled,
+      sessionGoalDefaultBudgetEnabled: state.sessionGoalDefaultBudgetEnabled,
+      sessionGoalDefaultBudget: state.sessionGoalDefaultBudget,
+      collapsibleThinkingBlocks: state.collapsibleThinkingBlocks,
       showDeletionDialog: state.showDeletionDialog,
       nativeNotificationsEnabled: state.nativeNotificationsEnabled,
       notificationMode: state.notificationMode,
@@ -118,6 +121,9 @@ export const startAppearanceAutoSave = (): void => {
       sessionRetentionAction: state.sessionRetentionAction,
       fontSize: state.fontSize,
       terminalFontSize: state.terminalFontSize,
+      terminalShell: state.terminalShell,
+      terminalLoginShells: state.terminalLoginShells,
+      editorFontSize: state.editorFontSize,
       uiFont: state.uiFont,
       monoFont: state.monoFont,
       padding: state.padding,
@@ -125,7 +131,6 @@ export const startAppearanceAutoSave = (): void => {
       inputBarOffset: state.inputBarOffset,
       mobileKeyboardMode: state.mobileKeyboardMode,
       diffLayoutPreference: state.diffLayoutPreference,
-      diffViewMode: state.diffViewMode,
       gitChangesViewMode: state.gitChangesViewMode,
     };
 
@@ -133,6 +138,24 @@ export const startAppearanceAutoSave = (): void => {
 
     if (current.showReasoningTraces !== previous.showReasoningTraces) {
       diff.showReasoningTraces = current.showReasoningTraces;
+    }
+    if (current.sessionRecapEnabled !== previous.sessionRecapEnabled) {
+      diff.sessionRecapEnabled = current.sessionRecapEnabled;
+    }
+    if (current.sessionSuggestionEnabled !== previous.sessionSuggestionEnabled) {
+      diff.sessionSuggestionEnabled = current.sessionSuggestionEnabled;
+    }
+    if (current.sessionGoalEnabled !== previous.sessionGoalEnabled) {
+      diff.sessionGoalEnabled = current.sessionGoalEnabled;
+    }
+    if (current.sessionGoalDefaultBudgetEnabled !== previous.sessionGoalDefaultBudgetEnabled) {
+      diff.sessionGoalDefaultBudgetEnabled = current.sessionGoalDefaultBudgetEnabled;
+    }
+    if (current.sessionGoalDefaultBudget !== previous.sessionGoalDefaultBudget) {
+      diff.sessionGoalDefaultBudget = current.sessionGoalDefaultBudget;
+    }
+    if (current.collapsibleThinkingBlocks !== previous.collapsibleThinkingBlocks) {
+      diff.collapsibleThinkingBlocks = current.collapsibleThinkingBlocks;
     }
     if (current.showDeletionDialog !== previous.showDeletionDialog) {
       diff.showDeletionDialog = current.showDeletionDialog;
@@ -185,6 +208,15 @@ export const startAppearanceAutoSave = (): void => {
     if (current.terminalFontSize !== previous.terminalFontSize) {
       diff.terminalFontSize = current.terminalFontSize;
     }
+    if (current.terminalShell !== previous.terminalShell) {
+      diff.terminalShell = current.terminalShell;
+    }
+    if (current.terminalLoginShells !== previous.terminalLoginShells) {
+      diff.terminalLoginShells = current.terminalLoginShells;
+    }
+    if (current.editorFontSize !== previous.editorFontSize) {
+      diff.editorFontSize = current.editorFontSize;
+    }
     if (current.uiFont !== previous.uiFont) {
       diff.uiFont = current.uiFont;
     }
@@ -206,9 +238,6 @@ export const startAppearanceAutoSave = (): void => {
     if (current.diffLayoutPreference !== previous.diffLayoutPreference) {
       diff.diffLayoutPreference = current.diffLayoutPreference;
     }
-    if (current.diffViewMode !== previous.diffViewMode) {
-      diff.diffViewMode = current.diffViewMode;
-    }
     if (current.gitChangesViewMode !== previous.gitChangesViewMode) {
       diff.gitChangesViewMode = current.gitChangesViewMode;
     }
@@ -216,7 +245,7 @@ export const startAppearanceAutoSave = (): void => {
     previous = current;
 
     if (Object.keys(diff).length > 0) {
-      schedule(diff);
+      void updateDesktopSettings(diff);
     }
   });
 

@@ -1,6 +1,7 @@
-import type { ChatMessageEntry, TurnDiffStats, TurnSummaryRecord } from './types';
+import type { ChatMessageEntry, TurnChangedFile, TurnDiffStats, TurnSummaryRecord } from './types';
 
 interface SummaryDiff {
+    file?: string | null;
     additions?: number | null;
     deletions?: number | null;
 }
@@ -22,10 +23,15 @@ const getTextFromPart = (part: unknown): string | undefined => {
     return undefined;
 };
 
+const isCompactionSummaryMessage = (message: ChatMessageEntry): boolean => {
+    return (message.info as { summary?: unknown }).summary === true;
+};
+
 export const projectTurnSummary = (assistantMessages: ChatMessageEntry[]): TurnSummaryRecord => {
     for (let messageIndex = assistantMessages.length - 1; messageIndex >= 0; messageIndex -= 1) {
         const assistantMessage = assistantMessages[messageIndex];
         if (!assistantMessage) continue;
+        if (isCompactionSummaryMessage(assistantMessage)) continue;
 
         const finish = (assistantMessage.info as { finish?: string | null }).finish;
         if (finish !== 'stop') continue;
@@ -48,6 +54,7 @@ export const projectTurnSummary = (assistantMessages: ChatMessageEntry[]): TurnS
     for (let messageIndex = assistantMessages.length - 1; messageIndex >= 0; messageIndex -= 1) {
         const assistantMessage = assistantMessages[messageIndex];
         if (!assistantMessage) continue;
+        if (isCompactionSummaryMessage(assistantMessage)) continue;
 
         for (let partIndex = assistantMessage.parts.length - 1; partIndex >= 0; partIndex -= 1) {
             const part = assistantMessage.parts[partIndex];
@@ -101,4 +108,32 @@ export const projectTurnDiffStats = (userMessage: ChatMessageEntry): TurnDiffSta
         deletions,
         files,
     };
+};
+
+export const projectTurnChangedFiles = (userMessage: ChatMessageEntry): TurnChangedFile[] | undefined => {
+    const summary = (userMessage.info as { summary?: UserSummaryPayload | null }).summary;
+    const diffs = summary?.diffs;
+    if (!Array.isArray(diffs) || diffs.length === 0) {
+        return undefined;
+    }
+
+    const files = diffs
+        .map((diff) => {
+            if (!diff || typeof diff.file !== 'string' || diff.file.trim().length === 0) {
+                return null;
+            }
+            const additions = typeof diff.additions === 'number' ? diff.additions : 0;
+            const deletions = typeof diff.deletions === 'number' ? diff.deletions : 0;
+            if (additions === 0 && deletions === 0) {
+                return null;
+            }
+            return {
+                file: diff.file,
+                additions,
+                deletions,
+            };
+        })
+        .filter((file): file is TurnChangedFile => file !== null);
+
+    return files.length > 0 ? files : undefined;
 };

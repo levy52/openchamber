@@ -31,6 +31,27 @@ describe('resolveDesktopBootView', () => {
     ).toEqual({ screen: 'recovery', variant: 'remote-unreachable', hostId: 'remote-a', url: 'https://x.test' });
   });
 
+  test('preserves disabled local runtime capability for remote recovery', () => {
+    expect(
+      resolveDesktopBootView({
+        isDesktopShell: true,
+        bootOutcome: {
+          target: 'remote',
+          status: 'unreachable',
+          hostId: 'remote-a',
+          url: 'https://x.test',
+          localAvailable: false,
+        },
+      }),
+    ).toEqual({
+      screen: 'recovery',
+      variant: 'remote-unreachable',
+      hostId: 'remote-a',
+      url: 'https://x.test',
+      localAvailable: false,
+    });
+  });
+
   test('returns main for local ok', () => {
     expect(
       resolveDesktopBootView({
@@ -63,13 +84,36 @@ describe('resolveDesktopBootView', () => {
     ).toEqual({ screen: 'recovery', variant: 'remote-wrong-service', hostId: 'bad-host', url: 'https://bad.test' });
   });
 
-  test('returns recovery view for local unreachable', () => {
+  test('returns recovery-remote for incompatible remote', () => {
+    expect(
+      resolveDesktopBootView({
+        isDesktopShell: true,
+        bootOutcome: {
+          target: 'remote',
+          status: 'incompatible',
+          hostId: 'old-host',
+          url: 'https://old.test',
+        },
+      }),
+    ).toEqual({ screen: 'recovery', variant: 'remote-incompatible', hostId: 'old-host', url: 'https://old.test' });
+  });
+
+  test('returns chooser for local unreachable', () => {
     expect(
       resolveDesktopBootView({
         isDesktopShell: true,
         bootOutcome: { target: 'local', status: 'unreachable' },
       }),
-    ).toEqual({ screen: 'recovery', variant: 'local-unavailable' });
+    ).toEqual({ screen: 'chooser' });
+  });
+
+  test('returns remote-only chooser when local runtime is disabled', () => {
+    expect(
+      resolveDesktopBootView({
+        isDesktopShell: true,
+        bootOutcome: { target: 'local', status: 'unreachable', localAvailable: false },
+      }),
+    ).toEqual({ screen: 'chooser', localAvailable: false });
   });
 
   test('returns recovery view for remote missing', () => {
@@ -180,7 +224,7 @@ describe('shouldRestartDesktopBootFlow', () => {
   test('restarts the desktop app when boot UI is running in the startup window', () => {
     expect(
       shouldRestartDesktopBootFlow({
-        isTauriShell: true,
+        isDesktopShell: true,
         isDesktopLocalOriginActive: false,
       }),
     ).toBe(true);
@@ -189,16 +233,16 @@ describe('shouldRestartDesktopBootFlow', () => {
   test('does not restart when the local desktop origin is already active', () => {
     expect(
       shouldRestartDesktopBootFlow({
-        isTauriShell: true,
+        isDesktopShell: true,
         isDesktopLocalOriginActive: true,
       }),
     ).toBe(false);
   });
 
-  test('does not restart outside the tauri shell', () => {
+  test('does not restart outside the desktop shell', () => {
     expect(
       shouldRestartDesktopBootFlow({
-        isTauriShell: false,
+        isDesktopShell: false,
         isDesktopLocalOriginActive: false,
       }),
     ).toBe(false);

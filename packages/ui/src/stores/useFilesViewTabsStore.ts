@@ -1,7 +1,8 @@
 import { create } from 'zustand';
-import { createJSONStorage, devtools, persist } from 'zustand/middleware';
+import { devtools, persist } from 'zustand/middleware';
 
-import { getSafeStorage } from './utils/safeStorage';
+import { createDeferredSafeJSONStorage } from './utils/safeStorage';
+import { getRuntimeKey } from '@/lib/runtime-switch';
 
 type RootTabsState = {
   openPaths: string[];
@@ -12,20 +13,31 @@ type RootTabsState = {
 
 type FilesViewTabsState = {
   byRoot: Record<string, RootTabsState>;
+  activeRuntimeKey: string;
+  runtimeSnapshots: Record<string, { byRoot: Record<string, RootTabsState>; updatedAt: number }>;
 };
 
 type FilesViewTabsActions = {
-  addOpenPath: (root: string, path: string) => void;
+  addOpenPath: (root: string, path: string, options?: { allowOutsideRoot?: boolean }) => void;
   removeOpenPath: (root: string, path: string) => void;
   removeOpenPathsByPrefix: (root: string, prefixPath: string) => void;
-  setSelectedPath: (root: string, path: string | null) => void;
+  removeExpandedPathsByPrefix: (root: string, prefixPath: string) => void;
+  setSelectedPath: (root: string, path: string | null, options?: { allowOutsideRoot?: boolean }) => void;
   ensureSelectedPath: (root: string) => void;
   toggleExpandedPath: (root: string, path: string) => void;
   expandPath: (root: string, path: string) => void;
   expandPaths: (root: string, paths: string[]) => void;
+  resetForRuntimeSwitch: (runtimeKey: string) => void;
 };
 
 export type FilesViewTabsStore = FilesViewTabsState & FilesViewTabsActions;
+
+const MAX_ROOTS = 20;
+const MAX_RUNTIME_SNAPSHOTS = 8;
+const MAX_OPEN_PATHS_PER_ROOT = 50;
+const MAX_EXPANDED_PATHS_PER_ROOT = 500;
+const MAX_PATH_LENGTH = 4096;
+const ROOT_TTL_MS = 90 * 24 * 60 * 60_000;
 
 const normalizePath = (value: string): string => {
   if (!value) return '';
@@ -89,14 +101,16 @@ const sanitizeByRoot = (input: unknown): Record<string, RootTabsState> => {
       ? Array.from(new Set(state.openPaths
         .filter((value): value is string => typeof value === 'string')
         .map((value) => normalizePath(value))
-        .filter((value) => isPathWithinRoot(value, root))))
+        .filter((value) => value.length <= MAX_PATH_LENGTH && isPathWithinRoot(value, root))))
+        .slice(-MAX_OPEN_PATHS_PER_ROOT)
       : [];
 
     const expandedPaths = Array.isArray(state.expandedPaths)
       ? Array.from(new Set(state.expandedPaths
         .filter((value): value is string => typeof value === 'string')
         .map((value) => normalizePath(value))
-        .filter((value) => isPathWithinRoot(value, root))))
+        .filter((value) => value.length <= MAX_PATH_LENGTH && isPathWithinRoot(value, root))))
+        .slice(-MAX_EXPANDED_PATHS_PER_ROOT)
       : [];
 
     const selectedPathCandidate = typeof state.selectedPath === 'string'
@@ -110,6 +124,7 @@ const sanitizeByRoot = (input: unknown): Record<string, RootTabsState> => {
     const touchedAt = typeof state.touchedAt === 'number' && Number.isFinite(state.touchedAt)
       ? state.touchedAt
       : Date.now();
+    if (Date.now() - touchedAt > ROOT_TTL_MS) continue;
 
     const existing = next[root];
     if (existing) {
@@ -133,7 +148,7 @@ const sanitizeByRoot = (input: unknown): Record<string, RootTabsState> => {
     };
   }
 
-  return next;
+  return clampRoots(next, MAX_ROOTS);
 };
 
 const clampRoots = (byRoot: Record<string, RootTabsState>, maxRoots: number): Record<string, RootTabsState> => {
@@ -162,11 +177,27 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
     persist(
       (set, get) => ({
         byRoot: {},
+        activeRuntimeKey: getRuntimeKey(),
+        runtimeSnapshots: {},
 
-        addOpenPath: (root, path) => {
+        resetForRuntimeSwitch: (runtimeKey) => {
+          set((state) => {
+            const runtimeSnapshots = {
+              ...state.runtimeSnapshots,
+              [state.activeRuntimeKey]: { byRoot: sanitizeByRoot(state.byRoot), updatedAt: Date.now() },
+            };
+            return {
+              activeRuntimeKey: runtimeKey,
+              runtimeSnapshots,
+              byRoot: sanitizeByRoot(runtimeSnapshots[runtimeKey]?.byRoot),
+            };
+          });
+        },
+
+        addOpenPath: (root, path, options) => {
           const normalizedRoot = normalizePath((root || '').trim());
           const normalizedPath = normalizePath((path || '').trim());
-          if (!normalizedRoot || !normalizedPath) {
+          if (!normalizedRoot || !normalizedPath || (!options?.allowOutsideRoot && !isPathWithinRoot(normalizedPath, normalizedRoot))) {
             return;
           }
 
@@ -188,7 +219,7 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
                 selectedPath: nextSelectedPath,
               },
             };
-            return { byRoot: clampRoots(byRoot, 20) };
+            return { byRoot: clampRoots(byRoot, MAX_ROOTS) };
           });
         },
 
@@ -205,12 +236,15 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
               return state;
             }
 
-            if (!current.openPaths.includes(normalizedPath) && current.selectedPath !== normalizedPath) {
+            const comparablePath = toComparablePath(normalizedPath);
+            const isMatchingPath = (candidate: string) => toComparablePath(candidate) === comparablePath;
+            const selectedPathMatches = current.selectedPath ? isMatchingPath(current.selectedPath) : false;
+            if (!current.openPaths.some(isMatchingPath) && !selectedPathMatches) {
               return state;
             }
 
-            const openPaths = current.openPaths.filter((p) => p !== normalizedPath);
-            const selectedPath = current.selectedPath === normalizedPath ? (openPaths[0] ?? null) : current.selectedPath;
+            const openPaths = current.openPaths.filter((p) => !isMatchingPath(p));
+            const selectedPath = selectedPathMatches ? (openPaths[0] ?? null) : current.selectedPath;
 
             const byRoot = {
               ...state.byRoot,
@@ -221,7 +255,7 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
                 touchedAt: Date.now(),
               },
             };
-            return { byRoot: clampRoots(byRoot, 20) };
+            return { byRoot: clampRoots(byRoot, MAX_ROOTS) };
           });
         },
 
@@ -238,13 +272,18 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
               return state;
             }
 
-            const prefixWithSlash = normalizedPrefix.endsWith('/') ? normalizedPrefix : `${normalizedPrefix}/`;
-            const openPaths = current.openPaths.filter((p) => p !== normalizedPrefix && !p.startsWith(prefixWithSlash));
+            const comparablePrefix = toComparablePath(normalizedPrefix);
+            const comparablePrefixWithSlash = comparablePrefix.endsWith('/') ? comparablePrefix : `${comparablePrefix}/`;
+            const isWithinPrefix = (candidate: string) => {
+              const comparablePath = toComparablePath(candidate);
+              return comparablePath === comparablePrefix || comparablePath.startsWith(comparablePrefixWithSlash);
+            };
+            const openPaths = current.openPaths.filter((p) => !isWithinPrefix(p));
             if (openPaths.length === current.openPaths.length) {
               return state;
             }
 
-            const selectedPath = current.selectedPath && (current.selectedPath === normalizedPrefix || current.selectedPath.startsWith(prefixWithSlash))
+            const selectedPath = current.selectedPath && isWithinPrefix(current.selectedPath)
               ? (openPaths[0] ?? null)
               : current.selectedPath;
 
@@ -258,14 +297,51 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
               },
             };
 
-            return { byRoot: clampRoots(byRoot, 20) };
+            return { byRoot: clampRoots(byRoot, MAX_ROOTS) };
           });
         },
 
-        setSelectedPath: (root, path) => {
+        removeExpandedPathsByPrefix: (root, prefixPath) => {
+          const normalizedRoot = normalizePath((root || '').trim());
+          const normalizedPrefix = normalizePath((prefixPath || '').trim());
+          if (!normalizedRoot || !normalizedPrefix) {
+            return;
+          }
+
+          set((state) => {
+            const current = state.byRoot[normalizedRoot];
+            if (!current) {
+              return state;
+            }
+
+            const comparablePrefix = toComparablePath(normalizedPrefix);
+            const comparablePrefixWithSlash = comparablePrefix.endsWith('/') ? comparablePrefix : `${comparablePrefix}/`;
+            const expandedPaths = current.expandedPaths.filter((candidate) => {
+              const comparablePath = toComparablePath(candidate);
+              return comparablePath !== comparablePrefix && !comparablePath.startsWith(comparablePrefixWithSlash);
+            });
+
+            if (expandedPaths.length === current.expandedPaths.length) {
+              return state;
+            }
+
+            const byRoot = {
+              ...state.byRoot,
+              [normalizedRoot]: {
+                ...current,
+                expandedPaths,
+                touchedAt: Date.now(),
+              },
+            };
+
+            return { byRoot: clampRoots(byRoot, MAX_ROOTS) };
+          });
+        },
+
+        setSelectedPath: (root, path, options) => {
           const normalizedRoot = normalizePath((root || '').trim());
           const normalizedPath = path ? normalizePath(path.trim()) : null;
-          if (!normalizedRoot) {
+          if (!normalizedRoot || (normalizedPath && !options?.allowOutsideRoot && !isPathWithinRoot(normalizedPath, normalizedRoot))) {
             return;
           }
 
@@ -288,7 +364,7 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
                 selectedPath: normalizedPath,
               },
             };
-            return { byRoot: clampRoots(byRoot, 20) };
+            return { byRoot: clampRoots(byRoot, MAX_ROOTS) };
           });
         },
 
@@ -314,7 +390,7 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
         toggleExpandedPath: (root, path) => {
           const normalizedRoot = normalizePath((root || '').trim());
           const normalizedPath = normalizePath((path || '').trim());
-          if (!normalizedRoot || !normalizedPath) {
+          if (!normalizedRoot || !normalizedPath || !isPathWithinRoot(normalizedPath, normalizedRoot)) {
             return;
           }
 
@@ -337,14 +413,14 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
                 expandedPaths: nextExpandedPaths,
               },
             };
-            return { byRoot: clampRoots(byRoot, 20) };
+            return { byRoot: clampRoots(byRoot, MAX_ROOTS) };
           });
         },
 
         expandPath: (root, path) => {
           const normalizedRoot = normalizePath((root || '').trim());
           const normalizedPath = normalizePath((path || '').trim());
-          if (!normalizedRoot || !normalizedPath) {
+          if (!normalizedRoot || !normalizedPath || !isPathWithinRoot(normalizedPath, normalizedRoot)) {
             return;
           }
 
@@ -364,7 +440,7 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
                 expandedPaths: [...current.expandedPaths, normalizedPath],
               },
             };
-            return { byRoot: clampRoots(byRoot, 20) };
+            return { byRoot: clampRoots(byRoot, MAX_ROOTS) };
           });
         },
 
@@ -374,7 +450,12 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
             return;
           }
 
-          const normalizedPaths = paths.map((p) => normalizePath((p || '').trim())).filter(Boolean);
+          const normalizedPaths = paths
+            .map((p) => normalizePath((p || '').trim()))
+            .filter((p) => p && isPathWithinRoot(p, normalizedRoot));
+          if (normalizedPaths.length === 0) {
+            return;
+          }
 
           set((state) => {
             const prev = state.byRoot[normalizedRoot];
@@ -393,25 +474,49 @@ export const useFilesViewTabsStore = create<FilesViewTabsStore>()(
                 expandedPaths: [...current.expandedPaths, ...newPaths],
               },
             };
-            return { byRoot: clampRoots(byRoot, 20) };
+            return { byRoot: clampRoots(byRoot, MAX_ROOTS) };
           });
         },
       }),
       {
         name: 'files-view-tabs-store',
-        version: 2,
-        storage: createJSONStorage(() => getSafeStorage()),
-        migrate: (persistedState) => {
-          if (!persistedState || typeof persistedState !== 'object') {
-            return { byRoot: {} };
+        version: 3,
+        storage: createDeferredSafeJSONStorage(),
+        migrate: (persistedState, version) => {
+          if (version < 3 || !persistedState || typeof persistedState !== 'object') {
+            return { byRoot: {}, activeRuntimeKey: getRuntimeKey(), runtimeSnapshots: {} };
           }
-
-          const rawByRoot = (persistedState as { byRoot?: unknown }).byRoot;
+          return persistedState;
+        },
+        partialize: (state) => {
+          const currentSnapshots = {
+            ...state.runtimeSnapshots,
+            [state.activeRuntimeKey]: { byRoot: sanitizeByRoot(state.byRoot), updatedAt: Date.now() },
+          };
+          const runtimeSnapshots = Object.fromEntries(Object.entries(currentSnapshots)
+            .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
+            .slice(0, MAX_RUNTIME_SNAPSHOTS)
+            .map(([runtimeKey, snapshot]) => [runtimeKey, {
+              byRoot: sanitizeByRoot(snapshot.byRoot),
+              updatedAt: snapshot.updatedAt,
+            }]));
+          return { activeRuntimeKey: state.activeRuntimeKey, runtimeSnapshots };
+        },
+        merge: (persistedState, currentState) => {
+          const persisted = persistedState && typeof persistedState === 'object'
+            ? persistedState as Partial<FilesViewTabsState>
+            : {};
+          const runtimeSnapshots = persisted.runtimeSnapshots && typeof persisted.runtimeSnapshots === 'object'
+            ? persisted.runtimeSnapshots
+            : {};
+          const activeRuntimeKey = getRuntimeKey();
           return {
-            byRoot: sanitizeByRoot(rawByRoot),
+            ...currentState,
+            activeRuntimeKey,
+            runtimeSnapshots,
+            byRoot: sanitizeByRoot(runtimeSnapshots[activeRuntimeKey]?.byRoot),
           };
         },
-        partialize: (state) => ({ byRoot: state.byRoot }),
       }
     ),
     { name: 'files-view-tabs-store' }

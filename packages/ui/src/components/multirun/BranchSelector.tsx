@@ -9,19 +9,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { useGitStore, useGitBranches, useGitLoadingBranches } from '@/stores/useGitStore';
+import { cn } from '@/lib/utils';
+import { useGitStore, useGitBranches, useGitLoadingBranches, useGitLoadingStatus, useIsGitRepo } from '@/stores/useGitStore';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
 import { getRootBranch } from '@/lib/worktrees/worktreeStatus';
+import {
+  LAST_WORKTREE_SOURCE_BRANCH_KEY,
+  resolveWorktreeSourceBranchPreference,
+} from '@/lib/worktrees/worktreeSourceBranchPreference';
 import { useI18n } from '@/lib/i18n';
-
-/** localStorage key matching NewWorktreeDialog */
-const LAST_SOURCE_BRANCH_KEY = 'oc:lastWorktreeSourceBranch';
-
-export type WorktreeBaseOption = {
-  value: string;
-  label: string;
-  group: 'special' | 'local' | 'remote';
-};
 
 export interface BranchSelectorProps {
   /** Current directory to check for git repository */
@@ -53,15 +49,26 @@ export interface BranchSelectorState {
 export function useBranchOptions(directory: string | null): BranchSelectorState {
   const { git } = useRuntimeAPIs();
   const branches = useGitBranches(directory);
-  const isLoading = useGitLoadingBranches(directory);
+  const isGitRepo = useIsGitRepo(directory);
+  const isLoadingStatus = useGitLoadingStatus(directory);
+  const isLoadingBranches = useGitLoadingBranches(directory);
   const fetchBranches = useGitStore((state) => state.fetchBranches);
+  const fetchStatus = useGitStore((state) => state.fetchStatus);
+
+  React.useEffect(() => {
+    if (!directory || !git || isGitRepo !== null || isLoadingStatus) return;
+    void fetchStatus(directory, git, { silent: true });
+  }, [directory, git, fetchStatus, isGitRepo, isLoadingStatus]);
 
   // Fetch branches if not cached
   React.useEffect(() => {
     if (!directory || !git) return;
+    if (isGitRepo !== true) return;
     if (branches?.all) return; // Already cached
     void fetchBranches(directory, git);
-  }, [directory, git, branches?.all, fetchBranches]);
+  }, [directory, git, isGitRepo, branches?.all, fetchBranches]);
+
+  const isLoading = isLoadingStatus || (isGitRepo === true && isLoadingBranches);
 
   // Compute local and remote branch lists (same as NewWorktreeDialog)
   const localBranches = React.useMemo(() => {
@@ -82,10 +89,10 @@ export function useBranchOptions(directory: string | null): BranchSelectorState 
   // isGitRepository: true if we got branches, false if fetch returned empty, null if not yet loaded
   const isGitRepository = React.useMemo<boolean | null>(() => {
     if (!directory) return null;
+    if (isGitRepo !== null) return isGitRepo;
     if (isLoading) return null;
-    if (!branches) return null;
-    return Boolean(branches.all);
-  }, [directory, isLoading, branches]);
+    return branches?.all ? true : null;
+  }, [directory, isLoading, branches, isGitRepo]);
 
   return { localBranches, remoteBranches, isLoading, isGitRepository };
 }
@@ -112,24 +119,35 @@ export const BranchSelector: React.FC<BranchSelectorProps> = ({
   // Resolve default source branch (same priority as NewWorktreeDialog)
   React.useEffect(() => {
     if (disabled || isLoading || allBranches.length === 0) return;
-    // If current value is valid, keep it
     if (value && allBranches.includes(value)) return;
+
+    const currentValue = value;
+    let cancelled = false;
 
     const resolve = async () => {
       try {
         const rootBranch = directory ? await getRootBranch(directory).catch(() => null) : null;
-        const saved = localStorage.getItem(LAST_SOURCE_BRANCH_KEY);
+        if (cancelled) return;
 
-        if (saved && allBranches.includes(saved)) {
-          onChange(saved);
-        } else if (rootBranch && allBranches.includes(rootBranch)) {
-          onChange(rootBranch);
-        } else if (allBranches.includes('main')) {
-          onChange('main');
-        } else if (allBranches.includes('master')) {
-          onChange('master');
-        } else if (allBranches[0]) {
-          onChange(allBranches[0]);
+        const saved = localStorage.getItem(LAST_WORKTREE_SOURCE_BRANCH_KEY);
+
+        const {
+          sourceBranch,
+          shouldClearSavedSourceBranch,
+        } = resolveWorktreeSourceBranchPreference({
+          branches: allBranches,
+          savedSourceBranch: saved,
+          rootBranch,
+        });
+
+        if (shouldClearSavedSourceBranch) {
+          localStorage.removeItem(LAST_WORKTREE_SOURCE_BRANCH_KEY);
+        }
+
+        if (cancelled || (currentValue && allBranches.includes(currentValue))) return;
+
+        if (sourceBranch) {
+          onChange(sourceBranch);
         }
       } catch {
         // ignore
@@ -137,6 +155,9 @@ export const BranchSelector: React.FC<BranchSelectorProps> = ({
     };
 
     void resolve();
+    return () => {
+      cancelled = true;
+    };
   }, [allBranches, directory, disabled, isLoading, onChange, value]);
 
   const isDisabled = disabled || !isGitRepository || isLoading;
@@ -151,7 +172,7 @@ export const BranchSelector: React.FC<BranchSelectorProps> = ({
         <SelectTrigger
           id={id}
           size="lg"
-          className={className ?? 'w-fit typography-meta text-foreground'}
+          className={cn('min-w-0 max-w-full *:data-[slot=select-value]:truncate', className ?? 'w-fit')}
         >
           <SelectValue placeholder={isLoading ? t('multiRun.branchSelector.status.loadingBranches') : t('multiRun.branchSelector.placeholder.selectSourceBranch')} />
         </SelectTrigger>

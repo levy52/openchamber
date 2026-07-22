@@ -1,30 +1,40 @@
 import * as React from 'react';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
+import { dropdownTriggerVariants } from '@/components/ui/dropdown-trigger';
 import { ScrollShadow } from '@/components/ui/ScrollShadow';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
+import { NumberInput } from '@/components/ui/number-input';
 import { Button } from '@/components/ui/button';
 import { MobileOverlayPanel } from '@/components/ui/MobileOverlayPanel';
 import { toast } from '@/components/ui';
-import { RiAddLine, RiCloseLine, RiCalendarLine, RiArrowLeftSLine, RiArrowRightSLine, RiArrowDownSLine } from '@remixicon/react';
 import { ModelSelector } from '@/components/sections/agents/ModelSelector';
 import { AgentSelector } from '@/components/sections/commands/AgentSelector';
 import { isPrimaryMode } from '@/components/chat/mobileControlsUtils';
 import { CommandAutocomplete, type CommandAutocompleteHandle, type CommandInfo } from '@/components/chat/CommandAutocomplete';
 import { FileMentionAutocomplete, type FileMentionHandle } from '@/components/chat/FileMentionAutocomplete';
+import { SnippetAutocomplete, type SnippetAutocompleteHandle } from '@/components/chat/SnippetAutocomplete';
+import { Icon } from "@/components/icon/Icon";
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useUIStore } from '@/stores/useUIStore';
 import type { ScheduledTask } from '@/lib/scheduledTasksApi';
 import { useI18n } from '@/lib/i18n';
+import { isValidCronExpression, getNextRuns, CRON_EXAMPLES } from '@/lib/cron';
+import { canonicalizeTimezone } from '@/lib/timezones';
 
 const WEEKDAY_INDEXES = [0, 1, 2, 3, 4, 5, 6] as const;
 
+// Mirrors the composer's footer icon toggles (PermissionAutoAcceptButton /
+// SessionGoalButton) so the state reads the same in both places.
+const EDITOR_TOGGLE_BUTTON_CLASS = 'flex h-6 w-6 cursor-pointer items-center justify-center text-foreground transition-none outline-none focus:outline-none flex-shrink-0';
+
 const TIMEZONE_OPTIONS = (() => {
   if (typeof Intl !== 'undefined' && typeof Intl.supportedValuesOf === 'function') {
-    return Intl.supportedValuesOf('timeZone');
+    return [...new Set(Intl.supportedValuesOf('timeZone').map(canonicalizeTimezone))];
   }
   return [
     'UTC',
@@ -450,12 +460,13 @@ type ScheduledTaskDraft = {
   name: string;
   enabled: boolean;
   schedule: {
-    kind: 'daily' | 'weekly' | 'once';
+    kind: 'daily' | 'weekly' | 'once' | 'cron';
     times: string[];
     onceDate: string;
     onceTime: string;
     weekdays: number[];
     timezone: string;
+    cronExpression: string;
   };
   execution: {
     prompt: string;
@@ -463,6 +474,9 @@ type ScheduledTaskDraft = {
     modelID: string;
     variant: string;
     agent: string;
+    goalEnabled: boolean;
+    goalTokenBudget: number | null;
+    permissionAutoAccept: boolean;
   };
   state?: ScheduledTask['state'];
 };
@@ -492,7 +506,7 @@ const toDraft = (
     agent: string;
   },
 ): ScheduledTaskDraft => {
-  const timezoneFallback = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const timezoneFallback = canonicalizeTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');
   if (!task) {
     return {
       name: '',
@@ -504,6 +518,7 @@ const toDraft = (
         onceTime: '09:00',
         weekdays: [1],
         timezone: timezoneFallback,
+        cronExpression: '',
       },
       execution: {
         prompt: '',
@@ -511,6 +526,9 @@ const toDraft = (
         modelID: defaults.modelID,
         variant: defaults.variant,
         agent: defaults.agent,
+        goalEnabled: false,
+        goalTokenBudget: null,
+        permissionAutoAccept: false,
       },
     };
   }
@@ -520,9 +538,11 @@ const toDraft = (
     name: task.name,
     enabled: task.enabled,
     schedule: {
-      kind: task.schedule.kind === 'once'
-        ? 'once'
-        : (task.schedule.kind === 'weekly' ? 'weekly' : 'daily'),
+      kind: task.schedule.kind === 'cron'
+        ? 'cron'
+        : (task.schedule.kind === 'once'
+          ? 'once'
+          : (task.schedule.kind === 'weekly' ? 'weekly' : 'daily')),
       times: normalizeDraftTimes(task),
       onceDate: typeof task.schedule.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(task.schedule.date)
         ? task.schedule.date
@@ -531,7 +551,10 @@ const toDraft = (
         ? task.schedule.time
         : '09:00',
       weekdays: Array.isArray(task.schedule.weekdays) ? task.schedule.weekdays : [1],
-      timezone: task.schedule.timezone || timezoneFallback,
+      timezone: canonicalizeTimezone(task.schedule.timezone || timezoneFallback),
+      cronExpression: task.schedule.kind === 'cron' && typeof task.schedule.cron === 'string'
+        ? task.schedule.cron
+        : '',
     },
     execution: {
       prompt: task.execution.prompt,
@@ -539,6 +562,11 @@ const toDraft = (
       modelID: task.execution.modelID,
       variant: task.execution.variant || '',
       agent: task.execution.agent || '',
+      goalEnabled: task.execution.goalEnabled === true,
+      goalTokenBudget: typeof task.execution.goalTokenBudget === 'number' && task.execution.goalTokenBudget > 0
+        ? task.execution.goalTokenBudget
+        : null,
+      permissionAutoAccept: task.execution.permissionAutoAccept === true,
     },
     state: task.state,
   };
@@ -562,6 +590,14 @@ const validateDraft = (draft: ScheduledTaskDraft, t: ReturnType<typeof useI18n>[
     if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(draft.schedule.onceTime)) {
       return t('sessions.scheduledTasks.editor.validation.timeFormat');
     }
+  } else if (draft.schedule.kind === 'cron') {
+    if (!draft.schedule.cronExpression.trim()) {
+      return t('sessions.scheduledTasks.editor.validation.cronRequired');
+    }
+    const cronResult = isValidCronExpression(draft.schedule.cronExpression);
+    if (!cronResult.valid) {
+      return t('sessions.scheduledTasks.editor.validation.cronInvalid');
+    }
   } else {
     const validTimes = draft.schedule.times.filter((value) => /^([01]\d|2[0-3]):([0-5]\d)$/.test(value));
     if (validTimes.length === 0) {
@@ -583,6 +619,108 @@ const validateDraft = (draft: ScheduledTaskDraft, t: ReturnType<typeof useI18n>[
 const dedupeSortTimes = (times: string[]) => {
   const filtered = times.filter((value) => /^([01]\d|2[0-3]):([0-5]\d)$/.test(value));
   return Array.from(new Set(filtered)).sort((a, b) => a.localeCompare(b));
+};
+
+const CronScheduleSection: React.FC<{
+  draft: ScheduledTaskDraft;
+  setDraft: React.Dispatch<React.SetStateAction<ScheduledTaskDraft>>;
+  locale: string;
+  t: ReturnType<typeof useI18n>['t'];
+}> = ({ draft, setDraft, locale, t }) => {
+  const cronExpression = draft.schedule.cronExpression;
+  const cronValidation = React.useMemo(
+    () => (cronExpression.trim() ? isValidCronExpression(cronExpression) : null),
+    [cronExpression],
+  );
+  const nextRuns = React.useMemo(() => {
+    if (!cronValidation?.valid || !cronExpression.trim()) {
+      return [];
+    }
+    return getNextRuns(cronExpression, draft.schedule.timezone);
+  }, [cronExpression, cronValidation, draft.schedule.timezone]);
+
+  const formatNextRun = React.useCallback(
+    (date: Date) => new Intl.DateTimeFormat(locale, {
+      timeZone: draft.schedule.timezone,
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    }).format(date),
+    [locale, draft.schedule.timezone],
+  );
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-1">
+        <FieldLabel htmlFor="sched-cron" required>{t('sessions.scheduledTasks.editor.cronExpression.label')}</FieldLabel>
+        <Input
+          id="sched-cron"
+          value={cronExpression}
+          onChange={(event) => setDraft((prev) => ({
+            ...prev,
+            schedule: { ...prev.schedule, cronExpression: event.target.value },
+          }))}
+          placeholder={t('sessions.scheduledTasks.editor.cronExpression.placeholder')}
+          className="w-full max-w-xs font-mono"
+        />
+        {cronValidation && !cronValidation.valid && cronExpression.trim() ? (
+          <span className="typography-micro text-destructive">
+            {t('sessions.scheduledTasks.editor.validation.cronInvalid')}
+          </span>
+        ) : null}
+      </div>
+
+      {nextRuns.length > 0 ? (
+        <div className="flex flex-col gap-1">
+          <span className="typography-meta text-muted-foreground">{t('sessions.scheduledTasks.editor.cronExpression.nextRuns')}</span>
+          <span className="typography-micro text-foreground">
+            {nextRuns.map(formatNextRun).join(', ')}
+          </span>
+        </div>
+      ) : null}
+
+      <div className="flex flex-col gap-1">
+        <span className="typography-meta text-muted-foreground">{t('sessions.scheduledTasks.editor.cronExpression.examples')}</span>
+        <div className="flex flex-wrap gap-1.5">
+          {CRON_EXAMPLES.map((example) => (
+            <button
+              key={example.expression}
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 typography-micro text-foreground hover:bg-interactive-hover"
+              onClick={() => setDraft((prev) => ({
+                ...prev,
+                schedule: { ...prev.schedule, cronExpression: example.expression },
+              }))}
+            >
+              <span className="font-mono">{example.expression}</span>
+              <span className="text-muted-foreground">{t(example.labelKey as Parameters<typeof t>[0])}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-1">
+        <FieldLabel>{t('sessions.scheduledTasks.editor.timezone.label')}</FieldLabel>
+        <Select
+          value={draft.schedule.timezone}
+          onValueChange={(timezone) => {
+            setDraft((prev) => ({
+              ...prev,
+              schedule: { ...prev.schedule, timezone },
+            }));
+          }}
+        >
+          <SelectTrigger size="lg" className="w-fit max-w-full"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            {TIMEZONE_OPTIONS.map((timezone) => (
+              <SelectItem key={timezone} value={timezone}>{timezone}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  );
 };
 
 export function ScheduledTaskEditorDialog(props: {
@@ -618,6 +756,8 @@ export function ScheduledTaskEditorDialog(props: {
   const [mentionQuery, setMentionQuery] = React.useState('');
   const [showCommandAutocomplete, setShowCommandAutocomplete] = React.useState(false);
   const [commandQuery, setCommandQuery] = React.useState('');
+  const [showSnippetAutocomplete, setShowSnippetAutocomplete] = React.useState(false);
+  const [snippetQuery, setSnippetQuery] = React.useState('');
   const [calendarMonth, setCalendarMonth] = React.useState<Date>(() => {
     const initialDate = parseISODateToLocal(task?.schedule?.date || '') || new Date();
     return new Date(initialDate.getFullYear(), initialDate.getMonth(), 1);
@@ -626,6 +766,7 @@ export function ScheduledTaskEditorDialog(props: {
   const promptTextareaRef = React.useRef<HTMLTextAreaElement>(null);
   const mentionRef = React.useRef<FileMentionHandle>(null);
   const commandRef = React.useRef<CommandAutocompleteHandle>(null);
+  const snippetRef = React.useRef<SnippetAutocompleteHandle>(null);
   const localeUse24Hour = React.useMemo(() => getUses24Hour(locale), [locale]);
   const localeWeekStartsOn = React.useMemo(() => getWeekStartsOn(locale), [locale]);
   const use24Hour = React.useMemo(() => {
@@ -658,8 +799,8 @@ export function ScheduledTaskEditorDialog(props: {
     if (!open) {
       return;
     }
-    void loadProviders();
-    void loadAgents();
+    void loadProviders({ source: 'scheduledTaskEditor' });
+    void loadAgents({ source: 'scheduledTaskEditor' });
   }, [open, loadProviders, loadAgents]);
 
   React.useEffect(() => {
@@ -699,7 +840,6 @@ export function ScheduledTaskEditorDialog(props: {
       document.removeEventListener('mousedown', onPointerDown);
     };
   }, [isDatePickerOpen]);
-
 
   const variantOptions = React.useMemo(() => {
     const provider = providers.find((item) => item.id === draft.execution.providerID);
@@ -829,6 +969,7 @@ export function ScheduledTaskEditorDialog(props: {
         setCommandQuery(value.substring(1, commandEnd));
         setShowCommandAutocomplete(true);
         setShowFileMention(false);
+        setShowSnippetAutocomplete(false);
         return;
       }
     }
@@ -836,6 +977,21 @@ export function ScheduledTaskEditorDialog(props: {
     setShowCommandAutocomplete(false);
 
     const textBeforeCursor = value.substring(0, cursorPosition);
+    const lastHashSymbol = textBeforeCursor.lastIndexOf('#');
+    if (lastHashSymbol !== -1) {
+      const charBefore = lastHashSymbol > 0 ? textBeforeCursor[lastHashSymbol - 1] : null;
+      const textAfterHash = textBeforeCursor.substring(lastHashSymbol + 1);
+      const isWordBoundary = !charBefore || /\s/.test(charBefore);
+      if (isWordBoundary && !textAfterHash.includes(' ') && !textAfterHash.includes('\n')) {
+        setSnippetQuery(textAfterHash);
+        setShowSnippetAutocomplete(true);
+        setShowFileMention(false);
+        return;
+      }
+    }
+
+    setShowSnippetAutocomplete(false);
+
     const lastAtSymbol = textBeforeCursor.lastIndexOf('@');
     if (lastAtSymbol !== -1) {
       const charBefore = lastAtSymbol > 0 ? textBeforeCursor[lastAtSymbol - 1] : null;
@@ -922,6 +1078,7 @@ export function ScheduledTaskEditorDialog(props: {
     setPromptValue(nextPrompt);
     setShowCommandAutocomplete(false);
     setCommandQuery('');
+    setShowSnippetAutocomplete(false);
 
     requestAnimationFrame(() => {
       const currentTextarea = promptTextareaRef.current;
@@ -933,6 +1090,31 @@ export function ScheduledTaskEditorDialog(props: {
       updateAutocompleteState(nextPrompt, nextPrompt.length);
     });
   }, [setPromptValue, updateAutocompleteState]);
+
+  const handleSnippetSelect = React.useCallback((_snippet: unknown, trigger: string) => {
+    const promptValue = draft.execution.prompt;
+    const textarea = promptTextareaRef.current;
+    const cursorPosition = textarea?.selectionStart ?? promptValue.length;
+    const textBeforeCursor = promptValue.substring(0, cursorPosition);
+    const lastHashSymbol = textBeforeCursor.lastIndexOf('#');
+    const startIndex = lastHashSymbol !== -1 ? lastHashSymbol : cursorPosition;
+    const nextPrompt = `${promptValue.substring(0, startIndex)}#${trigger} ${promptValue.substring(cursorPosition)}`;
+    const nextCursor = startIndex + trigger.length + 2;
+
+    setPromptValue(nextPrompt);
+    setShowSnippetAutocomplete(false);
+    setSnippetQuery('');
+
+    requestAnimationFrame(() => {
+      const currentTextarea = promptTextareaRef.current;
+      if (currentTextarea) {
+        currentTextarea.selectionStart = nextCursor;
+        currentTextarea.selectionEnd = nextCursor;
+        currentTextarea.focus();
+      }
+      updateAutocompleteState(nextPrompt, nextCursor);
+    });
+  }, [draft.execution.prompt, setPromptValue, updateAutocompleteState]);
 
   const handlePromptKeyDown = React.useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (showCommandAutocomplete && commandRef.current) {
@@ -949,7 +1131,14 @@ export function ScheduledTaskEditorDialog(props: {
         mentionRef.current.handleKeyDown(event.key);
       }
     }
-  }, [showCommandAutocomplete, showFileMention]);
+
+    if (showSnippetAutocomplete && snippetRef.current) {
+      if (event.key === 'Enter' || event.key === 'ArrowUp' || event.key === 'ArrowDown' || event.key === 'Escape' || event.key === 'Tab') {
+        event.preventDefault();
+        snippetRef.current.handleKeyDown(event.key);
+      }
+    }
+  }, [showCommandAutocomplete, showFileMention, showSnippetAutocomplete]);
 
   const handleSubmit = React.useCallback(async () => {
     const validationError = validateDraft(draft, t);
@@ -958,7 +1147,6 @@ export function ScheduledTaskEditorDialog(props: {
       return;
     }
 
-    const normalizedTimes = dedupeSortTimes(draft.schedule.times);
     const payload: Partial<ScheduledTask> = {
       ...(draft.id ? { id: draft.id } : {}),
       name: draft.name.trim(),
@@ -966,15 +1154,17 @@ export function ScheduledTaskEditorDialog(props: {
       schedule: {
         kind: draft.schedule.kind,
         timezone: draft.schedule.timezone.trim(),
-        ...(draft.schedule.kind === 'once'
-          ? {
-              date: draft.schedule.onceDate,
-              time: draft.schedule.onceTime,
+        ...(draft.schedule.kind === 'cron'
+          ? { cron: draft.schedule.cronExpression.trim() }
+          : draft.schedule.kind === 'once'
+            ? {
+                date: draft.schedule.onceDate,
+                time: draft.schedule.onceTime,
             }
-          : {
-              times: normalizedTimes,
-              ...(draft.schedule.kind === 'weekly' ? { weekdays: draft.schedule.weekdays } : {}),
-            }),
+            : {
+                times: dedupeSortTimes(draft.schedule.times),
+                ...(draft.schedule.kind === 'weekly' ? { weekdays: draft.schedule.weekdays } : {}),
+              }),
       },
       execution: {
         prompt: draft.execution.prompt,
@@ -982,6 +1172,11 @@ export function ScheduledTaskEditorDialog(props: {
         modelID: draft.execution.modelID,
         ...(draft.execution.variant.trim() ? { variant: draft.execution.variant.trim() } : {}),
         ...(draft.execution.agent.trim() ? { agent: draft.execution.agent.trim() } : {}),
+        ...(draft.execution.permissionAutoAccept ? { permissionAutoAccept: true } : {}),
+        ...(draft.execution.goalEnabled ? { goalEnabled: true } : {}),
+        ...(draft.execution.goalEnabled && draft.execution.goalTokenBudget
+          ? { goalTokenBudget: draft.execution.goalTokenBudget }
+          : {}),
       },
       ...(draft.state ? { state: draft.state } : {}),
     };
@@ -1002,7 +1197,7 @@ export function ScheduledTaskEditorDialog(props: {
     if (typeof document === 'undefined') return false;
     return Boolean(
       document.querySelector(
-        '[data-slot="dropdown-menu-content"], [data-slot="select-content"]'
+        '[data-slot="dropdown-menu-content"][data-open], [data-slot="select-content"][data-open]'
       )
     );
   }, []);
@@ -1029,47 +1224,58 @@ export function ScheduledTaskEditorDialog(props: {
                     <FieldLabel>{t('sessions.scheduledTasks.editor.scheduleType.label')}</FieldLabel>
                     <Select
                       value={draft.schedule.kind}
-                      onValueChange={(value: 'daily' | 'weekly' | 'once') => {
+                      onValueChange={(value: 'daily' | 'weekly' | 'once' | 'cron') => {
                         setDraft((prev) => ({
                           ...prev,
-                          schedule: { ...prev.schedule, kind: value },
+                          schedule: {
+                            ...prev.schedule,
+                            kind: value,
+                            ...(value === 'cron' && !prev.schedule.cronExpression
+                              ? { cronExpression: '0 * * * *' }
+                              : {}),
+                          },
                         }));
                       }}
                     >
-                      <SelectTrigger className="w-fit max-w-full">
+                      <SelectTrigger size="lg" className="w-fit max-w-full">
                         <SelectValue>
                           {(value) => value === 'daily'
                             ? t('sessions.scheduledTasks.editor.scheduleType.daily')
                             : value === 'weekly'
                               ? t('sessions.scheduledTasks.editor.scheduleType.weekly')
-                              : t('sessions.scheduledTasks.editor.scheduleType.once')}
+                              : value === 'cron'
+                                ? t('sessions.scheduledTasks.editor.scheduleType.cron')
+                                : t('sessions.scheduledTasks.editor.scheduleType.once')}
                         </SelectValue>
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="daily">{t('sessions.scheduledTasks.editor.scheduleType.daily')}</SelectItem>
                         <SelectItem value="weekly">{t('sessions.scheduledTasks.editor.scheduleType.weekly')}</SelectItem>
                         <SelectItem value="once">{t('sessions.scheduledTasks.editor.scheduleType.once')}</SelectItem>
+                        <SelectItem value="cron">{t('sessions.scheduledTasks.editor.scheduleType.cron')}</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
 
                 </div>
 
-          {draft.schedule.kind === 'once' ? (
+          {draft.schedule.kind === 'cron' ? (
+            <CronScheduleSection draft={draft} setDraft={setDraft} locale={locale} t={t} />
+          ) : draft.schedule.kind === 'once' ? (
             <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
               <div className="flex flex-col gap-1" ref={datePickerRef}>
                 <FieldLabel>{t('sessions.scheduledTasks.editor.date.label')}</FieldLabel>
                 <div className="relative">
                   <button
                     type="button"
-                    className="inline-flex h-9 w-fit max-w-full items-center justify-between gap-2 rounded-md border border-border bg-background px-3 text-left hover:bg-interactive-hover"
+                    className={cn(dropdownTriggerVariants({ size: 'default' }), 'w-fit max-w-full')}
                     onClick={() => setIsDatePickerOpen((prev) => !prev)}
                   >
                     <span className="inline-flex items-center gap-2">
-                      <RiCalendarLine className="h-4 w-4 text-muted-foreground" />
+                      <Icon name="calendar" className="h-4 w-4 text-muted-foreground" />
                       <span className="typography-ui-label text-foreground">{formatDateLabel(draft.schedule.onceDate, t('sessions.scheduledTasks.editor.date.placeholder'), locale)}</span>
                     </span>
-                    <RiArrowDownSLine className="h-4 w-4 text-muted-foreground" />
+                    <Icon name="arrow-down-s" className="h-4 w-4 text-muted-foreground" />
                   </button>
 
                   {isDatePickerOpen ? (
@@ -1082,7 +1288,7 @@ export function ScheduledTaskEditorDialog(props: {
                           aria-label={t('sessions.scheduledTasks.editor.date.previousMonth')}
                           disabled={isAtCurrentMonth}
                         >
-                          <RiArrowLeftSLine className="h-4 w-4" />
+                          <Icon name="arrow-left-s" className="h-4 w-4" />
                         </button>
                         <div className="typography-ui-label text-foreground">
                           {new Intl.DateTimeFormat(locale, { month: 'long', year: 'numeric' }).format(calendarMonth)}
@@ -1093,7 +1299,7 @@ export function ScheduledTaskEditorDialog(props: {
                           onClick={() => setCalendarMonth((prev) => shiftMonth(prev, 1))}
                           aria-label={t('sessions.scheduledTasks.editor.date.nextMonth')}
                         >
-                          <RiArrowRightSLine className="h-4 w-4" />
+                          <Icon name="arrow-right-s" className="h-4 w-4" />
                         </button>
                       </div>
 
@@ -1191,7 +1397,7 @@ export function ScheduledTaskEditorDialog(props: {
                       }));
                     }}
                   >
-                    <SelectTrigger className="w-fit max-w-full"><SelectValue /></SelectTrigger>
+                    <SelectTrigger size="lg" className="w-fit max-w-full"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       {TIMEZONE_OPTIONS.map((timezone) => (
                         <SelectItem key={timezone} value={timezone}>{timezone}</SelectItem>
@@ -1210,19 +1416,22 @@ export function ScheduledTaskEditorDialog(props: {
                     {orderedWeekdays.map((weekday) => {
                       const checked = draft.schedule.weekdays.includes(weekday.value);
                       return (
-                        <button
+                        <div
                           key={weekday.value}
-                          type="button"
-                          onClick={() => toggleWeekday(weekday.value, !checked)}
                           className={[
-                            'inline-flex items-center gap-1.5 px-0.5 py-0.5 typography-meta',
+                            'group inline-flex items-center gap-1.5 px-0.5 py-0.5 typography-meta',
                             checked ? 'text-foreground' : 'text-muted-foreground',
-                            'hover:text-foreground',
                           ].join(' ')}
                         >
                           <Checkbox checked={checked} onChange={(next) => toggleWeekday(weekday.value, next)} ariaLabel={weekday.label} />
-                          <span>{weekday.label}</span>
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() => toggleWeekday(weekday.value, !checked)}
+                            className="group-hover:text-foreground"
+                          >
+                            {weekday.label}
+                          </button>
+                        </div>
                       );
                     })}
                   </div>
@@ -1252,7 +1461,7 @@ export function ScheduledTaskEditorDialog(props: {
                           onClick={() => removeTimeAt(index)}
                           aria-label={t('sessions.scheduledTasks.editor.times.removeAria')}
                         >
-                          <RiCloseLine className="h-4 w-4" />
+                          <Icon name="close" className="h-4 w-4" />
                         </Button>
                       ) : null}
                     </div>
@@ -1260,7 +1469,7 @@ export function ScheduledTaskEditorDialog(props: {
                 </div>
                 <div>
                   <Button type="button" size="sm" variant="outline" onClick={addTime}>
-                    <RiAddLine className="mr-1 h-4 w-4" /> {t('sessions.scheduledTasks.editor.times.add')}
+                    <Icon name="add" className="mr-1 h-4 w-4" /> {t('sessions.scheduledTasks.editor.times.add')}
                   </Button>
                 </div>
               </div>
@@ -1276,7 +1485,7 @@ export function ScheduledTaskEditorDialog(props: {
                     }));
                   }}
                 >
-                  <SelectTrigger className="w-fit max-w-full"><SelectValue /></SelectTrigger>
+                  <SelectTrigger size="lg" className="w-fit max-w-full"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     {TIMEZONE_OPTIONS.map((timezone) => (
                       <SelectItem key={timezone} value={timezone}>{timezone}</SelectItem>
@@ -1322,7 +1531,7 @@ export function ScheduledTaskEditorDialog(props: {
                   }));
                 }}
               >
-                <SelectTrigger className="w-fit max-w-full">
+                <SelectTrigger size="lg" className="w-fit max-w-full">
                   <SelectValue>
                     {(value) => value === '__default'
                       ? t('sessions.scheduledTasks.editor.thinkingLevel.default')
@@ -1405,8 +1614,56 @@ export function ScheduledTaskEditorDialog(props: {
                   }}
                 />
               ) : null}
+
+              {showSnippetAutocomplete ? (
+                <SnippetAutocomplete
+                  ref={snippetRef}
+                  searchQuery={snippetQuery}
+                  onSnippetSelect={handleSnippetSelect}
+                  onClose={() => setShowSnippetAutocomplete(false)}
+                  style={{
+                    left: 0,
+                    top: 'auto',
+                    bottom: 'calc(100% + 6px)',
+                    marginBottom: 0,
+                    maxWidth: '100%',
+                  }}
+                />
+              ) : null}
             </div>
           </div>
+
+          {draft.execution.goalEnabled ? (
+          <div className="flex flex-wrap items-center gap-x-8 gap-y-2">
+              <label className="inline-flex cursor-pointer items-center gap-2">
+                <Checkbox
+                  checked={draft.execution.goalTokenBudget !== null}
+                  onChange={(hasBudget) => setDraft((prev) => ({
+                    ...prev,
+                    execution: { ...prev.execution, goalTokenBudget: hasBudget ? 200_000 : null },
+                  }))}
+                  ariaLabel={t('sessions.scheduledTasks.editor.goal.budgetAria')}
+                />
+                <span className="typography-meta">{t('sessions.scheduledTasks.editor.goal.budgetLabel')}</span>
+              </label>
+            {draft.execution.goalTokenBudget !== null ? (
+              <NumberInput
+                value={draft.execution.goalTokenBudget}
+                onValueChange={(value) => {
+                  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+                    setDraft((prev) => ({
+                      ...prev,
+                      execution: { ...prev.execution, goalTokenBudget: Math.floor(value) },
+                    }));
+                  }
+                }}
+                min={1000}
+                max={100000000}
+                step={50000}
+              />
+            ) : null}
+          </div>
+          ) : null}
     </div>
   );
 
@@ -1422,6 +1679,48 @@ export function ScheduledTaskEditorDialog(props: {
       </label>
 
       <div className="flex items-center gap-2">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className={cn(EDITOR_TOGGLE_BUTTON_CLASS)}
+              onClick={() => setDraft((prev) => ({
+                ...prev,
+                execution: { ...prev.execution, permissionAutoAccept: !prev.execution.permissionAutoAccept },
+              }))}
+              aria-pressed={draft.execution.permissionAutoAccept}
+              aria-label={t('sessions.scheduledTasks.editor.permissionAutoAccept.aria')}
+            >
+              {draft.execution.permissionAutoAccept ? (
+                <Icon name="shield-check" className="h-[18px] w-[18px]" style={{ color: 'var(--status-info)' }} aria-hidden="true" />
+              ) : (
+                <Icon name="shield-user" className="h-[18px] w-[18px]" aria-hidden="true" />
+              )}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" sideOffset={6}>{t('sessions.scheduledTasks.editor.permissionAutoAccept.label')}</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className={cn(EDITOR_TOGGLE_BUTTON_CLASS, draft.execution.goalEnabled && 'text-[var(--status-info)]')}
+              onClick={() => setDraft((prev) => ({
+                ...prev,
+                execution: { ...prev.execution, goalEnabled: !prev.execution.goalEnabled },
+              }))}
+              aria-pressed={draft.execution.goalEnabled}
+              aria-label={t('sessions.scheduledTasks.editor.goal.aria')}
+            >
+              {draft.execution.goalEnabled ? (
+                <Icon name="target-fill" className="h-[18px] w-[18px] text-current" aria-hidden="true" />
+              ) : (
+                <Icon name="target" className="h-[18px] w-[18px] text-current" aria-hidden="true" />
+              )}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" sideOffset={6}>{t('sessions.scheduledTasks.editor.goal.label')}</TooltipContent>
+        </Tooltip>
         <Button type="button" variant="ghost" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
           {t('sessions.scheduledTasks.editor.actions.cancel')}
         </Button>

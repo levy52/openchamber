@@ -1,5 +1,4 @@
 import React from 'react';
-import type { Session } from '@opencode-ai/sdk/v2';
 import { updateDesktopSettings } from '@/lib/persistence';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 
@@ -11,22 +10,15 @@ type SafeStorageLike = {
 type Keys = {
   sessionExpanded: string;
   projectCollapse: string;
-  sessionPinned: string;
   groupOrder: string;
-  projectActiveSession: string;
   groupCollapse: string;
 };
 
 type Args = {
   isVSCode: boolean;
-  hasLoadedGlobalSessions: boolean;
   safeStorage: SafeStorageLike;
   keys: Keys;
-  sessions: Session[];
-  pinnedSessionIds: Set<string>;
-  setPinnedSessionIds: React.Dispatch<React.SetStateAction<Set<string>>>;
   groupOrderByProject: Map<string, string[]>;
-  activeSessionByProject: Map<string, string>;
   collapsedGroups: Set<string>;
   setExpandedParents: React.Dispatch<React.SetStateAction<Set<string>>>;
   setCollapsedProjects: React.Dispatch<React.SetStateAction<Set<string>>>;
@@ -35,14 +27,9 @@ type Args = {
 export const useSidebarPersistence = (args: Args) => {
   const {
     isVSCode,
-    hasLoadedGlobalSessions,
     safeStorage,
     keys,
-    sessions,
-    pinnedSessionIds,
-    setPinnedSessionIds,
     groupOrderByProject,
-    activeSessionByProject,
     collapsedGroups,
     setExpandedParents,
     setCollapsedProjects,
@@ -116,34 +103,6 @@ export const useSidebarPersistence = (args: Args) => {
   }, [keys.projectCollapse, keys.sessionExpanded, safeStorage, setCollapsedProjects, setExpandedParents]);
 
   React.useEffect(() => {
-    if (!hasLoadedGlobalSessions) {
-      return;
-    }
-
-    const existingSessionIds = new Set(sessions.map((session) => session.id));
-    setPinnedSessionIds((prev) => {
-      let changed = false;
-      const next = new Set<string>();
-      prev.forEach((id) => {
-        if (existingSessionIds.has(id)) {
-          next.add(id);
-        } else {
-          changed = true;
-        }
-      });
-      return changed ? next : prev;
-    });
-  }, [hasLoadedGlobalSessions, sessions, setPinnedSessionIds]);
-
-  React.useEffect(() => {
-    try {
-      safeStorage.setItem(keys.sessionPinned, JSON.stringify(Array.from(pinnedSessionIds)));
-    } catch {
-      // ignored
-    }
-  }, [keys.sessionPinned, pinnedSessionIds, safeStorage]);
-
-  React.useEffect(() => {
     try {
       const serialized = Object.fromEntries(groupOrderByProject.entries());
       safeStorage.setItem(keys.groupOrder, JSON.stringify(serialized));
@@ -151,15 +110,6 @@ export const useSidebarPersistence = (args: Args) => {
       // ignored
     }
   }, [groupOrderByProject, keys.groupOrder, safeStorage]);
-
-  React.useEffect(() => {
-    try {
-      const serialized = Object.fromEntries(activeSessionByProject.entries());
-      safeStorage.setItem(keys.projectActiveSession, JSON.stringify(serialized));
-    } catch {
-      // ignored
-    }
-  }, [activeSessionByProject, keys.projectActiveSession, safeStorage]);
 
   React.useEffect(() => {
     try {

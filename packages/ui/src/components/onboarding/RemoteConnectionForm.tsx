@@ -1,14 +1,16 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import {
   desktopHostsGet,
   desktopHostsSet,
   desktopHostProbe,
-  normalizeHostUrl,
+  resolveDesktopHostUrl,
+  importDesktopHostPairing,
+  type DesktopHost,
   type HostProbeResult,
 } from '@/lib/desktopHosts';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { isTauriShell } from '@/lib/desktop';
+import { isDesktopShell, restartDesktopApp } from '@/lib/desktop';
 import { useI18n } from '@/lib/i18n';
 
 type ConnectionState = 'idle' | 'testing' | 'success' | 'error';
@@ -27,6 +29,7 @@ export interface RemoteConnectionFormProps {
   onConnect?: () => void;
   /** Optional: callback when user wants to switch to local setup */
   onSwitchToLocal?: () => void;
+  showInstancePicker?: boolean;
 }
 
 type ProbeStatus = HostProbeResult['status'] | null;
@@ -37,6 +40,10 @@ function getProbeStatusMessageKey(status: ProbeStatus): string | null {
       return null; // Success is shown separately
     case 'auth':
       return 'onboarding.remoteConnection.probe.authMessage';
+    case 'update-recommended':
+      return 'onboarding.remoteConnection.probe.updateRecommendedMessage';
+    case 'incompatible':
+      return 'onboarding.remoteConnection.probe.incompatibleMessage';
     case 'wrong-service':
       return 'onboarding.remoteConnection.probe.wrongServiceMessage';
     case 'unreachable':
@@ -47,7 +54,7 @@ function getProbeStatusMessageKey(status: ProbeStatus): string | null {
 }
 
 function isBlockingStatus(status: ProbeStatus): boolean {
-  return status === 'wrong-service' || status === 'unreachable';
+  return status === 'wrong-service' || status === 'unreachable' || status === 'incompatible';
 }
 
 export function RemoteConnectionForm({
@@ -58,6 +65,7 @@ export function RemoteConnectionForm({
   isRecoveryMode = false,
   onConnect,
   onSwitchToLocal,
+  showInstancePicker = false,
 }: RemoteConnectionFormProps) {
   const { t } = useI18n();
   const [url, setUrl] = useState(initialUrl);
@@ -65,8 +73,19 @@ export function RemoteConnectionForm({
   const [state, setState] = useState<ConnectionState>('idle');
   const [probeResult, setProbeResult] = useState<HostProbeResult | null>(null);
   const [error, setError] = useState('');
+  const [hosts, setHosts] = useState<DesktopHost[]>([]);
+  const [view, setView] = useState<'instances' | 'add' | 'import'>(() => showInstancePicker ? 'instances' : 'add');
+  const [connectLink, setConnectLink] = useState('');
 
-  const normalizedUrl = normalizeHostUrl(url);
+  useEffect(() => {
+    if (!showInstancePicker) return;
+    void desktopHostsGet().then((config) => setHosts(config.hosts)).catch((err) => {
+      setError(err instanceof Error ? err.message : String(err));
+    });
+  }, [showInstancePicker]);
+
+  const resolvedUrl = resolveDesktopHostUrl(url);
+  const normalizedUrl = resolvedUrl?.persistedUrl ?? null;
 
   const handleUrlChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     setUrl(e.target.value);
@@ -89,7 +108,7 @@ export function RemoteConnectionForm({
     try {
       const result = await desktopHostProbe(normalizedUrl);
       setProbeResult(result);
-      setState(result.status === 'ok' ? 'success' : 'error');
+      setState(result.status === 'ok' || result.status === 'update-recommended' ? 'success' : 'error');
     } catch (err) {
       setError(err instanceof Error ? err.message : t('onboarding.remoteConnection.errors.connectionTestFailed'));
       setState('error');
@@ -97,14 +116,15 @@ export function RemoteConnectionForm({
   }, [normalizedUrl, t]);
 
   const handleConnect = useCallback(async () => {
-    if (!normalizedUrl) return;
+    if (!resolvedUrl) return;
+    const targetUrl = resolvedUrl.persistedUrl;
 
     setState('testing');
     setProbeResult(null);
     setError('');
 
     try {
-      const probe = await desktopHostProbe(normalizedUrl);
+      const probe = await desktopHostProbe(targetUrl);
       setProbeResult(probe);
 
       // Block connection on wrong-service or unreachable
@@ -114,10 +134,10 @@ export function RemoteConnectionForm({
       }
 
       const config = await desktopHostsGet();
-      const hostLabel = label.trim() || normalizedUrl;
+      const hostLabel = label.trim() || targetUrl;
 
       const existingHost = config.hosts.find(
-        (h) => h.url === normalizedUrl
+        (h) => h.url === targetUrl
       );
 
       const hostId = existingHost ? existingHost.id : `host-${Date.now().toString(16)}`;
@@ -125,7 +145,8 @@ export function RemoteConnectionForm({
       const newHost = {
         id: hostId,
         label: hostLabel,
-        url: normalizedUrl,
+        url: targetUrl,
+        apiUrl: targetUrl,
       };
 
       const updatedHosts = existingHost
@@ -141,15 +162,51 @@ export function RemoteConnectionForm({
 
       onConnect?.();
 
-      if (isTauriShell()) {
-        const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } } }).__TAURI__;
-        await tauri?.core?.invoke?.('desktop_restart');
+      if (resolvedUrl.redeemUrl) {
+        window.location.assign(resolvedUrl.redeemUrl);
+        return;
+      }
+
+      if (isDesktopShell()) {
+        await restartDesktopApp();
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : t('onboarding.remoteConnection.errors.failedToSaveConnection'));
       setState('error');
     }
-  }, [normalizedUrl, label, onConnect, t]);
+  }, [resolvedUrl, label, onConnect, t]);
+
+  const selectHost = useCallback(async (hostId: string) => {
+    const config = await desktopHostsGet();
+    await desktopHostsSet({
+      hosts: config.hosts,
+      defaultHostId: hostId,
+      initialHostChoiceCompleted: true,
+    });
+    await restartDesktopApp();
+  }, []);
+
+  const handleImport = useCallback(async () => {
+    setState('testing');
+    setError('');
+    try {
+      const config = await desktopHostsGet();
+      const imported = await importDesktopHostPairing(connectLink, config.hosts);
+      await desktopHostsSet({
+        hosts: imported.hosts,
+        defaultHostId: imported.hostId,
+        initialHostChoiceCompleted: true,
+      });
+      await restartDesktopApp();
+    } catch (err) {
+      setError(
+        err instanceof Error && err.message === 'invalid-connect-link'
+          ? t('settings.remoteInstances.direct.error.invalidConnectLink')
+          : t('onboarding.remoteConnection.errors.failedToSaveConnection'),
+      );
+      setState('error');
+    }
+  }, [connectLink, t]);
 
   const isTesting = state === 'testing';
   const canTest = normalizedUrl !== null && !isTesting;
@@ -157,15 +214,85 @@ export function RemoteConnectionForm({
 
   const probeMessageKey = getProbeStatusMessageKey(probeResult?.status ?? null);
   const isSuccess = probeResult?.status === 'ok';
+  const isUpdateRecommended = probeResult?.status === 'update-recommended';
   const isAuth = probeResult?.status === 'auth';
   const isBlocking = isBlockingStatus(probeResult?.status ?? null);
+
+  if (showInstancePicker && view === 'instances') {
+    return (
+      <div className="flex flex-col items-center justify-center h-full p-8">
+        <div className="w-full max-w-md space-y-6">
+          <div className="space-y-2 text-center">
+            <h1 className="typography-ui-header text-xl font-semibold text-foreground">
+              {t('desktopHostSwitcher.actions.switchInstance')}
+            </h1>
+            <p className="text-muted-foreground text-sm">{t('settings.remoteInstances.direct.description')}</p>
+          </div>
+          {error ? <div className="text-sm text-[var(--status-error)]">{error}</div> : null}
+          <div className="space-y-2">
+            {hosts.length === 0 ? (
+              <div className="py-4 text-center text-sm text-muted-foreground">
+                {t('settings.remoteInstances.direct.state.empty')}
+              </div>
+            ) : hosts.map((host) => (
+              <Button
+                key={host.id}
+                variant="outline"
+                className="w-full justify-start"
+                onClick={() => void selectHost(host.id)}
+              >
+                <span className="min-w-0 truncate">{host.label}</span>
+              </Button>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <Button variant="outline" className="flex-1" onClick={() => setView('import')}>
+              {t('settings.remoteInstances.direct.import.action')}
+            </Button>
+            <Button className="flex-1" onClick={() => setView('add')}>
+              {t('settings.remoteInstances.direct.actions.add')}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (showInstancePicker && view === 'import') {
+    return (
+      <div className="flex flex-col items-center justify-center h-full p-8">
+        <div className="w-full max-w-md space-y-6">
+          <Button variant="ghost" onClick={() => setView('instances')} className="p-0 text-muted-foreground">
+            {t('onboarding.common.actions.back')}
+          </Button>
+          <div className="space-y-2 text-center">
+            <h1 className="typography-ui-header text-xl font-semibold text-foreground">
+              {t('settings.remoteInstances.direct.import.action')}
+            </h1>
+            <p className="text-muted-foreground text-sm">{t('settings.remoteInstances.direct.import.description')}</p>
+          </div>
+          <Input
+            value={connectLink}
+            onChange={(event) => setConnectLink(event.target.value)}
+            placeholder={t('settings.remoteInstances.direct.import.placeholder')}
+            disabled={isTesting}
+            autoFocus
+          />
+          {error ? <div className="text-sm text-[var(--status-error)]">{error}</div> : null}
+          <Button onClick={() => void handleImport()} disabled={isTesting || !connectLink.trim()}>
+            {t('settings.remoteInstances.direct.import.action')}
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col items-center justify-center h-full p-8">
       <div className="w-full max-w-md space-y-6">
-        {showBackButton && (
+        {(showBackButton || showInstancePicker) && (
           <div className="flex items-center">
-            <Button variant="ghost" onClick={onBack} className="p-0 text-muted-foreground hover:text-foreground">
+            <Button variant="ghost" onClick={showInstancePicker ? () => setView('instances') : onBack} className="p-0 text-muted-foreground hover:text-foreground">
               {t('onboarding.common.actions.back')}
             </Button>
           </div>
@@ -235,6 +362,18 @@ export function RemoteConnectionForm({
             }}
           >
             {t('onboarding.remoteConnection.status.authWarning')}
+          </div>
+        )}
+
+        {probeResult && isUpdateRecommended && (
+          <div
+            className="rounded-lg border p-3 text-sm"
+            style={{
+              borderColor: 'var(--status-warning)',
+              color: 'var(--status-warning)',
+            }}
+          >
+            {probeMessageKey ? t(probeMessageKey as Parameters<typeof t>[0]) : null}
           </div>
         )}
 

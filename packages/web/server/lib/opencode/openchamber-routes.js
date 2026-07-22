@@ -1,7 +1,6 @@
 export const registerOpenChamberRoutes = (app, dependencies) => {
   const {
     fs,
-    os,
     path,
     process,
     server,
@@ -13,9 +12,6 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
     fetchFreeZenModels,
     getCachedZenModels,
   } = dependencies;
-
-  let cachedModelsMetadata = null;
-  let cachedModelsMetadataTimestamp = 0;
 
   app.get('/api/openchamber/update-check', async (req, res) => {
     try {
@@ -43,6 +39,7 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
         arch: parseString(req.query.arch),
         instanceMode: parseString(req.query.instanceMode),
         currentVersion: parseString(req.query.currentVersion),
+        installId: parseString(req.query.installId),
         reportUsage: parseReportUsage(parseString(req.query.reportUsage)),
       });
       res.json(updateInfo);
@@ -104,14 +101,15 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
       }
 
       const currentPort = server.address()?.port || 3000;
-      const tmpDir = os.tmpdir();
-      const instanceFilePath = path.join(tmpDir, `openchamber-${currentPort}.json`);
+      const instanceFilePath = path.join(openchamberDataDir, 'run', `openchamber-${currentPort}.json`);
       let storedOptions = { port: currentPort, daemon: true };
       try {
         const content = await fs.promises.readFile(instanceFilePath, 'utf8');
         storedOptions = JSON.parse(content);
       } catch {
       }
+      const launchMode = storedOptions.launchMode === 'foreground' ? 'foreground' : 'daemon';
+      const isForegroundService = launchMode === 'foreground';
 
       const isWindows = process.platform === 'win32';
       const quotePosix = (value) => `'${String(value).replace(/'/g, "'\\''")}'`;
@@ -152,7 +150,11 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
           restartCmdFallback += ` --ui-password '${escapedPw}'`;
         }
       }
-      const restartCmd = `(${restartCmdPrimary}) || (${restartCmdFallback})`;
+      if (storedOptions.apiOnly === true) {
+        restartCmdPrimary += ' --api-only';
+        restartCmdFallback += ' --api-only';
+      }
+      const restartCmd = isForegroundService ? '' : `(${restartCmdPrimary}) || (${restartCmdFallback})`;
       const updateLogPath = path.join(openchamberDataDir, 'update-install.log');
       const logPreamble = [
         '',
@@ -165,8 +167,9 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
         `packagePath=${pmDetails.packagePath || 'unknown'}`,
         `globalNodeModulesRoot=${pmDetails.globalNodeModulesRoot || 'unknown'}`,
         `mode=${isContainer ? 'container' : 'restart'}`,
+        `launchMode=${launchMode}`,
         `updateCommand=${updateCmd}`,
-        `restartCommand=${restartCmd}`,
+        `restartCommand=${restartCmd || 'service-manager'}`,
         `logPath=${updateLogPath}`,
       ].join('\n');
 
@@ -176,6 +179,7 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
         version: updateInfo.version,
         packageManager: pm,
         autoRestart: true,
+        restartManager: isForegroundService ? 'service' : 'cli',
       });
 
         setTimeout(() => {
@@ -192,7 +196,7 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
             ${updateCmd}
             if %ERRORLEVEL% EQU 0 (
               echo Update successful, restarting OpenChamber...
-              ${restartCmd}
+              ${restartCmd || 'echo Service manager will restart OpenChamber.'}
             ) else (
               echo Update failed
               exit /b 1
@@ -204,7 +208,7 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
             ${updateCmd}
             if [ $? -eq 0 ]; then
               echo "Update successful, restarting OpenChamber..."
-              ${restartCmd}
+              ${restartCmd || 'echo "Service manager will restart OpenChamber."'}
             else
               echo "Update failed"
               exit 1
@@ -248,48 +252,18 @@ export const registerOpenChamberRoutes = (app, dependencies) => {
   });
 
   app.get('/api/openchamber/models-metadata', async (_req, res) => {
-    const now = Date.now();
-
-    if (cachedModelsMetadata && now - cachedModelsMetadataTimestamp < modelsMetadataCacheTtl) {
-      res.setHeader('Cache-Control', 'public, max-age=60');
-      return res.json(cachedModelsMetadata);
-    }
-
-    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timeout = controller ? setTimeout(() => controller.abort(), 8000) : null;
-
     try {
-      const response = await fetch(modelsDevApiUrl, {
-        signal: controller?.signal,
-        headers: {
-          Accept: 'application/json'
-        }
+      const { getModelsMetadata } = await import('./models-metadata.js');
+      const { metadata, fromCache, stale } = await getModelsMetadata({
+        url: modelsDevApiUrl,
+        ttlMs: modelsMetadataCacheTtl,
       });
-
-      if (!response.ok) {
-        throw new Error(`models.dev responded with status ${response.status}`);
-      }
-
-      const metadata = await response.json();
-      cachedModelsMetadata = metadata;
-      cachedModelsMetadataTimestamp = Date.now();
-
-      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.setHeader('Cache-Control', fromCache && !stale ? 'public, max-age=60' : 'public, max-age=300');
       res.json(metadata);
     } catch (error) {
       console.warn('Failed to fetch models.dev metadata via server:', error);
-
-      if (cachedModelsMetadata) {
-        res.setHeader('Cache-Control', 'public, max-age=60');
-        res.json(cachedModelsMetadata);
-      } else {
-        const statusCode = error?.name === 'AbortError' ? 504 : 502;
-        res.status(statusCode).json({ error: 'Failed to retrieve model metadata' });
-      }
-    } finally {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
+      const statusCode = error?.name === 'TimeoutError' || error?.name === 'AbortError' ? 504 : 502;
+      res.status(statusCode).json({ error: 'Failed to retrieve model metadata' });
     }
   });
 

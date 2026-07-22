@@ -8,6 +8,9 @@ export const createGracefulShutdownRuntime = (dependencies) => {
     syncToHmrState,
     openCodeWatcherRuntime,
     sessionRuntime,
+    sessionAssistRuntime,
+    sessionGoalRuntime,
+    contextObligatoryRuntime,
     scheduledTasksRuntime,
     getHealthCheckInterval,
     clearHealthCheckInterval,
@@ -29,7 +32,9 @@ export const createGracefulShutdownRuntime = (dependencies) => {
     tunnelAuthController,
   } = dependencies;
 
-  const gracefulShutdown = async (options = {}) => {
+  let shutdownPromise = null;
+
+  const runShutdown = async (options = {}) => {
     if (getIsShuttingDown()) return;
 
     setIsShuttingDown(true);
@@ -39,6 +44,9 @@ export const createGracefulShutdownRuntime = (dependencies) => {
 
     openCodeWatcherRuntime.stop();
     sessionRuntime.dispose();
+    sessionAssistRuntime?.stop?.();
+    sessionGoalRuntime?.stop?.();
+    contextObligatoryRuntime?.stop?.();
     scheduledTasksRuntime?.stop?.();
 
     const healthCheckInterval = getHealthCheckInterval();
@@ -90,20 +98,27 @@ export const createGracefulShutdownRuntime = (dependencies) => {
 
     const server = getServer();
     if (server) {
-      await Promise.race([
-        new Promise((resolve) => {
-          server.close(() => {
-            console.log('HTTP server closed');
-            resolve();
-          });
-        }),
-        new Promise((resolve) => {
-          setTimeout(() => {
-            console.warn('Server close timeout reached, forcing shutdown');
-            resolve();
-          }, shutdownTimeoutMs);
-        }),
-      ]);
+      let closeTimeout = null;
+      try {
+        await Promise.race([
+          new Promise((resolve) => {
+            server.close(() => {
+              console.log('HTTP server closed');
+              resolve();
+            });
+          }),
+          new Promise((resolve) => {
+            closeTimeout = setTimeout(() => {
+              console.warn('Server close timeout reached, forcing shutdown');
+              resolve();
+            }, shutdownTimeoutMs);
+          }),
+        ]);
+      } finally {
+        if (closeTimeout) {
+          clearTimeout(closeTimeout);
+        }
+      }
     }
 
     const uiAuthController = getUiAuthController();
@@ -124,6 +139,12 @@ export const createGracefulShutdownRuntime = (dependencies) => {
     if (exitProcess) {
       process.exit(0);
     }
+  };
+
+  const gracefulShutdown = (options = {}) => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = runShutdown(options);
+    return shutdownPromise;
   };
 
   return {

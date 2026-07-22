@@ -1,7 +1,9 @@
 import { create } from 'zustand';
-import { createJSONStorage, persist } from 'zustand/middleware';
+import { persist } from 'zustand/middleware';
 import type { GitHubPullRequestStatus, RuntimeAPIs } from '@/lib/api/types';
-import { getSafeStorage } from './utils/safeStorage';
+import { mapWithConcurrency } from '@/lib/concurrency';
+import { createDeferredSafeJSONStorage } from './utils/safeStorage';
+import { getRuntimeKey } from '@/lib/runtime-switch';
 
 const PR_REVALIDATE_TTL_MS = 90_000;
 const PR_REVALIDATE_INTERVAL_MS = 15_000;
@@ -10,8 +12,10 @@ const PR_BOOTSTRAP_RETRY_DELAYS_MS = [2_000, 5_000] as const;
 const PR_OPEN_BUSY_INTERVAL_MS = 60_000;
 const PR_OPEN_DEFAULT_INTERVAL_MS = 2 * 60_000;
 const PR_OPEN_STABLE_INTERVAL_MS = 5 * 60_000;
+const PR_STATUS_REFRESH_CONCURRENCY = 4;
 const PR_PERSIST_TTL_MS = 12 * 60 * 60_000;
 const PR_STATUS_STORAGE_KEY = 'openchamber.github-pr-status';
+const PR_MAX_ENTRIES = 200;
 
 const isTerminalPrState = (state: string | null | undefined): boolean => state === 'closed' || state === 'merged';
 const isPendingChecks = (status: GitHubPullRequestStatus | null): boolean => {
@@ -22,9 +26,14 @@ const isPendingChecks = (status: GitHubPullRequestStatus | null): boolean => {
   return checks.state === 'pending' || checks.pending > 0;
 };
 
+const getOpenPrRefreshInterval = (status: GitHubPullRequestStatus | null): number => {
+  if (isPendingChecks(status)) return PR_OPEN_BUSY_INTERVAL_MS;
+  if (status?.checks && status.checks.state !== 'pending') return PR_OPEN_STABLE_INTERVAL_MS;
+  return PR_OPEN_DEFAULT_INTERVAL_MS;
+};
+
 export const getGitHubPrStatusKey = (directory: string, branch: string, remoteName?: string | null): string => {
-  void remoteName;
-  return `${directory}::${branch}`;
+  return JSON.stringify([getRuntimeKey(), directory, branch, remoteName ?? 'auto']);
 };
 
 type RefreshOptions = {
@@ -41,6 +50,7 @@ type PrTrackingTarget = {
 };
 
 type PrRuntimeParams = {
+  runtimeKey?: string;
   directory: string;
   branch: string;
   remoteName: string | null;
@@ -51,6 +61,7 @@ type PrRuntimeParams = {
 };
 
 type PrEntryIdentity = {
+  runtimeKey: string;
   directory: string;
   branch: string;
   remoteName: string | null;
@@ -67,6 +78,7 @@ type PrStatusEntry = {
   params: PrRuntimeParams | null;
   identity: PrEntryIdentity | null;
   resolvedRemoteName: string | null;
+  paramsRevision: number;
 };
 
 type PersistedPrStatusEntry = Pick<
@@ -85,12 +97,51 @@ type GitHubPrStatusStore = {
   refresh: (key: string, options?: RefreshOptions) => Promise<void>;
   refreshTargets: (targets: PrTrackingTarget[], options?: RefreshOptions) => Promise<void>;
   updateStatus: (key: string, updater: (prev: GitHubPullRequestStatus | null) => GitHubPullRequestStatus | null) => void;
+  resetForRuntimeSwitch: () => void;
 };
 
 const timers = new Map<string, number>();
 const bootstrapTimers = new Map<string, number[]>();
-const inFlightBySignature = new Set<string>();
+const inFlightBySignature = new Map<string, symbol>();
 const lastRefreshBySignature = new Map<string, number>();
+let prRuntimeGeneration = 0;
+
+// Global concurrency gate for PR-status network requests.
+//
+// PR status is non-critical chrome, but each request can be slow (the server
+// makes many serial GitHub API calls and GitHub secondary-rate-limits bursts,
+// so a single request can take 20s+). The browser allows only ~6 concurrent
+// HTTP/1.1 connections per origin. Without this cap, watching N worktrees fires
+// N PR-status requests at once (each startWatching() calls refresh() directly,
+// bypassing refreshTargets' batch limiter), which saturates the connection pool
+// and starves the critical path (bootstrap session.status, diffs, sending
+// messages) for the full duration — the whole UI appears frozen on startup.
+//
+// Capping concurrency low guarantees free sockets remain for critical traffic.
+const PR_STATUS_NETWORK_CONCURRENCY = 2;
+let prStatusNetworkActive = 0;
+const prStatusNetworkWaiters: Array<() => void> = [];
+
+const acquirePrStatusNetworkSlot = (): Promise<void> => {
+  if (prStatusNetworkActive < PR_STATUS_NETWORK_CONCURRENCY) {
+    prStatusNetworkActive += 1;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    prStatusNetworkWaiters.push(resolve);
+  });
+};
+
+const releasePrStatusNetworkSlot = (): void => {
+  const next = prStatusNetworkWaiters.shift();
+  if (next) {
+    // Hand the slot directly to the next waiter — keep the active count steady.
+    next();
+    return;
+  }
+  prStatusNetworkActive = Math.max(0, prStatusNetworkActive - 1);
+};
+
 const createEntry = (): PrStatusEntry => ({
   status: null,
   isLoading: false,
@@ -102,6 +153,7 @@ const createEntry = (): PrStatusEntry => ({
   params: null,
   identity: null,
   resolvedRemoteName: null,
+  paramsRevision: 0,
 });
 
 const getIdentityFromEntry = (entry: PrStatusEntry | null | undefined): PrEntryIdentity | null => {
@@ -109,6 +161,7 @@ const getIdentityFromEntry = (entry: PrStatusEntry | null | undefined): PrEntryI
     return {
       directory: entry.params.directory,
       branch: entry.params.branch,
+      runtimeKey: entry.params.runtimeKey ?? entry.identity?.runtimeKey ?? getRuntimeKey(),
       remoteName: entry.params.remoteName ?? entry.resolvedRemoteName ?? entry.identity?.remoteName ?? null,
     };
   }
@@ -123,7 +176,7 @@ const getSignatureFromEntry = (entry: PrStatusEntry | null | undefined): string 
   if (!identity?.directory || !identity.branch) {
     return null;
   }
-  return `${identity.directory}::${identity.branch}`;
+  return JSON.stringify([identity.runtimeKey, identity.directory, identity.branch, identity.remoteName ?? 'auto']);
 };
 
 const getKeysBySignature = (entries: Record<string, PrStatusEntry>, signature: string): string[] => {
@@ -133,20 +186,35 @@ const getKeysBySignature = (entries: Record<string, PrStatusEntry>, signature: s
 };
 
 const mergeParams = (entry: PrStatusEntry, next: PrRuntimeParams): PrStatusEntry => {
+  const runtimeKey = next.runtimeKey ?? getRuntimeKey();
   const remoteName = next.remoteName ?? entry.params?.remoteName ?? entry.resolvedRemoteName ?? entry.identity?.remoteName ?? null;
+  const paramsChanged = !entry.params
+    || entry.params.runtimeKey !== runtimeKey
+    || entry.params.directory !== next.directory
+    || entry.params.branch !== next.branch
+    || entry.params.remoteName !== remoteName
+    || entry.params.canShow !== next.canShow
+    || entry.params.github !== next.github
+    || entry.params.githubAuthChecked !== next.githubAuthChecked
+    || entry.params.githubConnected !== next.githubConnected;
   return {
     ...entry,
+    paramsRevision: paramsChanged ? entry.paramsRevision + 1 : entry.paramsRevision,
+    ...(paramsChanged ? { isLoading: false, error: null } : {}),
     params: entry.params
       ? {
         ...entry.params,
         ...next,
+        runtimeKey,
         remoteName,
       }
       : {
         ...next,
+        runtimeKey,
         remoteName,
       },
     identity: {
+      runtimeKey,
       directory: next.directory,
       branch: next.branch,
       remoteName,
@@ -217,6 +285,20 @@ const hydrateEntry = (entry: PersistedPrStatusEntry | undefined): PrStatusEntry 
   resolvedRemoteName: entry?.resolvedRemoteName ?? entry?.status?.resolvedRemoteName ?? null,
 });
 
+const boundEntries = (entries: Record<string, PrStatusEntry>): Record<string, PrStatusEntry> => {
+  const all = Object.entries(entries);
+  if (all.length <= PR_MAX_ENTRIES) return entries;
+  return Object.fromEntries(all
+    .sort(([, left], [, right]) => {
+      const leftProtected = left.watchers > 0 || left.isLoading;
+      const rightProtected = right.watchers > 0 || right.isLoading;
+      if (leftProtected !== rightProtected) return leftProtected ? -1 : 1;
+      return Math.max(right.lastRefreshAt, right.lastDiscoveryPollAt)
+        - Math.max(left.lastRefreshAt, left.lastDiscoveryPollAt);
+    })
+    .slice(0, PR_MAX_ENTRIES));
+};
+
 export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
   persist(
     (set, get) => ({
@@ -224,16 +306,36 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
       activeRequestCount: 0,
       totalRequestCount: 0,
 
+      resetForRuntimeSwitch: () => {
+        prRuntimeGeneration += 1;
+        for (const timerId of timers.values()) window.clearInterval(timerId);
+        for (const timerIds of bootstrapTimers.values()) timerIds.forEach((timerId) => window.clearTimeout(timerId));
+        timers.clear();
+        bootstrapTimers.clear();
+        inFlightBySignature.clear();
+        lastRefreshBySignature.clear();
+        set((state) => ({
+          activeRequestCount: 0,
+          entries: Object.fromEntries(Object.entries(state.entries).map(([key, entry]) => [key, {
+            ...entry,
+            watchers: 0,
+            isLoading: false,
+            params: null,
+            paramsRevision: entry.paramsRevision + 1,
+          }])),
+        }));
+      },
+
       ensureEntry: (key) => {
         set((state) => {
           if (state.entries[key]) {
             return state;
           }
           return {
-            entries: {
+            entries: boundEntries({
               ...state.entries,
               [key]: createEntry(),
-            },
+            }),
           };
         });
       },
@@ -330,11 +432,7 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
           }
 
           const elapsed = Date.now() - entry.lastRefreshAt;
-          const nextInterval = isPendingChecks(entry.status)
-            ? PR_OPEN_BUSY_INTERVAL_MS
-            : (entry.status?.checks && entry.status.checks.state !== 'pending'
-                ? PR_OPEN_STABLE_INTERVAL_MS
-                : PR_OPEN_DEFAULT_INTERVAL_MS);
+          const nextInterval = getOpenPrRefreshInterval(entry.status);
           if (elapsed < nextInterval) {
             return;
           }
@@ -410,8 +508,17 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
           return;
         }
 
-        inFlightBySignature.add(signature);
-        lastRefreshBySignature.set(signature, Date.now());
+        const requestToken = Symbol(signature);
+        const runtimeGeneration = prRuntimeGeneration;
+        const paramsRevision = entry.paramsRevision;
+        const runtimeKey = entry.params?.runtimeKey ?? entry.identity?.runtimeKey ?? getRuntimeKey();
+        const isCurrent = () => (
+          runtimeGeneration === prRuntimeGeneration
+          && runtimeKey === getRuntimeKey()
+          && inFlightBySignature.get(signature) === requestToken
+          && get().entries[key]?.paramsRevision === paramsRevision
+        );
+        inFlightBySignature.set(signature, requestToken);
 
         set((prev) => {
           const nextEntries = { ...prev.entries };
@@ -422,7 +529,6 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
             }
             nextEntries[signatureKey] = {
               ...current,
-              lastRefreshAt: Date.now(),
               isLoading: options?.silent ? current.isLoading : true,
               error: null,
             };
@@ -433,6 +539,7 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
         });
 
         if (params.githubAuthChecked && params.githubConnected === false) {
+          if (!isCurrent()) return;
           set((prev) => {
             const nextEntries = { ...prev.entries };
             signatureKeys.forEach((signatureKey) => {
@@ -452,11 +559,12 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
               entries: nextEntries,
             };
           });
-          inFlightBySignature.delete(signature);
+          if (inFlightBySignature.get(signature) === requestToken) inFlightBySignature.delete(signature);
           return;
         }
 
         if (!params.github?.prStatus) {
+          if (!isCurrent()) return;
           set((prev) => {
             const nextEntries = { ...prev.entries };
             signatureKeys.forEach((signatureKey) => {
@@ -476,7 +584,7 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
               entries: nextEntries,
             };
           });
-          inFlightBySignature.delete(signature);
+          if (inFlightBySignature.get(signature) === requestToken) inFlightBySignature.delete(signature);
           return;
         }
 
@@ -486,7 +594,19 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
             activeRequestCount: prev.activeRequestCount + 1,
             totalRequestCount: prev.totalRequestCount + 1,
           }));
-          const next = await params.github.prStatus(params.directory, params.branch, params.remoteName ?? undefined, { force: options?.force });
+          await acquirePrStatusNetworkSlot();
+          let next: GitHubPullRequestStatus;
+          try {
+            if (!isCurrent()) return;
+            // Failed requests need the same non-forced cooldown as successful
+            // refreshes. Record only work that reaches the network slot so a
+            // stale queued request cannot suppress its replacement.
+            lastRefreshBySignature.set(signature, Date.now());
+            next = await params.github.prStatus(params.directory, params.branch, params.remoteName ?? undefined, { force: options?.force });
+          } finally {
+            releasePrStatusNetworkSlot();
+          }
+          if (!isCurrent()) return;
           set((prev) => {
             const nextEntries = { ...prev.entries };
             signatureKeys.forEach((signatureKey) => {
@@ -518,6 +638,7 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
 
               const resolvedRemoteName = status.resolvedRemoteName ?? current.resolvedRemoteName ?? params.remoteName ?? null;
               const identity = getIdentityFromEntry(current) ?? {
+                runtimeKey,
                 directory: params.directory,
                 branch: params.branch,
                 remoteName: params.remoteName ?? null,
@@ -529,6 +650,7 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
                 error: null,
                 isLoading: options?.silent ? current.isLoading : false,
                 isInitialStatusResolved: options?.markInitialResolved === false ? current.isInitialStatusResolved : true,
+                lastRefreshAt: Date.now(),
                 resolvedRemoteName,
                 identity: {
                   ...identity,
@@ -542,6 +664,7 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
             };
           });
         } catch (error) {
+          if (!isCurrent()) return;
           const message = error instanceof Error ? error.message : String(error);
           set((prev) => {
             const nextEntries = { ...prev.entries };
@@ -562,8 +685,10 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
             };
           });
         } finally {
-          inFlightBySignature.delete(signature);
-          set((prev) => ({ ...prev, activeRequestCount: Math.max(0, prev.activeRequestCount - 1) }));
+          if (inFlightBySignature.get(signature) === requestToken) inFlightBySignature.delete(signature);
+          if (runtimeGeneration === prRuntimeGeneration) {
+            set((prev) => ({ ...prev, activeRequestCount: Math.max(0, prev.activeRequestCount - 1) }));
+          }
         }
       },
 
@@ -581,7 +706,7 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
             .filter((key): key is string => Boolean(key)),
         ));
 
-        await Promise.all(keys.map((key) => get().refresh(key, options)));
+        await mapWithConcurrency(keys, PR_STATUS_REFRESH_CONCURRENCY, (key) => get().refresh(key, options));
       },
 
       updateStatus: (key, updater) => {
@@ -602,7 +727,9 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
     }),
     {
       name: PR_STATUS_STORAGE_KEY,
-      storage: createJSONStorage(() => getSafeStorage()),
+      storage: createDeferredSafeJSONStorage(),
+      version: 2,
+      migrate: (persistedState, version) => version < 2 ? { entries: {} } : persistedState,
       partialize: (state) => ({
         entries: Object.fromEntries(
           Object.entries(state.entries)
@@ -612,8 +739,11 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
                 return false;
               }
               const freshness = Math.max(entry.lastRefreshAt, entry.lastDiscoveryPollAt);
-              return freshness === 0 || Date.now() - freshness < PR_PERSIST_TTL_MS;
+              return freshness > 0 && Date.now() - freshness < PR_PERSIST_TTL_MS;
             })
+            .sort(([, left], [, right]) => Math.max(right.lastRefreshAt, right.lastDiscoveryPollAt)
+              - Math.max(left.lastRefreshAt, left.lastDiscoveryPollAt))
+            .slice(0, PR_MAX_ENTRIES)
             .map(([key, entry]) => [key, toPersistedEntry(entry)]),
         ),
       }),
@@ -623,22 +753,20 @@ export const useGitHubPrStatusStore = create<GitHubPrStatusStore>()(
         return {
           ...current,
           entries: Object.fromEntries(
-            Object.entries(persistedEntries).map(([key, entry]) => [key, hydrateEntry(entry)]),
+            Object.entries(persistedEntries)
+              .filter(([, entry]) => Boolean(
+                entry.identity?.runtimeKey
+                && Math.max(entry.lastRefreshAt, entry.lastDiscoveryPollAt) > 0
+                && Date.now() - Math.max(entry.lastRefreshAt, entry.lastDiscoveryPollAt) < PR_PERSIST_TTL_MS,
+              ))
+              .slice(0, PR_MAX_ENTRIES)
+              .map(([key, entry]) => [key, hydrateEntry(entry)]),
           ),
         };
       },
     },
   ),
 );
-
-export const usePrStatusForDirectoryBranch = (directory: string | null, branch: string | null) => {
-  return useGitHubPrStatusStore((state) => {
-    if (!directory || !branch) return null;
-    const key = getGitHubPrStatusKey(directory, branch);
-    return state.entries[key] ?? null;
-  });
-};
-
 export type PrVisualSummary = {
   number: number;
   visualState: string;

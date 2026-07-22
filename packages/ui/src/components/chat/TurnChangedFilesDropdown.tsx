@@ -1,22 +1,20 @@
 import React from 'react';
-import { RiFileEditLine, RiArrowDownSLine, RiArrowUpSLine } from '@remixicon/react';
 import type { ToolPart } from '@opencode-ai/sdk/v2';
 import { Popover } from '@base-ui/react/popover';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useIsGitRepo } from '@/stores/useGitStore';
 import { useUIStore } from '@/stores/useUIStore';
-import { RuntimeAPIContext } from '@/contexts/runtimeAPIContext';
 import {
     type ChangedFile,
     type ChangedFileEntry,
     FILE_EDIT_TOOLS,
     extractChangedFiles,
-    isGitFile,
     toRelativePath,
 } from './changedFiles';
 import { ChangedFilesList } from './ChangedFilesList';
 import { changedFilesPopoverClassName, changedFilesPopoverStyle } from './changedFilesPopover';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { Icon } from "@/components/icon/Icon";
 import type { TurnActivityRecord } from './lib/turns/types';
 
 interface TurnChangedFilesDropdownProps {
@@ -28,7 +26,6 @@ export const TurnChangedFilesDropdown: React.FC<TurnChangedFilesDropdownProps> =
     const [portalContainer, setPortalContainer] = React.useState<HTMLElement | null>(null);
     const triggerButtonRef = React.useRef<HTMLButtonElement | null>(null);
     const currentDirectory = useDirectoryStore((s) => s.currentDirectory);
-    const runtime = React.useContext(RuntimeAPIContext);
     const isGitRepo = useIsGitRepo(currentDirectory);
 
     const changedFiles = React.useMemo<ChangedFile[]>(() => {
@@ -55,26 +52,16 @@ export const TurnChangedFilesDropdown: React.FC<TurnChangedFilesDropdownProps> =
 
     const handleOpenFile = (file: ChangedFileEntry) => {
         if (!currentDirectory) return;
-        if (isGitFile(file)) return;
-
-        const absolutePath = file.path.startsWith('/')
-            ? file.path
-            : (currentDirectory.endsWith('/') ? currentDirectory : currentDirectory + '/') + file.path;
-
-        const editor = runtime?.editor;
-        if (editor) {
-            void editor.openFile(absolutePath);
-            setIsExpanded(false);
-            return;
-        }
 
         const store = useUIStore.getState();
+        const relativePath = toRelativePath(file.path, currentDirectory);
         if (!store.isMobile) {
-            store.openContextFile(currentDirectory, absolutePath);
+            store.openContextDiff(currentDirectory, relativePath, false, 'turn');
             setIsExpanded(false);
             return;
         }
-        store.navigateToDiff(toRelativePath(file.path, currentDirectory));
+
+        store.navigateToDiff(relativePath, false, 'turn');
         store.setRightSidebarOpen(false);
         setIsExpanded(false);
     };
@@ -96,12 +83,12 @@ export const TurnChangedFilesDropdown: React.FC<TurnChangedFilesDropdownProps> =
                                 onPointerDownCapture={syncPortalContainer}
                                 onFocusCapture={syncPortalContainer}
                             >
-                                <RiFileEditLine className="h-3.5 w-3.5" />
+                                <Icon name="file-edit" className="h-3.5 w-3.5" />
                                 <span className="message-footer__label">{label}</span>
                                 {isExpanded ? (
-                                    <RiArrowUpSLine className="h-3.5 w-3.5" />
+                                    <Icon name="arrow-up-s" className="h-3.5 w-3.5" />
                                 ) : (
-                                    <RiArrowDownSLine className="h-3.5 w-3.5" />
+                                    <Icon name="arrow-down-s" className="h-3.5 w-3.5" />
                                 )}
                             </button>
                         }

@@ -51,6 +51,10 @@ export type State = {
   path: Path
   session: Session[]
   sessionTotal: number
+  sessionListSource?: "empty" | "persisted" | "live" | "authoritative"
+  sessionRevision?: number
+  sessionEventRevision?: Record<string, number>
+  sessionDeletedRevision?: Record<string, number>
   session_status: Record<string, SessionStatus>
   session_diff: Record<string, FileDiff[]>
   todo: Record<string, Todo[]>
@@ -77,7 +81,7 @@ export type GlobalState = {
   sessionTodo: Record<string, Todo[]>
 }
 
-export type InitError = {
+type InitError = {
   type: "init"
   message: string
 }
@@ -105,15 +109,9 @@ export type DisposeCheck = {
   hasPendingBlockingRequests: boolean
 }
 
-export type ChildOptions = {
-  bootstrap?: boolean
-}
-
 export const MAX_DIR_STORES = 30
 export const DIR_IDLE_TTL_MS = 20 * 60 * 1000
-export const SESSION_RECENT_WINDOW = 4 * 60 * 60 * 1000
-export const SESSION_RECENT_LIMIT = 50
-export const SESSION_CACHE_LIMIT = 8
+export const SESSION_CACHE_LIMIT = 40
 
 export const INITIAL_STATE: State = {
   project: "",
@@ -127,6 +125,10 @@ export const INITIAL_STATE: State = {
   command: [],
   session: [],
   sessionTotal: 0,
+  sessionListSource: "empty",
+  sessionRevision: 0,
+  sessionEventRevision: {},
+  sessionDeletedRevision: {},
   session_status: {},
   session_diff: {},
   todo: {},

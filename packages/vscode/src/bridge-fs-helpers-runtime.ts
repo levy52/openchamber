@@ -4,7 +4,15 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { execGit } from './bridge-git-process-runtime';
 
-const MAX_FILE_ATTACH_SIZE_BYTES = 10 * 1024 * 1024;
+const MAX_FILE_ATTACH_SIZE_BYTES = 20 * 1024 * 1024;
+
+const createGitCheckIgnoreTimeoutMs = () => {
+  const raw = Number(process.env.OPENCHAMBER_GIT_CHECK_IGNORE_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 2500;
+};
+
+const GIT_CHECK_IGNORE_TIMEOUT_MS = createGitCheckIgnoreTimeoutMs();
 
 const guessMimeTypeFromExtension = (ext: string) => {
   switch (ext) {
@@ -91,7 +99,7 @@ export const readUriAsAttachment = async (
 
     const size = stat.size ?? 0;
     if (size > MAX_FILE_ATTACH_SIZE_BYTES) {
-      return { skipped: { name, reason: 'File exceeds 10MB limit' } };
+      return { skipped: { name, reason: 'File exceeds 20MB limit' } };
     }
 
     const bytes = await vscode.workspace.fs.readFile(uri);
@@ -114,12 +122,35 @@ const isPathInside = (candidatePath: string, parentPath: string): boolean => {
 
 export const normalizeFsPath = (value: string) => value.replace(/\\/g, '/');
 
+const execGitCheckIgnore = async (args: string[], cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number } | null> => {
+  if (GIT_CHECK_IGNORE_TIMEOUT_MS <= 0) {
+    return execGit(args, cwd);
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      execGit(args, cwd),
+      new Promise<null>((resolve) => {
+        timeout = setTimeout(() => resolve(null), GIT_CHECK_IGNORE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+};
+
 const gitCheckIgnoreNames = async (cwd: string, names: string[]): Promise<Set<string>> => {
   if (names.length === 0) {
     return new Set();
   }
 
-  const result = await execGit(['check-ignore', '--', ...names], cwd);
+  const result = await execGitCheckIgnore(['check-ignore', '--', ...names], cwd);
+  if (!result) {
+    return new Set();
+  }
   if (result.exitCode !== 0 || !result.stdout) {
     return new Set();
   }
@@ -137,7 +168,10 @@ const gitCheckIgnorePaths = async (cwd: string, paths: string[]): Promise<Set<st
     return new Set();
   }
 
-  const result = await execGit(['check-ignore', '--', ...paths], cwd);
+  const result = await execGitCheckIgnore(['check-ignore', '--', ...paths], cwd);
+  if (!result) {
+    return new Set();
+  }
   if (result.exitCode !== 0 || !result.stdout) {
     return new Set();
   }

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
 import { opencodeClient, type ProjectFileSearchHit } from '@/lib/opencode/client';
+import { getRuntimeKey } from '@/lib/runtime-switch';
 
 const CACHE_TTL_MS = 30_000;
 const MAX_CACHE_ENTRIES = 40;
@@ -22,9 +23,11 @@ interface FileSearchStoreState {
     options?: { includeHidden?: boolean; respectGitignore?: boolean; type?: 'file' | 'directory' }
   ) => Promise<ProjectFileSearchHit[]>;
   invalidateDirectory: (directory?: string | null) => void;
+  resetForRuntimeSwitch: () => void;
 }
 
 const buildCacheKey = (
+  runtimeKey: string,
   directory: string,
   query: string,
   limit: number,
@@ -34,7 +37,16 @@ const buildCacheKey = (
 ) => {
   const normalizedDirectory = directory.trim();
   const normalizedQuery = query.trim().toLowerCase();
-  return `${normalizedDirectory}::${normalizedQuery}::${limit}::${includeHidden ? '1' : '0'}::${respectGitignore ? '1' : '0'}::${type}`;
+  return JSON.stringify([runtimeKey, normalizedDirectory, normalizedQuery, limit, includeHidden, respectGitignore, type]);
+};
+
+const cacheKeyMatchesDirectory = (cacheKey: string, directory: string) => {
+  try {
+    const value: unknown = JSON.parse(cacheKey);
+    return Array.isArray(value) && value[1] === directory;
+  } catch {
+    return false;
+  }
 };
 
 export const useFileSearchStore = create<FileSearchStoreState>()(
@@ -49,11 +61,12 @@ export const useFileSearchStore = create<FileSearchStoreState>()(
         }
 
         const normalizedDirectory = directory.trim();
+        const runtimeKey = getRuntimeKey();
         const normalizedQuery = typeof query === 'string' ? query.trim() : '';
         const includeHidden = Boolean(options?.includeHidden);
         const respectGitignore = options?.respectGitignore ?? true;
         const type = options?.type === 'directory' ? 'directory' : 'file';
-        const key = buildCacheKey(normalizedDirectory, normalizedQuery, limit, includeHidden, respectGitignore, type);
+        const key = buildCacheKey(runtimeKey, normalizedDirectory, normalizedQuery, limit, includeHidden, respectGitignore, type);
         const now = Date.now();
         const cached = get().cache[key];
 
@@ -77,6 +90,10 @@ export const useFileSearchStore = create<FileSearchStoreState>()(
           })
           .then((files) => {
             set((state) => {
+              if (state.inFlight[key] !== searchPromise) {
+                return state;
+              }
+
               const nextCache = { ...state.cache, [key]: { files, timestamp: Date.now() } };
               const nextKeys = state.cacheKeys.filter((cacheKey) => cacheKey !== key);
               nextKeys.push(key);
@@ -97,6 +114,10 @@ export const useFileSearchStore = create<FileSearchStoreState>()(
           })
           .finally(() => {
             set((state) => {
+              if (state.inFlight[key] !== searchPromise) {
+                return state;
+              }
+
               const nextInFlight = { ...state.inFlight };
               delete nextInFlight[key];
               return { inFlight: nextInFlight };
@@ -119,12 +140,11 @@ export const useFileSearchStore = create<FileSearchStoreState>()(
         }
 
         const normalizedDirectory = directory.trim();
-        const prefix = `${normalizedDirectory}::`;
 
         set((state) => {
           const nextCache = { ...state.cache };
           const nextKeys = state.cacheKeys.filter((cacheKey) => {
-            if (cacheKey.startsWith(prefix)) {
+            if (cacheKeyMatchesDirectory(cacheKey, normalizedDirectory)) {
               delete nextCache[cacheKey];
               return false;
             }
@@ -132,7 +152,7 @@ export const useFileSearchStore = create<FileSearchStoreState>()(
           });
 
           const nextInFlightEntries = Object.entries(state.inFlight).filter(
-            ([key]) => !key.startsWith(prefix)
+            ([key]) => !cacheKeyMatchesDirectory(key, normalizedDirectory)
           );
           const nextInFlight = Object.fromEntries(nextInFlightEntries);
 
@@ -142,6 +162,9 @@ export const useFileSearchStore = create<FileSearchStoreState>()(
             inFlight: nextInFlight,
           };
         });
+      },
+      resetForRuntimeSwitch() {
+        set({ cache: {}, cacheKeys: [], inFlight: {} });
       },
     }),
     {

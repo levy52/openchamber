@@ -3,6 +3,7 @@ export const createSettingsNormalizationRuntime = (dependencies) => {
     os,
     path,
     processLike,
+    realpathSync,
     tunnelBootstrapTtlDefaultMs,
     tunnelBootstrapTtlMinMs,
     tunnelBootstrapTtlMaxMs,
@@ -16,7 +17,15 @@ export const createSettingsNormalizationRuntime = (dependencies) => {
       return value;
     }
 
-    const trimmed = value.trim();
+    let trimmed = value.trim();
+    // Paths pasted from Windows "Copy as path" (or quoted shell snippets)
+    // arrive wrapped in quotes — a literal quote character can never be part
+    // of a real path, and it breaks every fs.stat/executable check.
+    if (trimmed.length >= 2
+      && ((trimmed.startsWith('"') && trimmed.endsWith('"'))
+        || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+      trimmed = trimmed.slice(1, -1).trim();
+    }
     if (!trimmed) {
       return trimmed;
     }
@@ -32,7 +41,19 @@ export const createSettingsNormalizationRuntime = (dependencies) => {
     return trimmed;
   };
 
-  const normalizePathForPersistence = (value) => {
+  // Resolve symlinks, falling back to the original value on failure.
+  const safeRealpathSync = (value) => {
+    if (!realpathSync || typeof value !== 'string' || !value) {
+      return value;
+    }
+    try {
+      return realpathSync(value);
+    } catch {
+      return value;
+    }
+  };
+
+  const normalizePathForPersistence = (value, options = {}) => {
     if (typeof value !== 'string') {
       return value;
     }
@@ -47,11 +68,28 @@ export const createSettingsNormalizationRuntime = (dependencies) => {
       return trimmed;
     }
 
-    if (processLike.platform !== 'win32') {
-      return trimmed;
+    // Normalize Windows drive letter to uppercase to ensure consistent
+    // case across all path representations on Windows. NTFS is case-insensitive
+    // but case-preserving, so a path like "c:\\Users\\..." and "C:\\Users\\..."
+    // would be stored differently in settings.json across sessions.
+    const uppercaseDriveLetter = (p) =>
+      p.replace(/^([a-z]):/, (_, letter) => letter.toUpperCase() + ':');
+
+    const isWindows = processLike.platform === 'win32';
+    const caseNormalized = isWindows ? uppercaseDriveLetter(trimmed) : trimmed;
+    const resolved = options.resolveRealpath === false ? caseNormalized : safeRealpathSync(caseNormalized);
+
+    // Re-normalize after realpath — safeRealpathSync may return a
+    // lowercase drive letter on some Windows environments.
+    const finalResolved = isWindows && typeof resolved === 'string'
+      ? uppercaseDriveLetter(resolved)
+      : resolved;
+
+    if (!isWindows) {
+      return finalResolved;
     }
 
-    return trimmed.replace(/\//g, '\\');
+    return finalResolved.replace(/\//g, '\\');
   };
 
   const areStringArraysEqual = (a, b) => {
@@ -107,8 +145,8 @@ export const createSettingsNormalizationRuntime = (dependencies) => {
       const candidate = entry;
       const id = typeof candidate.id === 'string' ? candidate.id.trim() : '';
       const rawPath = typeof candidate.path === 'string' ? candidate.path.trim() : '';
-      const resolvedPath = rawPath ? path.resolve(normalizeDirectoryPath(rawPath)) : '';
-      const normalizedPath = resolvedPath ? normalizePathForPersistence(resolvedPath) : '';
+      const resolvedPath = rawPath ? safeRealpathSync(path.resolve(normalizeDirectoryPath(rawPath))) : '';
+      const normalizedPath = resolvedPath ? normalizePathForPersistence(resolvedPath, { resolveRealpath: false }) : '';
       const label = typeof candidate.label === 'string' ? candidate.label.trim() : '';
       const icon = typeof candidate.icon === 'string' ? candidate.icon.trim() : '';
       const iconImage = candidate.iconImage && typeof candidate.iconImage === 'object'
@@ -116,6 +154,7 @@ export const createSettingsNormalizationRuntime = (dependencies) => {
         : null;
       const iconBackground = normalizeIconBackground(candidate.iconBackground);
       const color = typeof candidate.color === 'string' ? candidate.color.trim() : '';
+      const defaultModel = typeof candidate.defaultModel === 'string' ? candidate.defaultModel.trim() : '';
       const addedAt = Number.isFinite(candidate.addedAt) ? Number(candidate.addedAt) : null;
       const lastOpenedAt = Number.isFinite(candidate.lastOpenedAt)
         ? Number(candidate.lastOpenedAt)
@@ -135,6 +174,7 @@ export const createSettingsNormalizationRuntime = (dependencies) => {
         ...(icon ? { icon } : {}),
         ...(iconBackground ? { iconBackground } : {}),
         ...(color ? { color } : {}),
+        ...(defaultModel && defaultModel.includes('/') ? { defaultModel } : {}),
         ...(Number.isFinite(addedAt) && addedAt >= 0 ? { addedAt } : {}),
         ...(Number.isFinite(lastOpenedAt) && lastOpenedAt >= 0 ? { lastOpenedAt } : {}),
       };
@@ -211,7 +251,6 @@ export const createSettingsNormalizationRuntime = (dependencies) => {
 
     normalizePathField('lastDirectory');
     normalizePathField('homeDirectory');
-    normalizePathArrayField('approvedDirectories');
     normalizePathArrayField('pinnedDirectories');
 
     if (Array.isArray(settings.projects)) {

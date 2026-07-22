@@ -15,12 +15,12 @@ import {
   useSortable,
 } from '@dnd-kit/sortable';
 import { CSS as DndCSS } from '@dnd-kit/utilities';
-import { RiCloseLine } from '@remixicon/react';
 
 import { useI18n } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
 import { useUIStore } from '@/stores/useUIStore';
 import { useDeviceInfo } from '@/lib/device';
+import { Icon } from "@/components/icon/Icon";
 
 export type SortableTabsStripItem = {
   id: string;
@@ -121,7 +121,6 @@ export const SortableTabsStrip: React.FC<SortableTabsStripProps> = ({
   const Wrapper = reorderEnabled ? SortableTabWrapper : StaticTabWrapper;
   const tabRefs = React.useRef<Map<string, HTMLElement>>(new Map());
   const [pillRect, setPillRect] = React.useState<{ left: number; top: number; width: number; height: number } | null>(null);
-
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -256,8 +255,6 @@ export const SortableTabsStrip: React.FC<SortableTabsStripProps> = ({
     updateActivePillRect();
   });
 
-
-
   React.useEffect(() => {
     if (!isScrollable || !activeId) {
       return;
@@ -380,10 +377,31 @@ export const SortableTabsStrip: React.FC<SortableTabsStripProps> = ({
                 ? 'flex-none basis-auto'
                 : (isMobile ? 'flex-1 basis-0 min-w-0' : 'flex-1 basis-0 min-w-fit'))
               : 'min-w-0 flex-1 basis-0';
+          const handleAuxClick = closable
+            ? (event: React.MouseEvent<HTMLDivElement>) => {
+                // Middle-click (button === 1) closes the tab. Matches browser tab behavior.
+                if (event.button !== 1) {
+                  return;
+                }
+                event.preventDefault();
+                event.stopPropagation();
+                onClose?.(item.id);
+              }
+            : undefined;
+          const handleMouseDown = closable
+            ? (event: React.MouseEvent<HTMLDivElement>) => {
+                // Prevent the browser's middle-click autoscroll affordance.
+                if (event.button === 1) {
+                  event.preventDefault();
+                }
+              }
+            : undefined;
           return (
             <Wrapper key={item.id} id={item.id} className={wrapperClassName}>
               <div
                 ref={(element) => setTabRef(item.id, element)}
+                onAuxClick={handleAuxClick}
+                onMouseDown={handleMouseDown}
                 className={cn(
                   'group flex h-full min-w-0 flex-nowrap items-center',
                   (isScrollable || useIntrinsicPillSizing)
@@ -457,7 +475,7 @@ export const SortableTabsStrip: React.FC<SortableTabsStripProps> = ({
                               aria-label={item.closeLabel ?? `Close ${item.label} tab`}
                               title={item.closeLabel ?? `Close ${item.label} tab`}
                             >
-                              <RiCloseLine className="h-3.5 w-3.5" />
+                              <Icon name="close" className="h-3.5 w-3.5" />
                             </span>
                           ) : null}
                         </span>
@@ -489,7 +507,7 @@ export const SortableTabsStrip: React.FC<SortableTabsStripProps> = ({
                               aria-label={item.closeLabel ?? `Close ${item.label} tab`}
                               title={item.closeLabel ?? `Close ${item.label} tab`}
                             >
-                              <RiCloseLine className="h-3.5 w-3.5" />
+                              <Icon name="close" className="h-3.5 w-3.5" />
                             </span>
                           ) : null}
                         </span>
@@ -524,7 +542,7 @@ export const SortableTabsStrip: React.FC<SortableTabsStripProps> = ({
                     aria-label={item.closeLabel ?? `Close ${item.label} tab`}
                     title={item.closeLabel ?? `Close ${item.label} tab`}
                   >
-                    <RiCloseLine className="h-3 w-3" />
+                    <Icon name="close" className="h-3 w-3" />
                   </button>
                 ) : null}
               </div>

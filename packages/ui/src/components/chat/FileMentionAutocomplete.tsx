@@ -1,5 +1,4 @@
 import React from 'react';
-import { RiCodeLine, RiFileImageLine, RiFileLine, RiFilePdfLine, RiFolder3Fill, RiRefreshLine } from '@remixicon/react';
 import { cn, truncatePathMiddle } from '@/lib/utils';
 import { useFileSearchStore } from '@/stores/useFileSearchStore';
 import { useConfigStore } from '@/stores/useConfigStore';
@@ -9,9 +8,12 @@ import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 import { useChatSearchDirectory } from '@/hooks/useChatSearchDirectory';
 import type { ProjectFileSearchHit } from '@/lib/opencode/client';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
+import { Icon } from "@/components/icon/Icon";
 import { useDirectoryShowHidden } from '@/lib/directoryShowHidden';
 import { useFilesViewShowGitignored } from '@/lib/filesViewShowGitignored';
 import { useI18n } from '@/lib/i18n';
+import { useUIStore } from '@/stores/useUIStore';
+import { useMobileAutocompleteMaxHeight } from './useMobileAutocompleteMaxHeight';
 
 type FileInfo = ProjectFileSearchHit;
 type AgentInfo = {
@@ -19,23 +21,16 @@ type AgentInfo = {
   description?: string;
   mode?: string | null;
 };
-const EMPTY_FILES: FileInfo[] = [];
-const EMPTY_AGENTS: AgentInfo[] = [];
 
 export interface FileMentionHandle {
   handleKeyDown: (key: string) => void;
 }
-
-type AutocompleteTab = 'commands' | 'agents' | 'files';
 
 interface FileMentionAutocompleteProps {
   searchQuery: string;
   onFileSelect: (file: FileInfo) => void;
   onAgentSelect?: (agentName: string) => void;
   onClose: () => void;
-  showTabs?: boolean;
-  activeTab?: AutocompleteTab;
-  onTabSelect?: (tab: AutocompleteTab) => void;
   style?: React.CSSProperties;
 }
 
@@ -44,9 +39,6 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
   onFileSelect,
   onAgentSelect,
   onClose,
-  showTabs,
-  activeTab = 'files',
-  onTabSelect,
   style,
 }, ref) => {
   const { t } = useI18n();
@@ -79,6 +71,7 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
   const [loading, setLoading] = React.useState(false);
   const pendingSearchRef = React.useRef(0);
   const [selectedIndex, setSelectedIndex] = React.useState(0);
+  const selectedIndexRef = React.useRef(0);
   const [marqueeWidth, setMarqueeWidth] = React.useState(360);
   const [overflowMap, setOverflowMap] = React.useState<Record<number, boolean>>({});
   const [marqueeDurations, setMarqueeDurations] = React.useState<Record<number, number>>({});
@@ -86,9 +79,9 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
   const labelRefs = React.useRef<(HTMLSpanElement | null)[]>([]);
   const measureRefs = React.useRef<(HTMLSpanElement | null)[]>([]);
   const containerRef = React.useRef<HTMLDivElement | null>(null);
-  const ignoreTabClickRef = React.useRef(false);
+  const isMobile = useUIStore((state) => state.isMobile);
+  const mobileMaxHeight = useMobileAutocompleteMaxHeight(containerRef, isMobile);
   const normalizedSearchQuery = (searchQuery ?? '').trim();
-  const scopeResultsToActiveTab = showTabs === true;
   const recentFiles = React.useMemo(() => {
     if (!projectRoot || !projectTabs) {
       return [] as FileInfo[];
@@ -127,14 +120,12 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
     return mapped;
   }, [normalizedSearchQuery, projectRoot, projectTabs]);
   const visibleAgents = React.useMemo(
-    () => !scopeResultsToActiveTab || activeTab === 'agents'
-      ? (normalizedSearchQuery.length > 0 ? agents : agents.slice(0, 2))
-      : EMPTY_AGENTS,
-    [activeTab, agents, normalizedSearchQuery.length, scopeResultsToActiveTab],
+    () => normalizedSearchQuery.length > 0 ? agents : agents.slice(0, 2),
+    [agents, normalizedSearchQuery.length],
   );
-  const visibleDirectories = !scopeResultsToActiveTab || activeTab === 'files' ? directories : EMPTY_FILES;
-  const visibleRecentFiles = !scopeResultsToActiveTab || activeTab === 'files' ? recentFiles : EMPTY_FILES;
-  const visibleFiles = !scopeResultsToActiveTab || activeTab === 'files' ? files : EMPTY_FILES;
+  const visibleDirectories = directories;
+  const visibleRecentFiles = recentFiles;
+  const visibleFiles = files;
 
   React.useEffect(() => {
     const handlePointerDown = (event: MouseEvent | TouchEvent) => {
@@ -293,8 +284,11 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
   }, [visibleFiles, visibleDirectories, visibleRecentFiles.length, visibleAgents.length]);
 
   React.useEffect(() => {
+    selectedIndexRef.current = selectedIndex;
+  }, [selectedIndex]);
+
+  React.useEffect(() => {
     itemRefs.current[selectedIndex]?.scrollIntoView({
-      behavior: 'smooth',
       block: 'nearest'
     });
   }, [selectedIndex]);
@@ -397,7 +391,7 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
       }
 
       if (key === 'Enter' || key === 'Tab') {
-        const safeIndex = ((selectedIndex % total) + total) % total;
+        const safeIndex = ((selectedIndexRef.current % total) + total) % total;
         if (safeIndex < visibleAgents.length) {
           const agent = visibleAgents[safeIndex];
           if (agent) {
@@ -422,7 +416,7 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
         }
       }
     }
-  }), [visibleFiles, visibleDirectories, visibleRecentFiles, visibleAgents, selectedIndex, onClose, handleFileSelect, handleAgentPick]);
+  }), [visibleFiles, visibleDirectories, visibleRecentFiles, visibleAgents, onClose, handleFileSelect, handleAgentPick]);
 
   const getFileIcon = (file: FileInfo) => {
     const ext = file.extension?.toLowerCase();
@@ -431,75 +425,33 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
       case 'tsx':
       case 'js':
       case 'jsx':
-        return <RiCodeLine className="h-3.5 w-3.5 text-[var(--status-info)]" />;
+        return <Icon name="code" className="h-3.5 w-3.5 text-[var(--status-info)]" />;
       case 'json':
-        return <RiCodeLine className="h-3.5 w-3.5 text-[var(--status-warning)]" />;
+        return <Icon name="code" className="h-3.5 w-3.5 text-[var(--status-warning)]" />;
       case 'md':
       case 'mdx':
-        return <RiFileLine className="h-3.5 w-3.5 text-muted-foreground" />;
+        return <Icon name="file" className="h-3.5 w-3.5 text-muted-foreground" />;
       case 'png':
       case 'jpg':
       case 'jpeg':
       case 'gif':
       case 'svg':
-        return <RiFileImageLine className="h-3.5 w-3.5 text-[var(--status-success)]" />;
+        return <Icon name="file-image" className="h-3.5 w-3.5 text-[var(--status-success)]" />;
       default:
-        return <RiFilePdfLine className="h-3.5 w-3.5 text-muted-foreground" />;
+        return <Icon name="file-pdf" className="h-3.5 w-3.5 text-muted-foreground" />;
     }
   };
-
-  const tabs = React.useMemo(() => ([
-    { id: 'commands' as const, label: t('chat.autocomplete.tabs.commands') },
-    { id: 'agents' as const, label: t('chat.autocomplete.tabs.agents') },
-    { id: 'files' as const, label: t('chat.autocomplete.tabs.files') },
-  ]), [t]);
 
   return (
       <div
         ref={containerRef}
         className="absolute z-[100] min-w-0 w-full max-w-[640px] max-h-64 bg-background border-2 border-border/60 rounded-xl shadow-none bottom-full mb-2 left-0 flex flex-col"
-        style={style}
+        style={mobileMaxHeight !== undefined ? { ...style, maxHeight: mobileMaxHeight } : style}
       >
-        {showTabs ? (
-          <div className="px-2 pt-2 pb-1 border-b border-border/60">
-            <div className="flex items-center gap-1 rounded-lg bg-[var(--surface-elevated)] p-1">
-              {tabs.map((tab) => (
-                <button
-                  key={tab.id}
-                  type="button"
-                  className={cn(
-                    'flex-1 px-2.5 py-1 rounded-md typography-meta font-semibold transition-none',
-                    activeTab === tab.id
-                      ? 'bg-interactive-selection text-interactive-selection-foreground shadow-none'
-                      : 'text-muted-foreground hover:bg-interactive-hover/50'
-                  )}
-                  onPointerDown={(event) => {
-                    if (event.pointerType !== 'touch') {
-                      return;
-                    }
-                    event.preventDefault();
-                    event.stopPropagation();
-                    ignoreTabClickRef.current = true;
-                    onTabSelect?.(tab.id);
-                  }}
-                  onClick={() => {
-                    if (ignoreTabClickRef.current) {
-                      ignoreTabClickRef.current = false;
-                      return;
-                    }
-                    onTabSelect?.(tab.id);
-                  }}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : null}
-        <ScrollableOverlay outerClassName="flex-1 min-h-0" className="px-0">
-        {(!scopeResultsToActiveTab || activeTab === 'files') && loading ? (
+        <ScrollableOverlay preventOverscroll outerClassName="flex-1 min-h-0" className="px-0">
+        {loading ? (
           <div className="flex items-center justify-center py-4">
-            <RiRefreshLine className="h-4 w-4 animate-spin text-muted-foreground" />
+            <Icon name="refresh" className="h-4 w-4 animate-spin text-muted-foreground" />
           </div>
         ) : (
           <div className="pb-2">
@@ -514,11 +466,11 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
                     isSelected && 'bg-interactive-selection',
                   )}
                   onClick={() => handleAgentPick(agent.name)}
-                  onMouseEnter={() => setSelectedIndex(index)}
+                  onMouseMove={() => setSelectedIndex(index)}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="font-semibold truncate">@{agent.name}</div>
-                    {agent.description ? (
+                    {agent.description && !isMobile ? (
                       <div className="typography-meta text-muted-foreground truncate">{agent.description}</div>
                     ) : null}
                   </div>
@@ -548,9 +500,9 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
                     isSelected && "bg-interactive-selection"
                   )}
                   onClick={() => handleFileSelect(dir)}
-                  onMouseEnter={() => setSelectedIndex(rowIndex)}
+                  onMouseMove={() => setSelectedIndex(rowIndex)}
                 >
-                  <RiFolder3Fill className="h-3.5 w-3.5 text-primary/60" />
+                  <Icon name="folder-3-fill" className="h-3.5 w-3.5 text-primary/60" />
                   <span className="flex-1 min-w-0 truncate" aria-label={relativePath}>
                     {displayPath}
                   </span>
@@ -577,7 +529,7 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
                     isSelected && "bg-interactive-selection"
                   )}
                   onClick={() => handleFileSelect(file)}
-                  onMouseEnter={() => setSelectedIndex(rowIndex)}
+                  onMouseMove={() => setSelectedIndex(rowIndex)}
                 >
                   {getFileIcon(file)}
                   <span
@@ -626,9 +578,9 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
                     className={cn(
                       "flex items-center gap-2 px-3 py-1.5 cursor-pointer typography-ui-label rounded-lg",
                       isSelected && "bg-interactive-selection"
-                    )}
+                  )}
                   onClick={() => handleFileSelect(file)}
-                  onMouseEnter={() => setSelectedIndex(rowIndex)}
+                  onMouseMove={() => setSelectedIndex(rowIndex)}
                 >
                   {getFileIcon(file)}
                   <span
@@ -674,9 +626,11 @@ export const FileMentionAutocomplete = React.forwardRef<FileMentionHandle, FileM
           </div>
         )}
         </ScrollableOverlay>
-        <div className="px-3 pt-1 pb-1.5 border-t typography-meta text-muted-foreground">
-        {t('chat.autocomplete.keyboardHint')}
-      </div>
+        {!isMobile && (
+          <div className="px-3 pt-1 pb-1.5 border-t typography-meta text-muted-foreground">
+            {t('chat.autocomplete.keyboardHint')}
+          </div>
+        )}
     </div>
   );
 });

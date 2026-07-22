@@ -28,25 +28,20 @@ import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
 import { getContextFileOpenFailureMessage, validateContextFileOpen } from '@/lib/contextFileOpenGuard';
 import { toast } from '@/components/ui';
 import { FileTypeIcon } from '@/components/icons/FileTypeIcon';
-import {
-  RiAddLine,
-  RiChatAi3Line,
-  RiGitBranchLine,
-  RiLayoutLeftLine,
-  RiLayoutRightLine,
-  RiPieChartLine,
-  RiSettings3Line,
-  RiTerminalBoxLine,
-} from '@remixicon/react';
 import type { Session } from '@opencode-ai/sdk/v2';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
 import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
-import { isDesktopShell, isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
+import { canUseElectronDesktopIPC, invokeDesktop, isDesktopShell, isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
 import { SETTINGS_PAGE_METADATA, type SettingsRuntimeContext } from '@/lib/settings/metadata';
 import { getSettingsNavIcon } from '@/components/views/SettingsView';
+import { Icon } from "@/components/icon/Icon";
+import { McpIcon } from '@/components/icons/McpIcon';
 import { scoreByFuzzyQuery } from '@/lib/search/fuzzySearch';
 import { truncatePathMiddle } from '@/lib/utils';
 import { useI18n } from '@/lib/i18n';
+import { sessionEvents } from '@/lib/sessionEvents';
+import { useProjectsStore } from '@/stores/useProjectsStore';
+import { buildCommandPaletteFileSearchKey, scoreCommandPaletteFiles } from './commandPaletteFilesState';
 
 type CommandEntry = {
   id: string;
@@ -58,6 +53,7 @@ type CommandEntry = {
 };
 
 type FileHit = { path: string; name: string; relativePath: string };
+const EMPTY_SESSIONS: Session[] = [];
 
 const normalizePath = (value: string): string => {
   if (!value) return '';
@@ -90,8 +86,13 @@ export const CommandPalette: React.FC = () => {
   const openNewSessionDraft = useSessionUIStore((s) => s.openNewSessionDraft);
   const setCurrentSession = useSessionUIStore((s) => s.setCurrentSession);
 
-  const activeSessions = useGlobalSessionsStore((s) => s.activeSessions);
+  const activeSessions = useGlobalSessionsStore(React.useCallback(
+    (state) => isCommandPaletteOpen ? state.activeSessions : EMPTY_SESSIONS,
+    [isCommandPaletteOpen],
+  ));
   const currentDirectory = useDirectoryStore((s) => s.currentDirectory);
+  const activeProject = useProjectsStore((s) => s.getActiveProject());
+  const projects = useProjectsStore((s) => s.projects);
   const effectiveDirectory = useEffectiveDirectory();
   const searchFiles = useFileSearchStore((s) => s.searchFiles);
   const { files: filesApi, git: gitApi } = useRuntimeAPIs();
@@ -149,7 +150,7 @@ export const CommandPalette: React.FC = () => {
       {
         id: 'new-session',
         title: t('commandPalette.item.newSession'),
-        icon: <RiAddLine className="mr-2 h-4 w-4" />,
+        icon: <Icon name="add" className="mr-2 h-4 w-4" />,
         shortcutId: 'new_chat',
         searchText: t('commandPalette.item.newSession'),
         onSelect: run(() => {
@@ -161,7 +162,7 @@ export const CommandPalette: React.FC = () => {
       {
         id: 'new-worktree',
         title: t('commandPalette.item.newWorktreeDraft'),
-        icon: <RiGitBranchLine className="mr-2 h-4 w-4" />,
+        icon: <Icon name="git-branch" className="mr-2 h-4 w-4" />,
         shortcutId: 'new_chat_worktree',
         searchText: t('commandPalette.item.newWorktreeDraft'),
         onSelect: run(() => {
@@ -169,11 +170,20 @@ export const CommandPalette: React.FC = () => {
         }),
       },
       {
+        id: 'add-project',
+        title: t('commandPalette.item.addProject'),
+        icon: <Icon name="folder-add" className="mr-2 h-4 w-4" />,
+        searchText: t('commandPalette.item.addProject'),
+        onSelect: run(() => {
+          sessionEvents.requestDirectoryDialog();
+        }),
+      },
+      {
         id: 'toggle-sidebar',
         title: isMobile
           ? t('commandPalette.item.showSessionSwitcher')
           : t('commandPalette.item.toggleSidebar'),
-        icon: <RiLayoutLeftLine className="mr-2 h-4 w-4" />,
+        icon: <Icon name="layout-left" className="mr-2 h-4 w-4" />,
         shortcutId: 'toggle_sidebar',
         searchText: isMobile
           ? t('commandPalette.item.showSessionSwitcher')
@@ -190,7 +200,7 @@ export const CommandPalette: React.FC = () => {
       {
         id: 'toggle-right-sidebar',
         title: t('commandPalette.item.toggleRightSidebar'),
-        icon: <RiLayoutRightLine className="mr-2 h-4 w-4" />,
+        icon: <Icon name="layout-right" className="mr-2 h-4 w-4" />,
         shortcutId: 'toggle_right_sidebar',
         searchText: t('commandPalette.item.toggleRightSidebar'),
         onSelect: run(() => toggleRightSidebar()),
@@ -198,7 +208,7 @@ export const CommandPalette: React.FC = () => {
       {
         id: 'toggle-terminal',
         title: t('commandPalette.item.toggleTerminal'),
-        icon: <RiTerminalBoxLine className="mr-2 h-4 w-4" />,
+        icon: <Icon name="terminal-box" className="mr-2 h-4 w-4" />,
         shortcutId: 'toggle_terminal',
         searchText: t('commandPalette.item.toggleTerminal'),
         onSelect: run(() => toggleBottomTerminal()),
@@ -206,7 +216,7 @@ export const CommandPalette: React.FC = () => {
       {
         id: 'context-usage',
         title: t('commandPalette.item.showContextUsage'),
-        icon: <RiPieChartLine className="mr-2 h-4 w-4" />,
+        icon: <Icon name="pie-chart" className="mr-2 h-4 w-4" />,
         searchText: t('commandPalette.item.showContextUsage'),
         onSelect: run(() => {
           if (currentDirectory) openContextOverview(currentDirectory);
@@ -215,12 +225,29 @@ export const CommandPalette: React.FC = () => {
       {
         id: 'open-settings',
         title: t('commandPalette.item.openSettings'),
-        icon: <RiSettings3Line className="mr-2 h-4 w-4" />,
+        icon: <Icon name="settings-3" className="mr-2 h-4 w-4" />,
         shortcutId: 'open_settings',
         searchText: t('commandPalette.item.openSettings'),
         onSelect: run(() => setSettingsDialogOpen(true)),
       },
     ];
+    if (canUseElectronDesktopIPC()) {
+      list.splice(1, 0, {
+        id: 'new-mini-chat',
+        title: t('commandPalette.item.newMiniChat'),
+        icon: <Icon name="window" className="mr-2 h-4 w-4" />,
+        shortcutId: 'new_mini_chat',
+        searchText: t('commandPalette.item.newMiniChat'),
+        onSelect: run(() => {
+          void invokeDesktop('desktop_open_draft_mini_chat_window', {
+            directory: normalizePath(currentDirectory || activeProject?.path || ''),
+            projectId: activeProject?.id ?? null,
+          }).catch((error) => {
+            console.warn('[command-palette] failed to open draft mini chat window', error);
+          });
+        }),
+      });
+    }
     return list;
   }, [
     t,
@@ -235,6 +262,8 @@ export const CommandPalette: React.FC = () => {
     currentDirectory,
     openContextOverview,
     setSettingsDialogOpen,
+    activeProject?.id,
+    activeProject?.path,
   ]);
 
   // ---------------------------------------------------------------------------
@@ -242,20 +271,22 @@ export const CommandPalette: React.FC = () => {
   // ---------------------------------------------------------------------------
   const settingsRuntimeCtx = React.useMemo<SettingsRuntimeContext>(() => {
     const isDesktop = isDesktopShell();
-    return { isVSCode: isVSCodeRuntime(), isWeb: !isDesktop && isWebRuntime(), isDesktop };
-  }, []);
+    return { isVSCode: isVSCodeRuntime(), isWeb: !isDesktop && isWebRuntime(), isDesktop, isMobile };
+  }, [isMobile]);
 
   const settingsEntries = React.useMemo<CommandEntry[]>(() => {
     return SETTINGS_PAGE_METADATA
       .filter((p) => p.slug !== 'home')
       .filter((p) => (p.isAvailable ? p.isAvailable(settingsRuntimeCtx) : true))
       .map((page) => {
-        const Icon = getSettingsNavIcon(page.slug) ?? RiSettings3Line;
+        const iconName = getSettingsNavIcon(page.slug) ?? 'settings-3';
         const keywords = (page.keywords ?? []).join(' ');
         return {
           id: `settings:${page.slug}`,
           title: page.title,
-          icon: <Icon className="mr-2 h-4 w-4" />,
+          icon: page.slug === 'mcp'
+            ? <McpIcon className="mr-2 h-4 w-4" />
+            : <Icon name={iconName} className="mr-2 h-4 w-4" />,
           searchText: `${page.title} ${page.group} ${keywords}`,
           onSelect: run(() => {
             setSettingsPage(page.slug);
@@ -292,21 +323,27 @@ export const CommandPalette: React.FC = () => {
   // File search
   // ---------------------------------------------------------------------------
   const [fileResults, setFileResults] = React.useState<FileHit[]>([]);
-  const [isSearchingFiles, setIsSearchingFiles] = React.useState(false);
+  const [fileResultsKey, setFileResultsKey] = React.useState('');
+
+  const fileSearchKey = buildCommandPaletteFileSearchKey(currentRoot, trimmedQuery);
 
   React.useEffect(() => {
     if (!isCommandPaletteOpen) {
       setFileResults([]);
-      setIsSearchingFiles(false);
+      setFileResultsKey('');
       return;
     }
-    if (!currentRoot || trimmedQuery.length === 0) {
+    if (!fileSearchKey) {
       setFileResults([]);
-      setIsSearchingFiles(false);
+      setFileResultsKey('');
+      return;
+    }
+    if (!currentRoot) {
+      setFileResults([]);
+      setFileResultsKey('');
       return;
     }
     let cancelled = false;
-    setIsSearchingFiles(true);
     void searchFiles(currentRoot, trimmedQuery, 10, { type: 'file' })
       .then((results) => {
         if (cancelled) return;
@@ -317,17 +354,18 @@ export const CommandPalette: React.FC = () => {
             relativePath: file.relativePath,
           })),
         );
+        setFileResultsKey(fileSearchKey);
       })
       .catch(() => {
-        if (!cancelled) setFileResults([]);
-      })
-      .finally(() => {
-        if (!cancelled) setIsSearchingFiles(false);
+        if (!cancelled) {
+          setFileResults([]);
+          setFileResultsKey(fileSearchKey);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [isCommandPaletteOpen, currentRoot, trimmedQuery, searchFiles]);
+  }, [isCommandPaletteOpen, currentRoot, trimmedQuery, fileSearchKey, searchFiles]);
 
   // ---------------------------------------------------------------------------
   // Filter visible items
@@ -359,32 +397,47 @@ export const CommandPalette: React.FC = () => {
   }, [sortedActiveSessions, liveTrimmed, hasQuery]);
 
   const scoredFiles = React.useMemo(() => {
-    if (!hasQuery || fileResults.length === 0) return [];
-    // Server already ranked by relevance; compute a comparable client score on
-    // basename so we can decide file group placement vs sessions/commands.
-    return scoreByFuzzyQuery(fileResults, liveTrimmed, (f) => f.name, {
-      limit: 10,
+    if (!isCommandPaletteOpen) return [];
+    return scoreCommandPaletteFiles(fileResults, trimmedQuery, fileSearchKey, fileResultsKey);
+  }, [isCommandPaletteOpen, fileResults, fileResultsKey, fileSearchKey, trimmedQuery]);
+
+  const isFileSearchStale = isCommandPaletteOpen && fileSearchKey.length > 0 && fileResultsKey !== fileSearchKey;
+
+  // ---------------------------------------------------------------------------
+  // Projects
+  // ---------------------------------------------------------------------------
+  const scoredProjects = React.useMemo(() => {
+    if (!hasQuery) return [];
+    const projectEntries = projects.map((project) => ({
+      ...project,
+      displayName: project.label || project.path.split('/').pop() || project.path,
+      searchText: `${project.label || ''} ${project.path}`,
+    }));
+    return scoreByFuzzyQuery(projectEntries, liveTrimmed, (p) => p.searchText, {
+      limit: 7,
       threshold: 0.4,
     });
-  }, [fileResults, liveTrimmed, hasQuery]);
+  }, [projects, liveTrimmed, hasQuery]);
 
   const visibleCommands = scoredCommands.map((x) => x.item);
   const visibleSettings = scoredSettings.map((x) => x.item);
   const visibleSessions = scoredSessions.map((x) => x.item);
   const visibleFiles = hasQuery ? scoredFiles.map((x) => x.item) : [];
+  const visibleProjects = hasQuery ? scoredProjects.map((x) => x.item) : [];
 
-  const groupOrder = React.useMemo<('commands' | 'settings' | 'sessions' | 'files')[]>(() => {
+  const groupOrder = React.useMemo<('commands' | 'settings' | 'sessions' | 'files' | 'projects')[]>(() => {
     if (!hasQuery) return ['commands', 'sessions'];
     const best = (arr: { score: number }[]): number => (arr.length ? arr[0].score : Infinity);
-    const groups: { key: 'commands' | 'settings' | 'sessions' | 'files'; score: number }[] = [
+    const groups: { key: 'commands' | 'settings' | 'sessions' | 'files' | 'projects'; score: number }[] = [
       { key: 'commands', score: best(scoredCommands) },
       { key: 'settings', score: best(scoredSettings) },
       { key: 'sessions', score: best(scoredSessions) },
       { key: 'files', score: best(scoredFiles) },
+      { key: 'projects', score: best(scoredProjects) },
     ];
     groups.sort((a, b) => a.score - b.score);
     return groups.map((g) => g.key);
-  }, [hasQuery, scoredCommands, scoredSettings, scoredSessions, scoredFiles]);
+  }, [hasQuery, scoredCommands, scoredSettings, scoredSessions, scoredFiles, scoredProjects]);
 
   const handleOpenSession = React.useCallback(
     (session: Session) => {
@@ -406,6 +459,14 @@ export const CommandPalette: React.FC = () => {
       close();
     },
     [currentRoot, filesApi, openContextFile, close],
+  );
+
+  const handleOpenProject = React.useCallback(
+    (projectId: string, projectPath: string) => {
+      close();
+      openNewSessionDraft({ selectedProjectId: projectId, directoryOverride: projectPath });
+    },
+    [close, openNewSessionDraft],
   );
 
   const shortcut = React.useCallback(
@@ -474,11 +535,11 @@ export const CommandPalette: React.FC = () => {
                           value={`session:${session.id}`}
                           onSelect={() => handleOpenSession(session)}
                         >
-                          <RiChatAi3Line className="mr-2 h-4 w-4" />
+                          <Icon name="chat-ai-3" className="mr-2 h-4 w-4" />
                           <span className="truncate">{title}</span>
                           {branch ? (
                             <span className="ml-auto inline-flex items-center gap-1 text-muted-foreground typography-meta">
-                              <RiGitBranchLine className="h-3 w-3" />
+                              <Icon name="git-branch" className="h-3 w-3" />
                               <span className="truncate max-w-[160px]">{branch}</span>
                             </span>
                           ) : null}
@@ -513,10 +574,32 @@ export const CommandPalette: React.FC = () => {
                   </CommandGroup>
                 );
               }
+              if (groupKey === 'projects' && visibleProjects.length > 0) {
+                return (
+                  <CommandGroup key="projects">
+                    {visibleProjects.map((project) => {
+                      const displayName = project.displayName;
+                      return (
+                        <CommandItem
+                          key={`project:${project.id}`}
+                          value={`project:${project.id}`}
+                          onSelect={() => handleOpenProject(project.id, project.path)}
+                        >
+                          <Icon name="folder" className="mr-2 h-4 w-4" />
+                          <span className="truncate">{displayName}</span>
+                          <span className="ml-auto inline-flex items-center text-muted-foreground typography-meta truncate max-w-[160px]">
+                            {project.path}
+                          </span>
+                        </CommandItem>
+                      );
+                    })}
+                  </CommandGroup>
+                );
+              }
               return null;
             })}
 
-            {hasQuery && isSearchingFiles && visibleFiles.length === 0 ? (
+            {isFileSearchStale ? (
               <div className="px-3 py-2 typography-meta text-muted-foreground">
                 {t('commandPalette.empty.searchingFiles')}
               </div>

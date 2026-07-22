@@ -3,17 +3,25 @@ import type { Session } from '@opencode-ai/sdk/v2';
 import { toast } from '@/components/ui';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { useI18n } from '@/lib/i18n';
+import type { MainTab } from '@/stores/useUIStore';
+import { streamPerfMark } from '@/stores/utils/streamDebug';
+import { useSessionUIStore } from '@/sync/session-ui-store';
 
 type DeleteSessionConfirmSetter = React.Dispatch<React.SetStateAction<{
   session: Session;
   descendantCount: number;
+  descendantIds: string[];
   archivedBucket: boolean;
 } | null>>;
 
+type DeleteSessionSource = {
+  archivedBucket?: boolean;
+  hardDelete?: boolean;
+  /** Bypass the confirmation dialog and delete/archive immediately. */
+  skipConfirm?: boolean;
+};
+
 type Args = {
-  activeProjectId: string | null;
-  currentDirectory: string | null;
-  currentSessionId: string | null;
   mobileVariant: boolean;
   allowReselect: boolean;
   onSessionSelected?: (sessionId: string) => void;
@@ -21,9 +29,7 @@ type Args = {
   sessionSearchQuery: string;
   setSessionSearchQuery: (value: string) => void;
   setIsSessionSearchOpen: (open: boolean) => void;
-  setActiveProjectIdOnly: (id: string) => void;
-  setDirectory: (directory: string, options?: { showOverlay?: boolean }) => void;
-  setActiveMainTab: (tab: 'chat' | 'plan' | 'git' | 'diff' | 'terminal' | 'files') => void;
+  setActiveMainTab: (tab: MainTab) => void;
   setSessionSwitcherOpen: (open: boolean) => void;
   setCurrentSession: (sessionId: string | null, directoryHint?: string | null) => void;
   updateSessionTitle: (id: string, title: string) => Promise<void>;
@@ -36,7 +42,7 @@ type Args = {
   childrenMap: Map<string, Session[]>;
   showDeletionDialog: boolean;
   setDeleteSessionConfirm: DeleteSessionConfirmSetter;
-  deleteSessionConfirm: { session: Session; descendantCount: number; archivedBucket: boolean } | null;
+  deleteSessionConfirm: { session: Session; descendantCount: number; descendantIds: string[]; archivedBucket: boolean } | null;
   setEditingId: (id: string | null) => void;
   setEditTitle: (value: string) => void;
   editingId: string | null;
@@ -57,11 +63,8 @@ export const useSessionActions = (args: Args) => {
   }, []);
 
   const handleSessionSelect = React.useCallback(
-    (sessionId: string, sessionDirectory?: string | null, disabled?: boolean, projectId?: string | null) => {
-      if (disabled) {
-        return;
-      }
-
+    (sessionId: string, sessionDirectory?: string | null) => {
+      streamPerfMark('navigation.session_select');
       const resetSessionSearch = () => {
         if (!args.isSessionSearchOpen && args.sessionSearchQuery.length === 0) {
           return;
@@ -70,31 +73,19 @@ export const useSessionActions = (args: Args) => {
         args.setIsSessionSearchOpen(false);
       };
 
-      if (projectId && projectId !== args.activeProjectId) {
-        args.setActiveProjectIdOnly(projectId);
-      }
-
-      if (sessionDirectory && sessionDirectory !== args.currentDirectory) {
-        args.setDirectory(sessionDirectory, { showOverlay: false });
-      }
-
       if (args.mobileVariant) {
         args.setActiveMainTab('chat');
         args.setSessionSwitcherOpen(false);
       }
 
-      if (sessionId === args.currentSessionId) {
+      if (sessionId === useSessionUIStore.getState().currentSessionId) {
         if (args.allowReselect) {
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent<string>('openchamber:session-reselected', {
-              detail: sessionId,
-            }));
-          }
           args.onSessionSelected?.(sessionId);
         }
         resetSessionSearch();
         return;
       }
+      streamPerfMark('navigation.session_state_set');
       args.setCurrentSession(sessionId, sessionDirectory ?? null);
       args.onSessionSelected?.(sessionId);
       resetSessionSearch();
@@ -102,16 +93,19 @@ export const useSessionActions = (args: Args) => {
     [args],
   );
 
-  const handleSessionDoubleClick = React.useCallback(() => {
-    args.setActiveMainTab('chat');
+  const handleSessionDoubleClick = React.useCallback((sessionId: string, sessionTitle: string) => {
+    args.setEditingId(sessionId);
+    args.setEditTitle(sessionTitle);
   }, [args]);
 
-  const handleSaveEdit = React.useCallback(async () => {
-    if (args.editingId && args.editTitle.trim()) {
-      await args.updateSessionTitle(args.editingId, args.editTitle.trim());
-      args.setEditingId(null);
-      args.setEditTitle('');
+  const handleSaveEdit = React.useCallback(async (titleOverride?: string) => {
+    if (!args.editingId) return;
+    const trimmed = (titleOverride ?? args.editTitle).trim();
+    if (trimmed) {
+      await args.updateSessionTitle(args.editingId, trimmed);
     }
+    args.setEditingId(null);
+    args.setEditTitle('');
   }, [args]);
 
   const handleCancelEdit = React.useCallback(() => {
@@ -173,11 +167,30 @@ export const useSessionActions = (args: Args) => {
     return collected;
   }, [args.childrenMap]);
 
+  // Archive cascades to subagents that aren't already archived; hard-delete
+  // cascades to every descendant unconditionally. We collect once and filter
+  // per-action so the dialog count and the executed ID list always agree.
+  const filterDescendantsForAction = React.useCallback(
+    (descendants: Session[], shouldHardDelete: boolean): Session[] => {
+      if (shouldHardDelete) return descendants;
+      return descendants.filter((s) => !s.time?.archived);
+    },
+    [],
+  );
+
   const executeDeleteSession = React.useCallback(
-    async (session: Session, source?: { archivedBucket?: boolean }) => {
-      const descendants = collectDescendants(session.id);
-      const shouldHardDelete = source?.archivedBucket === true;
-      if (descendants.length === 0) {
+    async (
+      session: Session,
+      source?: DeleteSessionSource,
+      precomputed?: { descendantIds: string[] },
+    ) => {
+      const shouldHardDelete = source?.archivedBucket === true || source?.hardDelete === true;
+      // Use the snapshot taken when the dialog opened (if any) so the
+      // executed list matches what the user was told. Fall back to a fresh
+      // collection for direct-execute (no-dialog) callers.
+      const descendantIds = precomputed?.descendantIds
+        ?? filterDescendantsForAction(collectDescendants(session.id), shouldHardDelete).map((s) => s.id);
+      if (descendantIds.length === 0) {
         const success = shouldHardDelete
           ? await args.deleteSession(session.id)
           : await args.archiveSession(session.id);
@@ -193,18 +206,19 @@ export const useSessionActions = (args: Args) => {
         return;
       }
 
-      const ids = [session.id, ...descendants.map((s) => s.id)];
+      const ids = [session.id, ...descendantIds];
       if (shouldHardDelete) {
+        // Delete root + all descendants individually. If the server
+        // cascade-deletes some children before we get to them, 404 is
+        // treated as success by deleteSession and no rollback occurs.
         const { deletedIds, failedIds } = await args.deleteSessions(ids);
-        if (deletedIds.length > 0) {
-          toast.success(deletedIds.length === 1
-            ? t('sessions.sidebar.bulkActions.deletedSingle', { count: deletedIds.length })
-            : t('sessions.sidebar.bulkActions.deletedPlural', { count: deletedIds.length }));
-        }
-        if (failedIds.length > 0) {
-          toast.error(failedIds.length === 1
-            ? t('sessions.sidebar.bulkActions.failedDeleteSingle', { count: failedIds.length })
-            : t('sessions.sidebar.bulkActions.failedDeletePlural', { count: failedIds.length }));
+        if (failedIds.length === 0) {
+          const totalDeleted = deletedIds.length;
+          toast.success(totalDeleted === 1
+            ? t('sessions.sidebar.bulkActions.deletedSingle', { count: totalDeleted })
+            : t('sessions.sidebar.bulkActions.deletedPlural', { count: totalDeleted }));
+        } else {
+          toast.error(t('sessions.sidebar.session.delete.error'));
         }
         return;
       }
@@ -221,26 +235,35 @@ export const useSessionActions = (args: Args) => {
           : t('sessions.sidebar.bulkActions.failedArchivePlural', { count: failedIds.length }));
       }
     },
-    [args, collectDescendants, t],
+    [args, collectDescendants, filterDescendantsForAction, t],
   );
 
   const handleDeleteSession = React.useCallback(
-    (session: Session, source?: { archivedBucket?: boolean }) => {
-      const descendants = collectDescendants(session.id);
-      if (!args.showDeletionDialog) {
-        void executeDeleteSession(session, source);
+    (session: Session, source?: DeleteSessionSource) => {
+      const shouldHardDelete = source?.archivedBucket === true || source?.hardDelete === true;
+      const effectiveDescendantIds = filterDescendantsForAction(
+        collectDescendants(session.id),
+        shouldHardDelete,
+      ).map((s) => s.id);
+      if (!args.showDeletionDialog || source?.skipConfirm === true) {
+        void executeDeleteSession(session, source, { descendantIds: effectiveDescendantIds });
         return;
       }
-      args.setDeleteSessionConfirm({ session, descendantCount: descendants.length, archivedBucket: source?.archivedBucket === true });
+      args.setDeleteSessionConfirm({
+        session,
+        descendantCount: effectiveDescendantIds.length,
+        descendantIds: effectiveDescendantIds,
+        archivedBucket: shouldHardDelete,
+      });
     },
-    [args, collectDescendants, executeDeleteSession],
+    [args, collectDescendants, executeDeleteSession, filterDescendantsForAction],
   );
 
   const confirmDeleteSession = React.useCallback(async () => {
     if (!args.deleteSessionConfirm) return;
-    const { session, archivedBucket } = args.deleteSessionConfirm;
+    const { session, archivedBucket, descendantIds } = args.deleteSessionConfirm;
     args.setDeleteSessionConfirm(null);
-    await executeDeleteSession(session, { archivedBucket });
+    await executeDeleteSession(session, { archivedBucket }, { descendantIds });
   }, [args, executeDeleteSession]);
 
   return {

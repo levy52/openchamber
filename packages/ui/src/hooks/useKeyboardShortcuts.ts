@@ -1,4 +1,5 @@
 import React from 'react';
+import { isTerminalEventTarget } from '@/lib/terminalFocus';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useSelectionStore } from '@/sync/selection-store';
 import * as sessionActions from '@/sync/session-actions';
@@ -7,9 +8,13 @@ import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { useAssistantStatus } from '@/hooks/useAssistantStatus';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
 import { useConfigStore } from '@/stores/useConfigStore';
-import { isVSCodeRuntime } from '@/lib/desktop';
+import { canUseElectronDesktopIPC, invokeDesktop, isVSCodeRuntime } from '@/lib/desktop';
 import { showOpenCodeStatus } from '@/lib/openCodeStatus';
-import { eventMatchesShortcut, getEffectiveShortcutCombo } from '@/lib/shortcuts';
+import { eventMatchesShortcut, getEffectiveShortcutCombo, normalizeCombo } from '@/lib/shortcuts';
+import { readEmbeddedThemeSearchParams } from '@/contexts/theme-embedded-bootstrap';
+import { useDirectoryStore } from '@/stores/useDirectoryStore';
+import { useProjectsStore } from '@/stores/useProjectsStore';
+import { getCycledPrimaryAgentName } from '@/components/chat/mobileControlsUtils';
 
 export const useKeyboardShortcuts = () => {
   const openNewSessionDraft = useSessionUIStore((s) => s.openNewSessionDraft);
@@ -31,8 +36,12 @@ export const useKeyboardShortcuts = () => {
   const setSettingsDialogOpen = useUIStore((s) => s.setSettingsDialogOpen);
   const setModelSelectorOpen = useUIStore((s) => s.setModelSelectorOpen);
   const setTimelineDialogOpen = useUIStore((s) => s.setTimelineDialogOpen);
+  const togglePromptNavigatorPanel = useUIStore((s) => s.togglePromptNavigatorPanel);
+  const setPromptNavigatorPanelOpen = useUIStore((s) => s.setPromptNavigatorPanelOpen);
   const toggleExpandedInput = useUIStore((s) => s.toggleExpandedInput);
   const shortcutOverrides = useUIStore((s) => s.shortcutOverrides);
+  const currentDirectory = useDirectoryStore((s) => s.currentDirectory);
+  const activeProject = useProjectsStore((s) => s.getActiveProject());
   const { themeMode, setThemeMode } = useThemeSystem();
   const { working } = useAssistantStatus();
   const abortPrimedUntilRef = React.useRef<number | null>(null);
@@ -54,8 +63,65 @@ export const useKeyboardShortcuts = () => {
 
   React.useEffect(() => {
     const combo = (actionId: string) => getEffectiveShortcutCombo(actionId, shortcutOverrides);
+    const dropdownTargetSelector = [
+      '[data-slot="dropdown-menu-content"]',
+      '[data-slot="select-content"]',
+      '[role="combobox"]',
+      '[role="listbox"]',
+      '[role="menu"]',
+      '[role="menuitem"]',
+      '[role="option"]',
+      '[data-radix-popper-content-wrapper]',
+    ].join(',');
+
+    const isDropdownEventTarget = (target: EventTarget | null) => {
+      return target instanceof Element && Boolean(target.closest(dropdownTargetSelector));
+    };
+
+    const hasOpenDropdown = () => {
+      const openDropdowns = document.querySelectorAll<HTMLElement>(
+        '[data-slot="dropdown-menu-content"], [data-slot="select-content"], [role="listbox"], [role="menu"], [data-radix-popper-content-wrapper]'
+      );
+      return Array.from(openDropdowns).some((element) => element.getClientRects().length > 0);
+    };
+
+    const handleTerminalShortcutCapture = (e: KeyboardEvent) => {
+      if (!isTerminalEventTarget(e.target)) {
+        return;
+      }
+
+      if (eventMatchesShortcut(e, combo('toggle_terminal'))) {
+        const { isMobile } = useUIStore.getState();
+        if (isMobile) {
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        toggleBottomTerminal();
+        return;
+      }
+
+      if (eventMatchesShortcut(e, combo('toggle_terminal_expanded'))) {
+        const { isMobile, isBottomTerminalExpanded } = useUIStore.getState();
+        if (isMobile) {
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        setBottomTerminalExpanded(!isBottomTerminalExpanded);
+        return;
+      }
+    };
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isTerminalEventTarget(e.target)) {
+        return;
+      }
+
+      const isChatInputTarget = (target: EventTarget | null) => {
+        return target instanceof HTMLTextAreaElement && target.getAttribute('data-chat-input') === 'true';
+      };
+
       if (eventMatchesShortcut(e, combo('open_command_palette'))) {
         e.preventDefault();
         toggleCommandPalette();
@@ -68,6 +134,42 @@ export const useKeyboardShortcuts = () => {
         return;
       }
 
+      if (eventMatchesShortcut(e, combo('toggle_prompt_navigator'))) {
+        const {
+          activeMainTab,
+          promptNavigatorEnabled,
+          isSettingsDialogOpen,
+          isCommandPaletteOpen,
+          isHelpDialogOpen,
+          isSessionSwitcherOpen,
+          isAboutDialogOpen,
+          isTimelineDialogOpen,
+          isMultiRunLauncherOpen,
+          isImagePreviewOpen,
+        } = useUIStore.getState();
+
+        if (!promptNavigatorEnabled || isMobile || isVSCodeRuntime() || activeMainTab !== 'chat') {
+          return;
+        }
+
+        const hasOverlay = isSettingsDialogOpen
+          || isCommandPaletteOpen
+          || isHelpDialogOpen
+          || isSessionSwitcherOpen
+          || isAboutDialogOpen
+          || isTimelineDialogOpen
+          || isMultiRunLauncherOpen
+          || isImagePreviewOpen;
+
+        if (hasOverlay) {
+          return;
+        }
+
+        e.preventDefault();
+        togglePromptNavigatorPanel();
+        return;
+      }
+
       if (eventMatchesShortcut(e, combo('open_status'))) {
         e.preventDefault();
         void showOpenCodeStatus();
@@ -77,6 +179,17 @@ export const useKeyboardShortcuts = () => {
       if (eventMatchesShortcut(e, combo('open_help'))) {
         e.preventDefault();
         toggleHelpDialog();
+        return;
+      }
+
+      if (canUseElectronDesktopIPC() && eventMatchesShortcut(e, combo('new_mini_chat'))) {
+        e.preventDefault();
+        void invokeDesktop('desktop_open_draft_mini_chat_window', {
+          directory: currentDirectory || activeProject?.path || '',
+          projectId: activeProject?.id ?? null,
+        }).catch((error) => {
+          console.warn('[keyboard-shortcuts] failed to open draft mini chat window', error);
+        });
         return;
       }
 
@@ -100,6 +213,10 @@ export const useKeyboardShortcuts = () => {
 
       if (eventMatchesShortcut(e, combo('cycle_theme'))) {
         e.preventDefault();
+        if (readEmbeddedThemeSearchParams() !== null && window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: 'openchamber:cycle-theme-request' }, window.location.origin);
+          return;
+        }
         const modes: Array<'light' | 'dark' | 'system'> = ['light', 'dark', 'system'];
         const activeElement = document.activeElement as HTMLElement | null;
         const currentIndex = modes.indexOf(themeModeRef.current);
@@ -141,6 +258,53 @@ export const useKeyboardShortcuts = () => {
         e.preventDefault();
         const textarea = document.querySelector<HTMLTextAreaElement>('textarea[data-chat-input="true"]');
         textarea?.focus();
+        return;
+      }
+
+      const cycleAgentCombo = combo('cycle_agent');
+      const cycleAgentBackwardCombo = cycleAgentCombo && !cycleAgentCombo.includes('shift')
+        ? normalizeCombo(`shift+${cycleAgentCombo}`)
+        : '';
+      const cycleAgentDirection = cycleAgentBackwardCombo && eventMatchesShortcut(e, cycleAgentBackwardCombo)
+        ? -1
+        : eventMatchesShortcut(e, cycleAgentCombo)
+          ? 1
+          : 0;
+
+      if (cycleAgentDirection !== 0) {
+        const {
+          isSettingsDialogOpen,
+          isCommandPaletteOpen,
+          isHelpDialogOpen,
+          isSessionSwitcherOpen,
+          isAboutDialogOpen,
+          activeMainTab,
+        } = useUIStore.getState();
+
+        const hasOverlay = isSettingsDialogOpen || isCommandPaletteOpen || isHelpDialogOpen || isSessionSwitcherOpen || isAboutDialogOpen;
+        if (hasOverlay || activeMainTab !== 'chat' || !isChatInputTarget(e.target)) {
+          return;
+        }
+
+        const configState = useConfigStore.getState();
+        const nextAgentName = getCycledPrimaryAgentName(
+          configState.getVisibleAgents(),
+          configState.currentAgentName,
+          cycleAgentDirection,
+        );
+
+        if (!nextAgentName) {
+          return;
+        }
+
+        e.preventDefault();
+        configState.setAgent(nextAgentName);
+        useUIStore.getState().addRecentAgent(nextAgentName);
+
+        const sessionId = useSessionUIStore.getState().currentSessionId;
+        if (sessionId) {
+          useSelectionStore.getState().saveSessionAgentSelection(sessionId, nextAgentName);
+        }
         return;
       }
 
@@ -338,19 +502,24 @@ export const useKeyboardShortcuts = () => {
         return;
       }
 
+      if (eventMatchesShortcut(e, combo('toggle_dictation'))) {
+        const { activeMainTab, isCommandPaletteOpen, isHelpDialogOpen, isSessionSwitcherOpen, isSettingsDialogOpen } = useUIStore.getState();
+        if (activeMainTab !== 'chat' || isCommandPaletteOpen || isHelpDialogOpen || isSessionSwitcherOpen || isSettingsDialogOpen) {
+          return;
+        }
+        e.preventDefault();
+        // Dictation state lives inside the composer's isolated component;
+        // toggle it via an event instead of subscribing this hot hook to it.
+        window.dispatchEvent(new CustomEvent('openchamber:dictation-toggle'));
+        return;
+      }
+
       if (e.key === 'Escape') {
         const target = e.target as Element | null;
         const isInsideDialog = Boolean(target?.closest('[role="dialog"]'));
         const isSettingsMounted = Boolean(document.querySelector('[data-settings-view="true"]'));
-        const isInsideTerminal = Boolean(
-          target?.closest('.terminal-viewport-container') ||
-          target?.getAttribute('data-terminal-hidden-input') === 'true'
-        );
-
-        if (isInsideDialog || isSettingsMounted || isInsideTerminal) {
-          resetAbortPriming();
-          return;
-        }
+        const isInsideTerminal = isTerminalEventTarget(target);
+        const hasDropdownInteraction = isDropdownEventTarget(target) || hasOpenDropdown();
 
         const {
           isSettingsDialogOpen,
@@ -361,12 +530,30 @@ export const useKeyboardShortcuts = () => {
           isMultiRunLauncherOpen,
           isImagePreviewOpen,
           activeMainTab,
+          isPromptNavigatorPanelOpen,
         } = useUIStore.getState();
+
+        if (isInsideDialog || isInsideTerminal || hasDropdownInteraction) {
+          resetAbortPriming();
+          return;
+        }
+
+        if (isPromptNavigatorPanelOpen) {
+          e.preventDefault();
+          setPromptNavigatorPanelOpen(false);
+          resetAbortPriming();
+          return;
+        }
 
         // If settings is open, close it
         if (isSettingsDialogOpen) {
           e.preventDefault();
           setSettingsDialogOpen(false);
+          resetAbortPriming();
+          return;
+        }
+
+        if (isSettingsMounted) {
           resetAbortPriming();
           return;
         }
@@ -416,9 +603,11 @@ export const useKeyboardShortcuts = () => {
       }
     };
 
+    window.addEventListener('keydown', handleTerminalShortcutCapture, true);
     window.addEventListener('keydown', handleKeyDown);
 
     return () => {
+      window.removeEventListener('keydown', handleTerminalShortcutCapture, true);
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [
@@ -438,12 +627,17 @@ export const useKeyboardShortcuts = () => {
     setSettingsDialogOpen,
     setModelSelectorOpen,
     setTimelineDialogOpen,
+    togglePromptNavigatorPanel,
+    setPromptNavigatorPanelOpen,
     toggleExpandedInput,
     setThemeMode,
     working,
     armAbortPrompt,
     resetAbortPriming,
     currentSessionId,
+    currentDirectory,
+    activeProject?.id,
+    activeProject?.path,
     shortcutOverrides,
   ]);
 
