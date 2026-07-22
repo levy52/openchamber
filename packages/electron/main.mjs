@@ -183,8 +183,6 @@ const DISCORD_INVITE_URL = 'https://discord.gg/ZYRSdnwwKA';
 const INSTALLED_APPS_CACHE_TTL_SECS = 60 * 60 * 24;
 const INSTALLED_APPS_CACHE_FILE = 'discovered-apps.json';
 const OPENCODE_SHUTDOWN_GRACE_MS = 100;
-const SKIP_LOCAL_SERVER = process.env.OPENCHAMBER_SKIP_LOCAL_SERVER === '1';
-
 const { autoUpdater } = updaterPkg;
 
 const state = {
@@ -1323,6 +1321,11 @@ const inheritUserShellEnv = () => {
   if ((process.platform === 'win32' || !currentPathLooksUserConfigured) && shellPath) {
     process.env.PATH = mergePathValues(shellPath, currentPath, delimiter);
   }
+};
+
+const shouldSkipLocalServer = () => {
+  inheritUserShellEnv();
+  return process.env.OPENCHAMBER_SKIP_LOCAL_SERVER === '1';
 };
 
 const spawnLocalServer = async () => {
@@ -2769,7 +2772,8 @@ const resolveInitialUrl = async () => {
   const hmrUiPort = process.env.OPENCHAMBER_HMR_UI_PORT || '5173';
   const hmrApiUrl = `http://127.0.0.1:${hmrApiPort}`;
   const hmrUiUrl = `http://127.0.0.1:${hmrUiPort}`;
-  const localUrl = SKIP_LOCAL_SERVER
+  const skipLocalServer = shouldSkipLocalServer();
+  const localUrl = skipLocalServer
     ? null
     : isDev && await waitForHealth(hmrApiUrl, 5_000, 100)
       ? hmrApiUrl
@@ -4925,7 +4929,7 @@ app.whenReady().then(async () => {
     state.requestHeaders = sanitizeRuntimeRequestHeaders(requestHeaders || {});
     // Serverless background startup re-probes the remote when a window is
     // eventually opened instead of trusting reachability from login time.
-    state.startupResolved = !SKIP_LOCAL_SERVER;
+    state.startupResolved = !shouldSkipLocalServer();
     state.initScript = buildInitScript(localOrigin, state.bootOutcome, apiBaseUrl, clientToken, state.requestHeaders);
     log.info('[electron] started in background without window');
     return;
