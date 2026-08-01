@@ -25,10 +25,10 @@ The following functions are exported and used by the web server:
 
 ### Status and Diff Operations
 - `getStatus(directory)`: Get comprehensive Git status including current branch, tracking, ahead/behind, file changes, diff stats, merge/rebase state.
-- `getDiff(directory, { path, staged, contextLines })`: Get diff output for files or entire working tree.
+- `getDiff(directory, { path, staged, contextLines })`: Get diff output for files or entire working tree. Untracked symbolic links are represented as link entries without following their targets.
 - `getRangeDiff(directory, { base, head, path, contextLines })`: Get diff between two refs.
 - `getRangeFiles(directory, { base, head })`: Get list of changed files between two refs.
-- `getFileDiff(directory, { path, staged })`: Get original and modified file contents for a single file (handles images as data URLs).
+- `getFileDiff(directory, { path, staged })`: Get original and modified file contents for a single file (handles images as data URLs and symbolic links as their link-target text).
 - `collectDiffs(directory, files)`: Collect diff output for multiple files.
 - `revertFile(directory, filePath, options)`: Revert a file. Default scope `all` discards staged and working-tree changes; scope `working` discards only unstaged/working-tree changes.
 - `stageFile(directory, filePath)`: Add one file path to the index.

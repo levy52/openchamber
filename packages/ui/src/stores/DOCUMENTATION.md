@@ -52,6 +52,8 @@ These stores coordinate persistent project/session metadata across multiple view
 
 `useGlobalSessionsStore.ts` owns cold/global active and archived session coverage, including `sessionsByDirectory`. It is complementary to directory child stores: it is not the source of live busy/retry status or session messages.
 
+User-visible session ordering is also not owned by the global cache array order. `sync/session-ordering.ts` combines lifecycle rank with timestamp fallbacks, and session surfaces must use that shared comparator instead of independently sorting global sessions by `time.updated`.
+
 Global refresh rules:
 
 - Per-directory refresh is bounded to two requests across callers and prioritizes the current directory.
@@ -76,6 +78,29 @@ Persisted session todos use a bounded composite key of runtime, normalized direc
 Chat composer drafts, confirmed mentions, inline-comment drafts, and pinned sessions use the same runtime/directory/session ownership rule. Chat drafts use a bounded shared envelope and notify mounted composers when authoritative deletion clears their identity, preventing unmount autosave from resurrecting deleted text. Inline drafts enforce per-session, global-session, and serialized-byte bounds. Pins retain every valid composite key across runtimes without silent age/count eviction and are never pruned from the first startup list. Confirmed local deletion and routed deletion events clear immediately; after an authoritative baseline exists, a later complete omission also cleans persisted state. Ambiguous session-only legacy drafts and pins are not claimed.
 
 Composer draft edits remain immediate in memory and use a trailing durable-write debounce. Pending text and confirmed mentions flush synchronously when the document becomes hidden, freezes, receives `pagehide`, switches identity, or unmounts; authoritative deletion cancels pending work before any lifecycle flush can run. The shared chat-draft envelope reuses its parsed snapshot until the storage value changes. Inline-comment draft byte accounting indexes serialized buckets and recalculates only the changed session bucket during normal edits; deferred storage still performs the final full-envelope serialization and lifecycle flush.
+
+### `useTerminalStore.ts`
+
+`useTerminalStore` owns terminal tab arrangement per directory plus PTY scrollback.
+
+Scrollback is deliberately **not** stored on the tab. `buffers` is a separate map keyed by
+directory and tab id, and `getBuffer()` returns a shared frozen empty buffer for tabs that
+have produced no output. PTY output arrives at streaming frequency, so keeping it inside
+`sessions` made every output chunk allocate a new tab, a new directory entry and a new
+`sessions` map. That invalidated every tab-strip subscription, re-ran the project-action
+run monitor, and made Zustand persist rewrite the session-storage snapshot per chunk.
+
+Invariants to preserve when editing:
+
+- Output actions (`appendToBuffer`, `replaceBuffer`) must leave `sessions` referentially
+  unchanged; only `buffers` and `nextChunkId` may change.
+- Buffer entries are owned by their tab. `closeTab`, `removeDirectory`, `clearAll`, and
+  rebinding a tab to a different terminal session must drop the entry.
+- Output for an unknown tab is ignored rather than creating an orphan buffer.
+- Only `sessions` and `nextTabId` are persisted. `partialize` reuses its previous
+  projection while both are referentially unchanged, and the storage adapter skips a write
+  for an unchanged projection, so streaming output performs no persistence work.
+- Consumers that react to output must subscribe to `buffers`, not `sessions`.
 
 ## Git / PR Stores
 
@@ -145,7 +170,7 @@ These rules are important. Breaking them tends to reintroduce idle CPU churn, st
 4. Prefer store `ensure*` methods over direct runtime API calls from views.
 5. Visible consumers should drive refresh. Hidden consumers should not.
 6. Header should not depend on PR store.
-7. Closed sidebar should not create live PR work.
+7. A closed context panel (or hidden git surface) should not create live PR work.
 8. File tree Git status should update only when the file tree is visible.
 9. Global session refresh must remain bounded and failure-isolated per directory.
 10. Global session cache must not drive live activity indicators or message-loading state.

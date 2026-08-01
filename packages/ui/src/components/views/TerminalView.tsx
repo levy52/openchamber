@@ -1,7 +1,7 @@
 import React from 'react';
 
 import { useSessionUIStore } from '@/sync/session-ui-store';
-import { useTerminalStore } from '@/stores/useTerminalStore';
+import { EMPTY_TERMINAL_BUFFER, useTerminalStore } from '@/stores/useTerminalStore';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
 import { type TerminalStreamEvent } from '@/lib/api/types';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
@@ -36,8 +36,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ visible }) => {
     const terminalFontSize = useUIStore(state => state.terminalFontSize);
     const terminalShell = useUIStore(state => state.terminalShell);
     const terminalLoginShell = useUIStore(state => state.terminalLoginShells.includes(state.terminalShell));
-    const bottomTerminalHeight = useUIStore((state) => state.bottomTerminalHeight);
-    const isBottomTerminalExpanded = useUIStore((state) => state.isBottomTerminalExpanded);
     const { isMobile, isTablet, hasTouchOnlyPointer } = useDeviceInfo();
     const isTouchTerminal = isMobile || isTablet;
     const useTouchTerminalInput = (isTouchTerminal || hasTouchOnlyPointer) && runtime.platform === 'web';
@@ -99,7 +97,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ visible }) => {
 
     const terminalSessionId = activeTab?.terminalSessionId ?? null;
     const terminalLifecycle = activeTab?.lifecycle ?? 'idle';
-    const bufferChunks = activeTab?.bufferChunks ?? [];
+    // Scrollback is a leaf subscription: streaming output must not rerender the tab strip.
+    const bufferChunks = useTerminalStore((s) => (
+        effectiveDirectory && activeTabId ? s.getBuffer(effectiveDirectory, activeTabId).chunks : EMPTY_TERMINAL_BUFFER.chunks
+    ));
     const isConnecting = activeTab?.isConnecting ?? false;
     const previewUrl = activeTab?.previewUrl ?? null;
 
@@ -146,11 +147,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ visible }) => {
     }, [useTouchTerminalInput]);
 
     const activeMainTab = useUIStore((state) => state.activeMainTab);
-    const isBottomTerminalOpen = useUIStore((state) => state.isBottomTerminalOpen);
-    const setBottomTerminalOpen = useUIStore((state) => state.setBottomTerminalOpen);
-    const setBottomTerminalExpanded = useUIStore((state) => state.setBottomTerminalExpanded);
     const isTerminalActive = activeMainTab === 'terminal';
-    const isTerminalVisible = visible ?? (isTerminalActive || isBottomTerminalOpen);
+    const isTerminalVisible = visible ?? isTerminalActive;
     const [hasOpenedTerminalViewport, setHasOpenedTerminalViewport] = React.useState(isTerminalVisible);
 
     React.useEffect(() => {
@@ -429,7 +427,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ visible }) => {
             let terminalId = tab?.terminalSessionId ?? null;
             const terminalLifecycle = tab?.lifecycle ?? 'idle';
             const isActionTab = Boolean(tab?.label?.startsWith('Action:'));
-            const hasBufferedOutput = (tab?.bufferLength ?? 0) > 0 || (tab?.bufferChunks?.length ?? 0) > 0;
+            const buffer = useTerminalStore.getState().getBuffer(directory, tabId);
+            const hasBufferedOutput = buffer.byteLength > 0 || buffer.chunks.length > 0;
 
             if (!terminalId) {
                 if (terminalLifecycle === 'exited') {
@@ -798,12 +797,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ visible }) => {
 
     const xtermTheme = React.useMemo(() => convertThemeToXterm(currentTheme), [currentTheme]);
 
+    // Viewport identity is the tab, not the PTY session. Including the session id
+    // here tore down and rebuilt the Ghostty terminal (WASM VT + canvas + font
+    // atlas) a second time the moment `createSession` resolved, doubling the cost
+    // of every terminal open. Session changes are handled by the chunk replay path.
     const terminalViewportKey = React.useMemo(() => {
         const directoryPart = effectiveDirectory ?? 'no-dir';
         const tabPart = activeTabId ?? 'no-tab';
-        const terminalPart = terminalSessionId ?? 'no-terminal';
-        return `${directoryPart}::${tabPart}::${terminalPart}`;
-    }, [effectiveDirectory, activeTabId, terminalSessionId]);
+        return `${directoryPart}::${tabPart}`;
+    }, [effectiveDirectory, activeTabId]);
 
     React.useEffect(() => {
         if (!isTerminalVisible || useTouchTerminalInput) {
@@ -847,34 +849,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ visible }) => {
         };
     }, [isTerminalVisible, terminalViewportKey, useTouchTerminalInput]);
 
-    React.useEffect(() => {
-        if (useTouchTerminalInput || !isTerminalVisible || !isBottomTerminalOpen) {
-            return;
-        }
-
-        const controller = terminalControllerRef.current;
-        if (!controller) {
-            return;
-        }
-
-        const fitOnce = () => {
-            controller.fit();
-        };
-
-        if (typeof window !== 'undefined') {
-            const rafId = window.requestAnimationFrame(() => {
-                fitOnce();
-            });
-            const timeoutIds = [320].map((delay) => window.setTimeout(fitOnce, delay));
-            return () => {
-                window.cancelAnimationFrame(rafId);
-                timeoutIds.forEach((id) => window.clearTimeout(id));
-            };
-        }
-
-        fitOnce();
-    }, [bottomTerminalHeight, isBottomTerminalExpanded, isBottomTerminalOpen, isTerminalVisible, useTouchTerminalInput]);
-
     if (!hasActiveContext) {
         return (
             <div className="flex h-full items-center justify-center p-4 text-center text-sm text-muted-foreground">
@@ -899,7 +873,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ visible }) => {
 
     const quickKeysDisabled = !terminalSessionId || isConnecting || isRestarting || isReconnectPending;
     const shouldRenderViewport = hasOpenedTerminalViewport;
-    const showBottomDockControls = !isTouchTerminal && isBottomTerminalOpen && !isTerminalActive;
     const quickKeySize: 'lg' | 'xs' = isTouchTerminal ? 'lg' : 'xs';
     const quickKeyIconClass = isTouchTerminal ? 'w-10 p-0' : 'w-9 p-0';
     const preserveTerminalFocus = (event: React.PointerEvent<HTMLButtonElement>) => {
@@ -1076,32 +1049,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ visible }) => {
                                     <Icon name="global" className="h-3.5 w-3.5 shrink-0" />
                                     <span className="whitespace-nowrap">{t('terminalView.preview.open')}</span>
                                 </Button>
-                            ) : null}
-                            {showBottomDockControls ? (
-                                <>
-                                    <Button
-                                        type="button"
-                                        size="xs"
-                                        variant="ghost"
-                                        onClick={() => setBottomTerminalExpanded(!isBottomTerminalExpanded)}
-                                        className={cn('shrink-0 p-0', isMobile ? 'h-8 w-8' : 'h-7 w-7')}
-                                        title={isBottomTerminalExpanded ? t('terminalView.bottomDock.restoreTitle') : t('terminalView.bottomDock.expandTitle')}
-                                        aria-label={isBottomTerminalExpanded ? t('terminalView.bottomDock.restoreAria') : t('terminalView.bottomDock.expandAria')}
-                                    >
-                                        {isBottomTerminalExpanded ? <Icon name="fullscreen-exit" className="h-4 w-4" /> : <Icon name="fullscreen" className="h-4 w-4" />}
-                                    </Button>
-                                    <Button
-                                        type="button"
-                                        size="xs"
-                                        variant="ghost"
-                                        onClick={() => setBottomTerminalOpen(false)}
-                                        className={cn('shrink-0 p-0', isMobile ? 'h-8 w-8' : 'h-7 w-7')}
-                                        title={t('terminalView.bottomDock.closeTitle')}
-                                        aria-label={t('terminalView.bottomDock.closeAria')}
-                                    >
-                                        <Icon name="close" className="h-4 w-4" />
-                                    </Button>
-                                </>
                             ) : null}
                         </div>
                     </div>

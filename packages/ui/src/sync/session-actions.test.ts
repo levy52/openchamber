@@ -9,6 +9,7 @@ const registeredSessionDirectories: Array<{ sessionID: string; directory: string
 let sessionRevertResult: { data?: unknown; error?: unknown; response?: { status?: number } } = {}
 let questionReplyError: unknown | null = null
 let questionRejectError: unknown | null = null
+let permissionReplyError: unknown | null = null
 let sessionShareResult: { data?: unknown; error?: unknown; response?: { status?: number } } = {}
 let sessionUpdateResult: { data?: unknown; error?: unknown; response?: { status?: number } } = {}
 let sessionMessagesResult: { data?: unknown; error?: unknown; response?: { status?: number } } = { data: [] }
@@ -22,6 +23,10 @@ const mockScopedClient = {
   permission: {
     reply: mock((params: Record<string, unknown>) => {
       replyCalls.push({ method: "permission.reply", params })
+      if (permissionReplyError) {
+        const status = (permissionReplyError as { status?: number })?.status ?? 404
+        return Promise.resolve({ error: permissionReplyError, response: { status } })
+      }
       return Promise.resolve({ data: true })
     }),
   },
@@ -85,6 +90,10 @@ const mockSdk = {
   permission: {
     reply: mock((params: Record<string, unknown>) => {
       replyCalls.push({ method: "permission.reply", params })
+      if (permissionReplyError) {
+        const status = (permissionReplyError as { status?: number })?.status ?? 404
+        return Promise.resolve({ error: permissionReplyError, response: { status } })
+      }
       return Promise.resolve({ data: true })
     }),
   },
@@ -458,11 +467,28 @@ describe("shareSession live state", () => {
 
     const result = await unshareSession("session-a")
 
-    expect(result).toBe(unsharedSession)
+    expect(result).toEqual({ ...unsharedSession, share: undefined })
     expect(replyCalls.find((call) => call.method === "session.unshare")?.params.directory).toBe("/test/project")
     expect(sessionStore.getState().session[0].share).toBe(undefined)
     expect(otherStore.getState().session[0].id).toBe("other")
-    expect(globalUpsertedSessions).toEqual([unsharedSession])
+    expect(globalUpsertedSessions).toEqual([{ ...unsharedSession, share: undefined }])
+  })
+
+  test("clears a stale share URL echoed by a successful unshare response", async () => {
+    const sharedSession = { id: "session-a", time: { created: 1 }, share: { url: "https://share.example/a" } } as Session
+    const staleResponse = { id: "session-a", time: { created: 1, updated: 2 }, share: { url: "https://share.example/a" } } as Session
+    const sessionStore = createStore({}, { session: [sharedSession] })
+    const childStores = createChildStores([["/test/project", sessionStore]])
+    sessionShareResult = { data: staleResponse }
+
+    const { setActionRefs, unshareSession } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/current/project")
+
+    const result = await unshareSession("session-a")
+
+    expect(result?.share).toBe(undefined)
+    expect(sessionStore.getState().session[0].share).toBe(undefined)
+    expect((globalUpsertedSessions[0] as Session).share).toBe(undefined)
   })
 
   test("updates the directory live store after sharing", async () => {
@@ -483,7 +509,7 @@ describe("shareSession live state", () => {
     expect(globalUpsertedSessions).toEqual([sharedSession])
   })
 
-  test("preserves live directory metadata while clearing share from null response", async () => {
+  test("preserves live directory metadata while normalizing a null share response", async () => {
     const sharedSession = {
       id: "session-a",
       time: { created: 1 },
@@ -505,8 +531,8 @@ describe("shareSession live state", () => {
 
     await unshareSession("session-a")
 
-    const liveSession = sessionStore.getState().session[0] as SessionWithDirectory & { share?: null }
-    expect(liveSession.share).toBe(null)
+    const liveSession = sessionStore.getState().session[0] as SessionWithDirectory
+    expect(liveSession.share).toBe(undefined)
     expect(liveSession.directory).toBe("/test/project")
     expect(liveSession.project?.worktree).toBe("/test/project")
   })
@@ -615,6 +641,90 @@ describe("optimisticSend target directory", () => {
     expect(optimisticRemove).toBe(null)
     expect(targetStore.getState().session_status["session-new"]?.type).toBe("busy")
     expect(currentStore.getState().session_status["session-new"]).toBe(undefined)
+  })
+
+  test("commits the new branch locally and discards its optimistic shadow when sending after a revert", async () => {
+    const retainedMessage = { id: "msg_1", role: "user", sessionID: "session-reverted" } as Message
+    const revertedMessage = { id: "msg_2", role: "user", sessionID: "session-reverted" } as Message
+    const targetStore = createStore({}, {
+      session: [{ id: "session-reverted", revert: { messageID: "msg_2" } } as Session],
+      message: { "session-reverted": [retainedMessage, revertedMessage] },
+      part: { msg_2: [{ id: "part_2", type: "text", text: "old branch" } as Part] },
+    })
+    const childStores = createChildStores([["/target/project", targetStore]])
+    let optimisticMessage: Message | null = null
+    const optimisticShadow = new Set([revertedMessage.id])
+
+    const { optimisticSend, setActionRefs, setOptimisticRefs } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/target/project")
+    setOptimisticRefs(
+      (input) => {
+        optimisticMessage = input.message
+        optimisticShadow.add(input.message.id)
+        targetStore.setState((state) => ({
+          message: { ...state.message, [input.sessionID]: [...(state.message[input.sessionID] ?? []), input.message] },
+          part: { ...state.part, [input.message.id]: input.parts },
+        }))
+      },
+      () => {},
+      (input) => optimisticShadow.delete(input.messageID),
+    )
+
+    await optimisticSend({
+      sessionId: "session-reverted",
+      directory: "/target/project",
+      content: "new branch",
+      providerID: "provider",
+      modelID: "model",
+      send: async () => {},
+    })
+
+    expect(targetStore.getState().session[0].revert).toBe(undefined)
+    expect(targetStore.getState().message["session-reverted"].map((message) => message.id)).toEqual([
+      "msg_1",
+      (optimisticMessage as unknown as Message).id,
+    ])
+    expect(targetStore.getState().part.msg_2).toBe(undefined)
+    expect(optimisticShadow.has(revertedMessage.id)).toBe(false)
+    expect(optimisticShadow.has((optimisticMessage as unknown as Message).id)).toBe(true)
+  })
+
+  test("restores the reverted branch when sending fails", async () => {
+    const retainedMessage = { id: "msg_1", role: "user", sessionID: "session-reverted" } as Message
+    const revertedMessage = { id: "msg_2", role: "user", sessionID: "session-reverted" } as Message
+    const revertedPart = { id: "part_2", type: "text", text: "old branch" } as Part
+    const targetStore = createStore({}, {
+      session: [{ id: "session-reverted", revert: { messageID: "msg_2" } } as Session],
+      message: { "session-reverted": [retainedMessage, revertedMessage] },
+      part: { msg_2: [revertedPart] },
+    })
+    const childStores = createChildStores([["/target/project", targetStore]])
+
+    const { optimisticSend, setActionRefs, setOptimisticRefs } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/target/project")
+    setOptimisticRefs(
+      (input) => targetStore.setState((state) => ({
+        message: { ...state.message, [input.sessionID]: [...(state.message[input.sessionID] ?? []), input.message] },
+        part: { ...state.part, [input.message.id]: input.parts },
+      })),
+      (input) => targetStore.setState((state) => ({
+        message: { ...state.message, [input.sessionID]: (state.message[input.sessionID] ?? []).filter((message) => message.id !== input.messageID) },
+        part: Object.fromEntries(Object.entries(state.part).filter(([messageID]) => messageID !== input.messageID)),
+      })),
+    )
+
+    await expect(optimisticSend({
+      sessionId: "session-reverted",
+      directory: "/target/project",
+      content: "new branch",
+      providerID: "provider",
+      modelID: "model",
+      send: async () => { throw new Error("rejected") },
+    })).rejects.toThrow("rejected")
+
+    expect(targetStore.getState().session[0].revert?.messageID).toBe("msg_2")
+    expect(targetStore.getState().message["session-reverted"]).toEqual([retainedMessage, revertedMessage])
+    expect(targetStore.getState().part.msg_2).toEqual([revertedPart])
   })
 
   test("allows callers to block final send when runtime changes after optimistic insert", async () => {
@@ -816,6 +926,18 @@ describe("respondToPermission passes directory", () => {
     expect(replyCalls[0].params.reply).toBe("reject")
     expect(replyCalls[0].params.directory).toBe("/fallback/dir")
   })
+
+  test("uses an explicit event directory before incomplete local routing state", async () => {
+    const childStores = createChildStores([])
+
+    const { setActionRefs, respondToPermission } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/stale/current")
+
+    await respondToPermission("unknown-session", "perm-event", "once", "/event/project")
+
+    expect(scopedClientDirectories).toContain("/event/project")
+    expect(replyCalls[0].params.directory).toBe("/event/project")
+  })
 })
 
 describe("revertToMessage passes session directory", () => {
@@ -891,6 +1013,7 @@ describe("dismissPermission passes directory", () => {
     replyCalls.length = 0
     scopedClientDirectories.length = 0
     questionReplyError = null
+    permissionReplyError = null
   })
 
   test("passes directory and reply=reject", async () => {
@@ -1005,6 +1128,17 @@ function buildQuestion(id: string, sessionId: string): QuestionRequest {
   }
 }
 
+function buildPermission(id: string, sessionId: string): PermissionRequest {
+  return {
+    id,
+    sessionID: sessionId,
+    permission: "edit",
+    patterns: [],
+    metadata: {},
+    always: [],
+  }
+}
+
 describe("dismissOpenQuestionsForSession", () => {
   beforeEach(() => {
     replyCalls.length = 0
@@ -1076,5 +1210,143 @@ describe("dismissOpenQuestionsForSession", () => {
     expect(rejectCalls[0].params.requestID).toBe("q-stale")
     // The stale entry is cleared from the store even though the server reported not-found.
     expect(store.getState().question["session-a"]).toBe(undefined)
+  })
+})
+
+describe("dismissPermission not-found handling", () => {
+  beforeEach(() => {
+    replyCalls.length = 0
+    scopedClientDirectories.length = 0
+    permissionReplyError = null
+  })
+
+  test("clears the stale permission and rethrows on PermissionNotFoundError", async () => {
+    const permission = buildPermission("perm-stale", "session-a")
+    const store = createStore({ "session-a": [permission] })
+    const childStores = createChildStores([["/test/project", store]])
+    permissionReplyError = Object.assign(new Error("permission.reply failed (404): PermissionNotFoundError"), { status: 404 })
+
+    const { setActionRefs, dismissPermission } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/test/project")
+
+    await expect(dismissPermission("session-a", "perm-stale")).rejects.toThrow()
+    expect(replyCalls.filter((call) => call.method === "permission.reply")).toHaveLength(1)
+    // The stale entry is cleared from the store even though the server reported not-found.
+    expect(store.getState().permission["session-a"]).toBe(undefined)
+  })
+
+  test("does not clear the store on a non-not-found failure (rethrow only)", async () => {
+    const permission = buildPermission("perm-500", "session-a")
+    const store = createStore({ "session-a": [permission] })
+    const childStores = createChildStores([["/test/project", store]])
+    permissionReplyError = Object.assign(new Error("permission.reply failed (500)"), { status: 500 })
+
+    const { setActionRefs, dismissPermission } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/test/project")
+
+    await expect(dismissPermission("session-a", "perm-500")).rejects.toThrow()
+    // A non-not-found failure leaves store reconciliation to the next server event.
+    expect(store.getState().permission["session-a"]).toHaveLength(1)
+  })
+})
+
+describe("dismissOpenPermissionsForSession", () => {
+  beforeEach(() => {
+    replyCalls.length = 0
+    scopedClientDirectories.length = 0
+    permissionReplyError = null
+  })
+
+  test("returns false and rejects nothing when no permissions are pending", async () => {
+    const store = createStore({}, { session: [{ id: "session-a", time: { created: 1 } } as Session] })
+    const childStores = createChildStores([["/test/project", store]])
+
+    const { setActionRefs, dismissOpenPermissionsForSession } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/test/project")
+
+    const dismissed = await dismissOpenPermissionsForSession("session-a")
+
+    expect(dismissed).toBe(false)
+    expect(replyCalls.filter((call) => call.method === "permission.reply")).toHaveLength(0)
+  })
+
+  test("rejects every pending permission in the session subtree (root + subagent child)", async () => {
+    const rootPermission = buildPermission("perm-root", "session-a")
+    const childPermission = buildPermission("perm-child", "session-child")
+    const store = createStore({
+      "session-a": [rootPermission],
+      "session-child": [childPermission],
+    }, {
+      session: [
+        { id: "session-a", time: { created: 1 } } as Session,
+        { id: "session-child", parentID: "session-a", time: { created: 2 } } as Session,
+      ],
+    })
+    const childStores = createChildStores([["/test/project", store]])
+
+    const { setActionRefs, dismissOpenPermissionsForSession } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/test/project")
+
+    const dismissed = await dismissOpenPermissionsForSession("session-a")
+
+    expect(dismissed).toBe(true)
+    const replyCallsForPermissions = replyCalls.filter((call) => call.method === "permission.reply")
+    expect(replyCallsForPermissions).toHaveLength(2)
+    const rejectedIds = replyCallsForPermissions.map((call) => call.params.requestID).sort()
+    expect(rejectedIds).toEqual(["perm-child", "perm-root"])
+    expect(replyCallsForPermissions.every((call) => call.params.reply === "reject")).toBe(true)
+    // Optimistic clear: the permissions are removed from the local store so the
+    // prompt disappears instantly, without waiting for the reject round-trip.
+    expect(store.getState().permission["session-a"]).toBe(undefined)
+    expect(store.getState().permission["session-child"]).toBe(undefined)
+  })
+
+  test("swallows PermissionNotFoundError so a stranded permission never blocks the send", async () => {
+    const stalePermission = buildPermission("perm-stale", "session-a")
+    const store = createStore({ "session-a": [stalePermission] }, {
+      session: [{ id: "session-a", time: { created: 1 } } as Session],
+    })
+    const childStores = createChildStores([["/test/project", store]])
+    permissionReplyError = Object.assign(new Error("permission.reply failed (404): PermissionNotFoundError"), { status: 404 })
+
+    const { setActionRefs, dismissOpenPermissionsForSession } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/test/project")
+
+    const dismissed = await dismissOpenPermissionsForSession("session-a")
+
+    expect(dismissed).toBe(true)
+    const replyCallsForPermissions = replyCalls.filter((call) => call.method === "permission.reply")
+    expect(replyCallsForPermissions).toHaveLength(1)
+    expect(replyCallsForPermissions[0].params.requestID).toBe("perm-stale")
+    // The stale entry is cleared from the store even though the server reported not-found.
+    expect(store.getState().permission["session-a"]).toBe(undefined)
+  })
+
+  test("swallows and logs a non-not-found reject failure so the send is never blocked", async () => {
+    const permission = buildPermission("perm-500", "session-a")
+    const store = createStore({ "session-a": [permission] }, {
+      session: [{ id: "session-a", time: { created: 1 } } as Session],
+    })
+    const childStores = createChildStores([["/test/project", store]])
+    permissionReplyError = Object.assign(new Error("permission.reply failed (500)"), { status: 500 })
+
+    const { setActionRefs, dismissOpenPermissionsForSession } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/test/project")
+
+    const errors: unknown[][] = []
+    const originalError = console.error
+    console.error = (...args: unknown[]) => { errors.push(args) }
+    try {
+      const dismissed = await dismissOpenPermissionsForSession("session-a")
+
+      expect(dismissed).toBe(true)
+      const replyCallsForPermissions = replyCalls.filter((call) => call.method === "permission.reply")
+      expect(replyCallsForPermissions).toHaveLength(1)
+      expect(replyCallsForPermissions[0].params.requestID).toBe("perm-500")
+      expect(errors).toHaveLength(1)
+      expect(String(errors[0]?.[0])).toContain("[session-actions]")
+    } finally {
+      console.error = originalError
+    }
   })
 })

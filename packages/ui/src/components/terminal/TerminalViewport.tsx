@@ -53,6 +53,9 @@ const TerminalViewport = React.forwardRef<TerminalController, Props>(({
   const outputRewriteCarryRef = React.useRef('');
   const safeResetRef = React.useRef(getGhosttySafeResetSequence(theme.background));
   const writingRef = React.useRef(false);
+  // Incremented whenever the replay stream restarts, so a write completing from
+  // before the restart cannot clear the in-flight flag of a newer write.
+  const writeEpochRef = React.useRef(0);
   const visibleRef = React.useRef(isVisible);
   const rendererReadyRef = React.useRef(false);
   const [ready, setReady] = React.useState(0);
@@ -98,19 +101,39 @@ const TerminalViewport = React.forwardRef<TerminalController, Props>(({
       return;
     }
     writingRef.current = true;
+    const epoch = writeEpochRef.current;
     terminal.write(rewritten.data, () => {
-      if (terminalRef.current !== terminal) return;
+      if (terminalRef.current !== terminal || writeEpochRef.current !== epoch) return;
       writingRef.current = false;
       if (writeQueueRef.current) flush();
     });
   }, []);
 
+  /**
+   * Replay discontinuities (restart, reconnect, buffer reset) only need the VT
+   * state cleared. `Terminal.reset()` frees and rebuilds the WASM terminal while
+   * keeping the canvas, renderer and font atlas, so prefer it over remounting the
+   * whole terminal; the generation bump remains the fallback before the terminal
+   * exists.
+   */
   const recreateRenderer = React.useCallback(() => {
     lastChunkRef.current = null;
     writeQueueRef.current = '';
     outputRewriteCarryRef.current = '';
     writingRef.current = false;
-    setRendererGeneration((value) => value + 1);
+    writeEpochRef.current += 1;
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      setRendererGeneration((value) => value + 1);
+      return;
+    }
+    try {
+      terminal.reset();
+      const safeReset = safeResetRef.current;
+      if (safeReset) terminal.write(`${safeReset}\u001b[2J\u001b[H`);
+    } catch {
+      setRendererGeneration((value) => value + 1);
+    }
   }, []);
 
   React.useEffect(() => {
@@ -165,6 +188,20 @@ const TerminalViewport = React.forwardRef<TerminalController, Props>(({
 
     return () => {
       disposed = true;
+      // Removing a focused editable mid-IME-composition wedges Android
+      // WebView's input dispatch (the whole app stops responding to touch).
+      // Blur first so the IME detaches cleanly, and hide the soft keyboard
+      // explicitly on Android before the terminal DOM is torn down.
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && container.contains(active)) {
+        active.blur();
+        const capacitor = (window as typeof window & { Capacitor?: { getPlatform?: () => string } }).Capacitor;
+        if (capacitor?.getPlatform?.() === 'android') {
+          void import('@capacitor/keyboard')
+            .then(({ Keyboard }) => Keyboard.hide())
+            .catch(() => undefined);
+        }
+      }
       observer?.disconnect();
       if (resizeTimeout) clearTimeout(resizeTimeout);
       if (fitFrame !== null) cancelAnimationFrame(fitFrame);
@@ -181,6 +218,7 @@ const TerminalViewport = React.forwardRef<TerminalController, Props>(({
       writeQueueRef.current = '';
       outputRewriteCarryRef.current = '';
       writingRef.current = false;
+      writeEpochRef.current += 1;
       rendererReadyRef.current = false;
     };
   }, [fit, fontFamily, fontSize, rendererGeneration, theme]);
@@ -200,10 +238,20 @@ const TerminalViewport = React.forwardRef<TerminalController, Props>(({
       return;
     }
     const previous = lastChunkRef.current;
-    const previousIndex = previous === null ? -1 : chunks.findIndex((chunk) => chunk.id === previous);
-    if (previous !== null && previousIndex < 0) {
-      recreateRenderer();
-      return;
+    // Chunk ids are monotonic and the store appends, so the already-written chunk
+    // is normally the last one. Scanning from the end keeps this O(1) per chunk
+    // instead of O(chunks) on every streamed write.
+    let previousIndex = -1;
+    if (previous !== null) {
+      for (let index = chunks.length - 1; index >= 0; index -= 1) {
+        const id = chunks[index].id;
+        if (id === previous) { previousIndex = index; break; }
+        if (id < previous) break;
+      }
+      if (previousIndex < 0) {
+        recreateRenderer();
+        return;
+      }
     }
     const isReplay = previousIndex < 0;
     const pending = previousIndex >= 0 ? chunks.slice(previousIndex + 1) : chunks;
@@ -220,6 +268,36 @@ const TerminalViewport = React.forwardRef<TerminalController, Props>(({
 
   React.useEffect(() => {
     const container = containerRef.current;
+    if (!enableTouchScroll || !container) return;
+    // ghostty-web only reads keydown/composition events and preventDefaults
+    // beforeinput without consuming it. Android IMEs deliver text via
+    // beforeinput (their keydown arrives as keyCode 229, which ghostty
+    // ignores), so forward those payloads to the terminal here. Composition
+    // updates are skipped: ghostty commits them itself on compositionend.
+    const handleBeforeInput = (event: Event) => {
+      const input = event as InputEvent;
+      if (input.isComposing) return;
+      switch (input.inputType) {
+        case 'insertText':
+          if (input.data) inputRef.current(input.data);
+          break;
+        case 'insertLineBreak':
+        case 'insertParagraph':
+          inputRef.current('\r');
+          break;
+        case 'deleteContentBackward':
+          inputRef.current('\x7f');
+          break;
+        default:
+          break;
+      }
+    };
+    container.addEventListener('beforeinput', handleBeforeInput);
+    return () => container.removeEventListener('beforeinput', handleBeforeInput);
+  }, [enableTouchScroll, ready]);
+
+  React.useEffect(() => {
+    const container = containerRef.current;
     const terminal = terminalRef.current;
     if (!enableTouchScroll || !container || !terminal) return;
     let pointerId: number | null = null;
@@ -231,6 +309,16 @@ const TerminalViewport = React.forwardRef<TerminalController, Props>(({
     let remainder = 0;
     let selectionFocus: TerminalCellPosition | null = null;
     const lineHeight = Math.max(12, fontSize + 2);
+    // Android WebView only raises the soft keyboard for a native tap-focus; the
+    // pointer-captured, touch-action:none tap here focuses programmatically, so
+    // the IME must be summoned explicitly via the Capacitor Keyboard plugin.
+    const showAndroidSoftKeyboard = () => {
+      const capacitor = (window as typeof window & { Capacitor?: { getPlatform?: () => string } }).Capacitor;
+      if (capacitor?.getPlatform?.() !== 'android') return;
+      void import('@capacitor/keyboard')
+        .then(({ Keyboard }) => Keyboard.show())
+        .catch(() => undefined);
+    };
     const clearLongPress = () => {
       if (!longPressTimeout) return;
       clearTimeout(longPressTimeout);
@@ -332,7 +420,10 @@ const TerminalViewport = React.forwardRef<TerminalController, Props>(({
       pointerId = null;
       gesture = 'idle';
       if (shouldFinishSelection) finishSelection();
-      if (shouldFocus) terminal.focus();
+      if (shouldFocus) {
+        terminal.focus();
+        showAndroidSoftKeyboard();
+      }
     };
     const cancel = (event: PointerEvent) => {
       if (pointerId !== event.pointerId) return;
