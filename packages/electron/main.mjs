@@ -13,7 +13,7 @@ import updaterPkg from 'electron-updater';
 import { ElectronSshManager } from './ssh-manager.mjs';
 import { createTrayController } from './tray.mjs';
 import { resolveManagedOpenCodeCwd } from './opencode-cwd.mjs';
-import { resolveStartupUrlProbePlan } from './startup-url-selection.mjs';
+import { resolveStartupUrlProbePlan, shouldIgnoreLoopbackConnectionLimit } from './startup-url-selection.mjs';
 import { sanitizeRuntimeRequestHeaders } from './runtime-request-headers.mjs';
 import { assertUpdaterCapability } from './updater-capability.mjs';
 import { checkForDesktopUpdate } from './updater-check.mjs';
@@ -89,13 +89,16 @@ if (isDev) {
 }
 app.setAppUserModelId(APP_USER_MODEL_ID);
 app.commandLine.appendSwitch('proxy-bypass-list', '<-loopback>');
-// Lift Chromium's ~6-connections-per-host cap for the loopback backend. The
-// packaged renderer is cross-origin (openchamber-ui:// → http://127.0.0.1), so
-// every API call also needs a CORS preflight; during startup a few slow
-// OpenCode-proxied requests otherwise hold the whole pool and every other
-// request — including opening the first session — queues for seconds behind
-// them. Loopback has no per-host connection cost that the cap protects.
-app.commandLine.appendSwitch('ignore-connections-limit', '127.0.0.1,localhost');
+// Lift Chromium's per-host cap only for bundled UI. Applying this to Vite HMR
+// lets the renderer request most of the module graph at once, overwhelming the
+// dev server's transform pipeline and leaving the HTML splash visible for up
+// to a minute before React mounts.
+if (shouldIgnoreLoopbackConnectionLimit({
+  development: isDev,
+  packagedUi: process.env.OPENCHAMBER_ELECTRON_USE_BUNDLED_UI === '1',
+})) {
+  app.commandLine.appendSwitch('ignore-connections-limit', '127.0.0.1,localhost');
+}
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -1371,11 +1374,16 @@ const loadShellEnv = () => {
 
 // Merge the user's login-shell env (PATH, etc.) into this process before we
 import { pathLooksUserConfigured, mergePathValues } from '@openchamber/web/server/lib/opencode/path-utils.js';
+import { clearAppImageArgv0FromProcessEnv } from '@openchamber/web/server/lib/inherited-env.js';
 
 // import/start the server in-process. The server and its children (opencode
 // CLI, git, etc.) inherit process.env directly now — there is no sidecar
 // subprocess to hand a custom env to.
 const inheritUserShellEnv = () => {
+  // Clear before probing/merging so login-shell snapshots and children never
+  // inherit the AppImage path as argv[0] via zsh's ARGV0 parameter (#2588).
+  clearAppImageArgv0FromProcessEnv();
+
   const shellEnv = loadShellEnv();
   if (!shellEnv) return;
 
@@ -1385,7 +1393,7 @@ const inheritUserShellEnv = () => {
   const currentPathLooksUserConfigured = pathLooksUserConfigured(currentPath, homeDir, delimiter);
 
   for (const [key, value] of Object.entries(shellEnv)) {
-    if (key === 'PATH') continue;
+    if (key === 'PATH' || key === 'ARGV0') continue;
     if (typeof process.env[key] === 'undefined') {
       process.env[key] = value;
     }
@@ -2247,6 +2255,13 @@ const dispatchMenuAction = (action) => {
   dispatchDomEventToWindow(target, 'openchamber:menu-action', action);
 };
 
+// Append-style menu actions must reach the renderer exactly once. Dual IPC+DOM
+// delivery (dispatchMenuAction) would insert the selection twice.
+const dispatchAddSelectionToChat = () => {
+  const target = getMenuTargetWindow();
+  if (target) emitToWindow(target, 'openchamber:menu-action', 'add-selection-to-chat');
+};
+
 // Mini-chat draft windows are not deduplicated, so this must reach the renderer
 // exactly once — emitToWindow alone (no DOM-event double dispatch). The renderer
 // resolves the active directory/project and opens the window.
@@ -2447,12 +2462,6 @@ const createBrowserWindow = ({ label, restoreGeometry, url, runtimeConfig = {} }
   });
   browserWindow.on('move', () => {
     debounceWindowStatePersist(browserWindow, false);
-  });
-  browserWindow.on('minimize', (event) => {
-    if (!shouldHideMainWindowToTray(browserWindow)) return;
-    debounceWindowStatePersist(browserWindow, true);
-    event.preventDefault();
-    browserWindow.hide();
   });
   browserWindow.on('close', (event) => {
     if (!state.quitRequested && shouldHideMainWindowToTray(browserWindow)) {
@@ -4433,7 +4442,12 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
 
     case 'desktop_minimize_current_window':
       if (browserWindow && !browserWindow.isDestroyed()) {
-        browserWindow.minimize();
+        if (shouldHideMainWindowToTray(browserWindow)) {
+          debounceWindowStatePersist(browserWindow, true);
+          browserWindow.hide();
+        } else {
+          browserWindow.minimize();
+        }
       }
       return null;
 
@@ -4556,6 +4570,7 @@ const buildMacMenu = () => {
         { type: 'separator' },
         { role: 'cut' },
         { label: 'Copy', accelerator: 'Cmd+C', click: () => handleCopyAction() },
+        { label: 'Add Selection to Chat', accelerator: 'Cmd+L', registerAccelerator: false, click: () => dispatchAddSelectionToChat() },
         { role: 'paste' },
         { role: 'selectAll' },
       ],
@@ -4574,7 +4589,7 @@ const buildMacMenu = () => {
         { label: 'Dark Theme', click: () => dispatchAction('theme-dark') },
         { label: 'System Theme', click: () => dispatchAction('theme-system') },
         { type: 'separator' },
-        { label: 'Toggle Session Sidebar', accelerator: 'Cmd+L', click: () => dispatchAction('toggle-sidebar') },
+        { label: 'Toggle Session Sidebar', accelerator: 'Cmd+Alt+L', click: () => dispatchAction('toggle-sidebar') },
         { label: 'Toggle Memory Debug', accelerator: 'Cmd+Shift+D', click: () => dispatchAction('toggle-memory-debug') },
         { type: 'separator' },
         { role: 'togglefullscreen' },
@@ -4653,6 +4668,7 @@ const buildAutoHiddenMenu = () => {
         { type: 'separator' },
         { role: 'cut' },
         { label: 'Copy', accelerator: 'Ctrl+C', click: () => handleCopyAction() },
+        { label: 'Add Selection to Chat', accelerator: 'Ctrl+L', registerAccelerator: false, click: () => dispatchAddSelectionToChat() },
         { role: 'paste' },
         { role: 'selectAll' },
       ],
@@ -4675,7 +4691,7 @@ const buildAutoHiddenMenu = () => {
         { label: 'Dark Theme', click: () => dispatchAction('theme-dark') },
         { label: 'System Theme', click: () => dispatchAction('theme-system') },
         { type: 'separator' },
-        { label: 'Toggle Session Sidebar', accelerator: 'Ctrl+L', click: () => dispatchAction('toggle-sidebar') },
+        { label: 'Toggle Session Sidebar', accelerator: 'Ctrl+Alt+L', click: () => dispatchAction('toggle-sidebar') },
         { label: 'Toggle Memory Debug', accelerator: 'Ctrl+Shift+D', click: () => dispatchAction('toggle-memory-debug') },
         { type: 'separator' },
         { role: 'togglefullscreen' },

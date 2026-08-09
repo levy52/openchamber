@@ -771,7 +771,9 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({ active = true, aut
 
     React.useEffect(() => {
         if (autoOpenDraft && !currentSessionId && !draftOpen) {
-            openNewSessionDraft();
+            // Programmatic fallback, not user navigation — must not clear the
+            // persisted last-session pointer the cold-launch restore reads.
+            openNewSessionDraft({ automatic: true });
         }
     }, [autoOpenDraft, currentSessionId, draftOpen, openNewSessionDraft]);
 

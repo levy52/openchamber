@@ -12,6 +12,8 @@ import type {
   TextPartInput,
   FilePartInput,
 } from "@opencode-ai/sdk/v2";
+import { isAmbiguousTransportFailure, markAmbiguousTransportFailure } from "@/lib/relay/transport-error";
+import { FilesystemError, parseFilesystemErrorReason } from "@/lib/api/files-errors";
 import type { PermissionRequest } from "@/types/permission";
 import type { QuestionRequest } from "@/types/question";
 
@@ -266,6 +268,12 @@ class OpencodeService {
     const requestedBaseUrl = runtimeBase || baseUrl;
     this.baseUrl = ensureAbsoluteBaseUrl(requestedBaseUrl);
     this.client = createRuntimeOpencodeClient({ baseUrl: this.baseUrl });
+  }
+
+  private assertRuntimeUnchanged(runtimeKey?: string): void {
+    if (runtimeKey && runtimeKey !== getRuntimeKey()) {
+      throw new Error('Message was not sent because the runtime changed.');
+    }
   }
 
   getBaseUrl(): string {
@@ -743,6 +751,7 @@ class OpencodeService {
   }
 
   async sendMessage(params: {
+    runtimeKey?: string;
     id: string;
     providerID: string;
     modelID: string;
@@ -768,6 +777,8 @@ class OpencodeService {
     };
     directory?: string | null;
   }): Promise<string> {
+    this.assertRuntimeUnchanged(params.runtimeKey);
+
     // Use the optimistic/client-generated ID as the real user message ID so SSE
     // can reconcile the echoed server message in-place.
     const messageId = params.messageId ?? ascendingId("msg");
@@ -851,6 +862,7 @@ class OpencodeService {
     }
 
     assertProviderCircuitClosed(params.providerID);
+    this.assertRuntimeUnchanged(params.runtimeKey);
 
     let response: Response;
 
@@ -878,7 +890,13 @@ class OpencodeService {
           // failure) — there is no HTTP response to report. Never fabricate a
           // status: surface it as a transport error so callers treat it like
           // any other network failure instead of a server 500.
-          throw new Error(`Message send transport failure: ${formatSdkError(result.error)}`);
+          // Preserve the transport's "dispatched, outcome unknown" tag through
+          // the wrap: without it the caller cannot tell a lost response from a
+          // send that never reached the server, and re-sends a running prompt.
+          const transportError = new Error(`Message send transport failure: ${formatSdkError(result.error)}`);
+          throw isAmbiguousTransportFailure(result.error)
+            ? markAmbiguousTransportFailure(transportError)
+            : transportError;
         }
         response = new Response(JSON.stringify(result.error), { status });
       } else {
@@ -911,6 +929,7 @@ class OpencodeService {
   }
 
   async sendCommand(params: {
+    runtimeKey?: string;
     id: string;
     providerID: string;
     modelID: string;
@@ -922,6 +941,8 @@ class OpencodeService {
     messageId?: string;
     directory?: string | null;
   }): Promise<string> {
+    this.assertRuntimeUnchanged(params.runtimeKey);
+
     const tempMessageId = params.messageId ?? ascendingId("msg");
 
     const parts: FilePartInput[] = [];
@@ -932,6 +953,7 @@ class OpencodeService {
     }
 
     const requestDirectory = this.normalizeCandidatePath(params.directory ?? null) ?? this.currentDirectory;
+    this.assertRuntimeUnchanged(params.runtimeKey);
 
     const response = await this.client.session.command({
       sessionID: params.id,
@@ -961,6 +983,7 @@ class OpencodeService {
   }
 
   async shellSession(params: {
+    runtimeKey?: string;
     sessionId: string;
     command: string;
     agent: string;
@@ -968,6 +991,7 @@ class OpencodeService {
     messageId?: string;
     directory?: string | null;
   }): Promise<{ info: Message; parts: Part[] }> {
+    this.assertRuntimeUnchanged(params.runtimeKey);
     const requestDirectory = this.normalizeCandidatePath(params.directory ?? null) ?? this.currentDirectory;
     const response = await this.client.session.shell({
       sessionID: params.sessionId,
@@ -1744,20 +1768,55 @@ class OpencodeService {
     }
 
     const task = (async () => {
-    const desktopFiles = getDesktopFilesApi();
-    if (desktopFiles) {
+      const desktopFiles = getDesktopFilesApi();
       try {
-        const result = await desktopFiles.listDirectory(directoryPath || '', options);
-        if (!result || !Array.isArray(result.entries)) {
-          return [];
+        if (desktopFiles) {
+          const result = await desktopFiles.listDirectory(directoryPath || '', options);
+          if (!result || !Array.isArray(result.entries)) {
+            throw new FilesystemError('Directory listing returned an invalid response', {
+              reason: 'invalid-response',
+            });
+          }
+          const entries = result.entries.map<FilesystemEntry>((entry) => ({
+            name: entry.name,
+            path: normalizeFsPath(entry.path),
+            isDirectory: !!entry.isDirectory,
+            isFile: !entry.isDirectory,
+            isSymbolicLink: false,
+          }));
+          this.listDirectoryCache.set(cacheKey, {
+            entries,
+            expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS,
+          });
+          return entries;
         }
-        const entries = result.entries.map<FilesystemEntry>((entry) => ({
-          name: entry.name,
-          path: normalizeFsPath(entry.path),
-          isDirectory: !!entry.isDirectory,
-          isFile: !entry.isDirectory,
-          isSymbolicLink: false,
-        }));
+
+        const params = new URLSearchParams();
+        if (directoryPath && directoryPath.trim().length > 0) {
+          params.set('path', directoryPath);
+        }
+        if (options?.respectGitignore) {
+          params.set('respectGitignore', 'true');
+        }
+        const query = params.toString();
+        const response = await runtimeFetch(`${this.baseUrl}/fs/list${query ? `?${query}` : ''}`);
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          const message = typeof error.error === 'string' ? error.error : 'Failed to list directory';
+          throw new FilesystemError(message, {
+            reason: parseFilesystemErrorReason((error as { reason?: unknown }).reason),
+            status: response.status,
+          });
+        }
+
+        const result = await response.json();
+        if (!result || !Array.isArray(result.entries)) {
+          throw new FilesystemError('Directory listing returned an invalid response', {
+            reason: 'invalid-response',
+          });
+        }
+
+        const entries = result.entries as FilesystemEntry[];
         this.listDirectoryCache.set(cacheKey, {
           entries,
           expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS,
@@ -1767,39 +1826,6 @@ class OpencodeService {
         console.error('Failed to list directory contents:', error);
         throw error;
       }
-    }
-
-    try {
-      const params = new URLSearchParams();
-      if (directoryPath && directoryPath.trim().length > 0) {
-        params.set('path', directoryPath);
-      }
-      if (options?.respectGitignore) {
-        params.set('respectGitignore', 'true');
-      }
-      const query = params.toString();
-      const response = await runtimeFetch(`${this.baseUrl}/fs/list${query ? `?${query}` : ''}`);
-      if (!response.ok) {
-        const error = await response.json().catch(() => ({}));
-        const message = typeof error.error === 'string' ? error.error : 'Failed to list directory';
-        throw new Error(message);
-      }
-
-      const result = await response.json();
-      if (!result || !Array.isArray(result.entries)) {
-        return [];
-      }
-
-      const entries = result.entries as FilesystemEntry[];
-      this.listDirectoryCache.set(cacheKey, {
-        entries,
-        expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS,
-      });
-      return entries;
-    } catch (error) {
-      console.error('Failed to list directory contents:', error);
-      throw error;
-    }
     })();
 
     const trackedTask = task.finally(() => {

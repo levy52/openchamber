@@ -443,6 +443,10 @@ export const createSettingsHelpers = (dependencies) => {
       const trimmed = candidate.smallModelOverride.trim();
       result.smallModelOverride = trimmed.length > 0 ? trimmed : undefined;
     }
+    if (typeof candidate.walkthroughModelOverride === 'string') {
+      const trimmed = candidate.walkthroughModelOverride.trim();
+      result.walkthroughModelOverride = trimmed.length > 0 ? trimmed : undefined;
+    }
     if (typeof candidate.defaultGitIdentityId === 'string') {
       const trimmed = candidate.defaultGitIdentityId.trim();
       result.defaultGitIdentityId = trimmed.length > 0 ? trimmed : undefined;
@@ -560,6 +564,9 @@ export const createSettingsHelpers = (dependencies) => {
       if (mode === 'markdown' || mode === 'plain') {
         result.userMessageRenderingMode = mode;
       }
+    }
+    if (typeof candidate.collapsibleUserMessages === 'boolean') {
+      result.collapsibleUserMessages = candidate.collapsibleUserMessages;
     }
     if (typeof candidate.stickyUserHeader === 'boolean') {
       result.stickyUserHeader = candidate.stickyUserHeader;

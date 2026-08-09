@@ -32,7 +32,7 @@ import {
 } from '@/lib/chatDraftPersistence';
 import { ReviewFlowDialog, type ReviewFlowExecution } from '@/components/session/ReviewFlowDialog';
 import { AttachedFilesList, AttachedVSCodeFileChips, ActiveEditorFileSuggestion } from './FileAttachment';
-import ToolOutputDialog from './message/ToolOutputDialog';
+import { lazyWithChunkRecovery } from '@/lib/chunkLoadRecovery';
 import type { ToolPopupContent } from './message/types';
 import { QueuedMessageChips } from './QueuedMessageChips';
 import { AutoReviewBanner } from './AutoReviewBanner';
@@ -48,11 +48,12 @@ import { PendingChangesBar } from './PendingChangesBar';
 import { useChatSurfaceMode } from './useChatSurfaceMode';
 import { MobileAgentButton } from './MobileAgentButton';
 import { MobileModelButton } from './MobileModelButton';
-import { MobileSessionStatusBar } from './MobileSessionStatusBar';
 import { useCurrentSessionActivity } from '@/hooks/useSessionActivity';
 import { toast } from '@/components/ui';
 // useMessageStore removed — messages now come from sync system
 import { isVSCodeRuntime } from '@/lib/desktop';
+import { useTabletLayout } from '@/lib/device';
+import { useHardwareKeyboard } from '@/lib/hardwareKeyboard';
 import { isIMECompositionEvent } from '@/lib/ime';
 import { getCycledPrimaryAgentName, type MobileControlsPanel } from './mobileControlsUtils';
 import { MobileOverlayPanel } from '@/components/ui/MobileOverlayPanel';
@@ -141,6 +142,10 @@ import { RevertedMessageDock } from './composer/ui/RevertedMessageDock';
 import { SessionSuggestionChip } from '@/components/chat/SessionSuggestionChip';
 import { SessionGoalRow } from '@/components/chat/SessionGoalRow';
 
+// Lazy like in ChatMessage: a static import would pull the @pierre/diffs and
+// Shiki stacks into the eager startup graph for a dialog opened on demand.
+const ToolOutputDialog = lazyWithChunkRecovery(() => import('./message/ToolOutputDialog'));
+
 const MAX_VISIBLE_COMPOSER_LINES = 8;
 /**
  * Mobile grows the composer with content instead of offering a fullscreen
@@ -158,6 +163,7 @@ const MAX_MOBILE_COMPOSER_LINES = 16;
  */
 const MOBILE_COMPOSER_BOUND_GAP_PX = 4;
 const EMPTY_QUEUE: QueuedMessage[] = [];
+const EMPTY_SENDING_IDS: string[] = [];
 const COMPACT_CHAT_PLACEHOLDER_MAX_WIDTH = 560;
 const renameFileForAttachmentCitation = (file: File, filename: string): File => {
     if (file.name === filename) {
@@ -350,6 +356,8 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     const getVisibleAgents = useConfigStore((state) => state.getVisibleAgents);
     const agents = getVisibleAgents();
     const isMobile = useUIStore((state) => state.isMobile);
+    const hasHardwareKeyboard = useHardwareKeyboard();
+    const { enabled: isTabletLayout } = useTabletLayout();
     const setImagePreviewOpen = useUIStore((state) => state.setImagePreviewOpen);
     const inputBarOffset = useUIStore((state) => state.inputBarOffset);
     const persistChatDraft = useUIStore((state) => state.persistChatDraft);
@@ -370,6 +378,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     );
     const ensureGitStatus = useGitStore((state) => state.ensureStatus);
     const fetchGitStatus = useGitStore((state) => state.fetchStatus);
+    const clearGitDiffCache = useGitStore((state) => state.clearDiffCache);
     const [showAbortStatus, setShowAbortStatus] = React.useState(false);
     const setSessionAutoAccept = usePermissionStore((state) => state.setSessionAutoAccept);
     const [isNarrowComposer, setIsNarrowComposer] = React.useState(false);
@@ -378,6 +387,15 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         title: '',
         content: '',
     });
+    // Mount the lazy preview dialog only after its first open; rendering it
+    // closed would fetch the ToolOutputDialog chunk (with the @pierre/diffs
+    // stack) on the draft screen before any preview is requested.
+    const [attachmentPreviewMounted, setAttachmentPreviewMounted] = React.useState(false);
+    React.useEffect(() => {
+        if (attachmentPreview.open) {
+            setAttachmentPreviewMounted(true);
+        }
+    }, [attachmentPreview.open]);
     const attachmentCompatibilityRef = React.useRef({
         modelKey: `${currentProviderId ?? ''}/${currentModelId ?? ''}`,
         modalitySignature: currentModelMetadata?.modalities?.input?.slice().sort().join(',') ?? null,
@@ -446,9 +464,12 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         if (!currentDirectory || !runtimeGit) return;
         return sessionEvents.onGitRefreshHint((hint) => {
             if (normalizePath(hint.directory) !== normalizePath(currentDirectory)) return;
-            void fetchGitStatus(currentDirectory, runtimeGit);
+            if (hint.paths?.length) {
+                clearGitDiffCache(currentDirectory, hint.paths);
+            }
+            void fetchGitStatus(currentDirectory, runtimeGit, { silent: true });
         });
-    }, [currentDirectory, runtimeGit, fetchGitStatus]);
+    }, [clearGitDiffCache, currentDirectory, runtimeGit, fetchGitStatus]);
 
     const handleStartReviewFlow = React.useCallback(async (execution: ReviewFlowExecution) => {
         if (!currentSessionId) return;
@@ -928,19 +949,34 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         setPrPickerOpen(true);
     }, []);
 
+    const getSubmitErrorMessage = (error: unknown, fallback: string) => {
+        const message = error instanceof Error ? error.message : '';
+        return message.toLowerCase().includes('runtime changed')
+            ? t('chat.chatInput.toast.messageSendFailed')
+            : message || fallback;
+    };
+
     const handleSubmit = async (options?: SubmitOptions) => {
         const queuedOnly = options?.queuedOnly ?? false;
         const queuedMessageId = options?.queuedMessageId;
         const delivery = options?.delivery === 'steer' && sessionPhase !== 'idle' ? 'steer' : undefined;
+        const capturedTarget = messageQueueTarget;
         const inputSnapshot = options?.presetText != null
             ? {
                 message: options.presetText,
                 hasContent: options.presetText.trim().length > 0 || attachedFiles.length > 0 || hasDrafts,
             }
             : getCurrentInputSnapshot();
-        const queuedMessagesToSend = queuedMessageId
+        // A queued item stays in the queue until its own send resolves, so the
+        // auto-send hook may already be delivering one of these. Merging it here
+        // would send the same message twice (the window is seconds over a relay).
+        const sendingIds = messageQueueTarget
+            ? useMessageQueueStore.getState().sendingIds[getMessageQueueKey(messageQueueTarget)] ?? EMPTY_SENDING_IDS
+            : EMPTY_SENDING_IDS;
+        const queuedMessagesToSend = (queuedMessageId
             ? queuedMessages.filter((message) => message.id === queuedMessageId)
-            : queuedMessages;
+            : queuedMessages
+        ).filter((message) => !sendingIds.includes(message.id));
 
         if (queuedOnly && autoReviewRunning) {
             return;
@@ -997,7 +1033,9 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
             }
         }
 
-        const sendMessageOptions = delivery ? { delivery } : undefined;
+        const sendMessageOptions = capturedTarget
+            ? { target: capturedTarget, ...(delivery ? { delivery } : {}) }
+            : delivery ? { delivery } : undefined;
 
         // Inline review comments and synthetic context are consumed before
         // assembly so a failed send can restore exactly what it took.
@@ -1043,10 +1081,10 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         if (outgoing.isEmpty) return;
 
         // Clear queue and input
-        if (messageQueueTarget && queuedMessageId) {
-            removeFromQueue(messageQueueTarget, queuedMessageId);
-        } else if (messageQueueTarget && hasQueuedMessages) {
-            clearQueue(messageQueueTarget);
+        if (capturedTarget && queuedMessageId) {
+            removeFromQueue(capturedTarget, queuedMessageId);
+        } else if (capturedTarget && hasQueuedMessages) {
+            clearQueue(capturedTarget);
         }
         if (!queuedOnly) {
             setMessage('');
@@ -1096,7 +1134,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                     const compactDirectory = useSessionUIStore.getState().getDirectoryForSession(currentSessionId) || currentDirectory || undefined;
                     await opencodeClient.summarizeSession(currentSessionId, currentProviderId, currentModelId, compactDirectory);
                 } catch (error) {
-                    toast.error(error instanceof Error ? error.message : t('chat.chatInput.toast.compactFailed'));
+                    toast.error(getSubmitErrorMessage(error, t('chat.chatInput.toast.compactFailed')));
                 }
                 return;
             }
@@ -1128,15 +1166,13 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                     );
                     scrollToBottom?.();
                 } catch (error) {
-                    toast.error(error instanceof Error ? error.message : t(command.errorToastKey));
+                    toast.error(getSubmitErrorMessage(error, t(command.errorToastKey)));
                 }
                 return;
             }
         }
 
-        const currentSessionDirectory = currentSessionId
-            ? useSessionUIStore.getState().getDirectoryForSession(currentSessionId) || currentDirectory
-            : currentDirectory;
+        const currentSessionDirectory = capturedTarget?.directory ?? currentDirectory;
         const shouldAddResponseStyle = newSessionDraftOpen || (currentSessionId ? !hasUserMessages(currentSessionId, currentSessionDirectory) : false);
         if (shouldAddResponseStyle) {
             const responseStyleInstruction = await fetchResponseStyleInstruction().catch(() => null);
@@ -1240,6 +1276,14 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                     useInputStore.getState().setAttachedFiles(allAttachments);
                     toast.error(t('chat.chatInput.toast.sendAttachmentsFailed'));
                 }
+                return;
+            }
+
+            if (normalized.includes('runtime changed')) {
+                if (allAttachments.length > 0) {
+                    useInputStore.getState().setAttachedFiles(allAttachments);
+                }
+                toast.error(t('chat.chatInput.toast.messageSendFailed'));
                 return;
             }
 
@@ -2234,6 +2278,10 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         editorRef: composerRef,
         formRef: composerFormRef,
         setExpandedInput,
+        // The pill exists to buy screen back from the soft keyboard. A tablet
+        // has the room regardless, and with a hardware keyboard there is no
+        // soft keyboard to buy it back from — keep the real composer up.
+        alwaysExpanded: hasHardwareKeyboard || isTabletLayout,
         holders: {
             controlsPanelOpen: Boolean(mobileControlsPanel),
             attachMenuOpen: mobileAttachMenuOpen,
@@ -2482,8 +2530,10 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                         newSessionDraftOpen={newSessionDraftOpen}
                         hasContent={Boolean(hasContent)}
                         isVSCode={isVSCode}
+                        canAbort={canAbort}
                         footerIconButtonClass={footerIconButtonClass}
                         iconSizeClass={iconSizeClass}
+                        stopIconSizeClass={stopIconSizeClass}
                         theme={currentTheme}
                         onExpand={mobileShell.expand}
                         onApplySuggestion={applyAssistSuggestion}
@@ -2493,6 +2543,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                         onOpenPrPicker={openPrPicker}
                         onOpenAttachSheet={openMobileAttachSheet}
                         onStartDictation={toggleDictation}
+                        onAbort={handleAbort}
                     />
                 ) : (
                 <>
@@ -2569,7 +2620,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                         onClose={closeAutocomplete}
                     />
                     {/* Positioning context for the dictation overlay: covers the
-                        text area + footer exactly, excluding MobileSessionStatusBar. */}
+                        text area + footer exactly. */}
                     <div className={cn('relative flex flex-col', isComposerExpanded && 'flex-1 min-h-0')}>
                     <div className={cn("overflow-hidden", isComposerExpanded && 'flex flex-1 min-h-0 flex-col')}>
                         {isMobile ? (
@@ -2704,10 +2755,6 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                     />
                 ) : null}
                 </div>
-                {/* Mobile session panel: slide-up overlay toggled by
-                    MobileSessionPanelTrigger. Mounted outside the pill
-                    conditional so the pill's trigger works too. */}
-                {isMobile && <MobileSessionStatusBar />}
                 {/* Hidden host for the model/agent/variant bottom sheets. Kept
                     outside the pill conditional so an open panel survives (and
                     stays visible over) the collapsed composer. */}
@@ -2752,11 +2799,15 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
             submitting={reviewFlowSubmitting}
             onConfirm={handleStartReviewFlow}
         />
-        <ToolOutputDialog
-            popup={attachmentPreview}
-            onOpenChange={handleAttachmentPreviewOpenChange}
-            isMobile={isMobile}
-        />
+        {attachmentPreviewMounted ? (
+            <React.Suspense fallback={null}>
+                <ToolOutputDialog
+                    popup={attachmentPreview}
+                    onOpenChange={handleAttachmentPreviewOpenChange}
+                    isMobile={isMobile}
+                />
+            </React.Suspense>
+        ) : null}
 
         {/* Single always-mounted picker input. It must NOT live inside
             ComposerAttachmentControls: that component mounts once per composer
