@@ -2308,6 +2308,7 @@ export async function respondToPermission(
   requestId: string,
   response: "once" | "always" | "reject",
   directoryOverride?: string,
+  message?: string,
 ): Promise<void> {
   await waitForConnectionOrThrow()
   const directory = directoryOverride
@@ -2315,7 +2316,7 @@ export async function respondToPermission(
     || getSessionDirectory(sessionId)
     || dir()
   try {
-    if (await opencodeClient.replyToPermission(sessionId, requestId, response, { directory }) !== true) {
+    if (await opencodeClient.replyToPermission(sessionId, requestId, response, { directory, message: response === "reject" ? message : undefined }) !== true) {
       throw new Error("Permission reply failed")
     }
   } catch (error) {

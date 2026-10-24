@@ -363,31 +363,61 @@ const useAlwaysLabel = (permission: PermissionRequest): { label: string; full: s
 export const PermissionActions: React.FC<{
   permission: PermissionRequest;
   isResponding: boolean;
-  onRespond: (response: PermissionReply) => void;
+  onRespond: (response: PermissionReply, message?: string) => Promise<boolean>;
   variant: 'inline' | 'dock';
 }> = ({ permission, isResponding, onRespond, variant }) => {
   const { t } = useI18n();
+  const [editingReason, setEditingReason] = React.useState(false);
+  const [reason, setReason] = React.useState('');
+  const [failed, setFailed] = React.useState(false);
   const always = useAlwaysLabel(permission);
   const hasSave = always.full !== undefined;
   const canSave = canSavePermission(permission.save);
 
+  if (editingReason) {
+    return (
+      <form data-permission-reason className="px-3 py-2 space-y-2" onSubmit={(event) => {
+        event.preventDefault();
+        if (isResponding || !reason.trim()) return;
+        void onRespond('reject', reason.trim()).then((success) => setFailed(!success));
+      }}>
+        <label className="block typography-meta" htmlFor={`permission-reason-${permission.id}`}>{t('chat.permissionCard.reasonLabel')}</label>
+        <textarea
+          id={`permission-reason-${permission.id}`}
+          autoFocus
+          value={reason}
+          onChange={(event) => { setReason(event.target.value); setFailed(false); }}
+          disabled={isResponding}
+          className="oc-raised oc-field w-full min-h-20 rounded-md px-2 py-1.5 typography-meta"
+          aria-invalid={failed || undefined}
+        />
+        {failed ? <p role="alert" className="typography-meta text-[var(--status-error-text)]">{t('chat.permissionCard.reasonError')}</p> : null}
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="ghost" size="sm" disabled={isResponding} onClick={() => { setEditingReason(false); setFailed(false); }}>{t('chat.permissionCard.reasonCancel')}</Button>
+          <Button type="submit" variant="destructive" size="sm" disabled={isResponding || !reason.trim()}>{t('chat.permissionCard.reasonSubmit')}</Button>
+        </div>
+      </form>
+    );
+  }
+
   if (variant === 'dock') {
     return (
       <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2 pt-1">
-        <Button variant="ghost" size="xs" disabled={isResponding} onClick={() => onRespond('reject')} className="text-[var(--status-error)]">
+        <Button variant="ghost" size="xs" disabled={isResponding} onClick={() => void onRespond('reject')} className="text-[var(--status-error)]">
           <Icon name="close" className="size-3.5" />
           {t('chat.permissionCard.deny')}
           <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+backspace')}</kbd>
         </Button>
+        <Button variant="ghost" size="xs" disabled={isResponding} onClick={() => setEditingReason(true)}>{t('chat.permissionCard.reasonOpen')}</Button>
         <div className="min-w-0 flex-1" />
         {canSave ? (
-          <Button variant="outline" size="xs" disabled={isResponding} onClick={() => onRespond('always')} title={always.full}>
+          <Button variant="outline" size="xs" disabled={isResponding} onClick={() => void onRespond('always')} title={always.full}>
             <Icon name="time" className="size-3.5" />
             <span className="max-w-[180px] truncate">{always.label}</span>
             {!hasSave ? <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+shift+enter')}</kbd> : null}
           </Button>
         ) : null}
-        <Button size="xs" disabled={isResponding} onClick={() => onRespond('once')}>
+        <Button size="xs" disabled={isResponding} onClick={() => void onRespond('once')}>
           {isResponding ? <Icon name="loader-4" className="size-3.5 animate-spin" /> : <Icon name="check" className="size-3.5" />}
           {t('chat.permissionCard.allowOnce')}
           <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+enter')}</kbd>
@@ -404,7 +434,7 @@ export const PermissionActions: React.FC<{
   return (
     <div className="px-2 pb-2 sm:pb-1.5 pt-1.5 sm:pt-1 flex flex-col sm:flex-row sm:items-center sm:flex-wrap gap-1.5 border-t border-border/20">
       <button
-        onClick={() => onRespond('once')}
+        onClick={() => void onRespond('once')}
         disabled={isResponding}
         className={cn(rowClass, 'bg-[var(--status-success)]/10 text-[var(--status-success)] hover:bg-[var(--status-success)]/20')}
       >
@@ -415,7 +445,7 @@ export const PermissionActions: React.FC<{
 
       {canSave ? (
         <button
-          onClick={() => onRespond('always')}
+          onClick={() => void onRespond('always')}
           disabled={isResponding}
           title={always.full}
           className={cn(rowClass, 'bg-[var(--muted)]/50 text-muted-foreground hover:bg-[var(--muted)]/70')}
@@ -427,7 +457,7 @@ export const PermissionActions: React.FC<{
       ) : null}
 
       <button
-        onClick={() => onRespond('reject')}
+        onClick={() => void onRespond('reject')}
         disabled={isResponding}
         className={cn(rowClass, 'bg-[var(--status-error)]/10 text-[var(--status-error)] hover:bg-[var(--status-error)]/20')}
       >
@@ -435,6 +465,8 @@ export const PermissionActions: React.FC<{
         {t('chat.permissionCard.deny')}
         <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+backspace')}</kbd>
       </button>
+
+      <Button type="button" variant="ghost" size="sm" disabled={isResponding} onClick={() => setEditingReason(true)}>{t('chat.permissionCard.reasonOpen')}</Button>
 
       {isResponding && (
         <div className="flex justify-center w-full sm:w-auto sm:ms-auto py-1 sm:py-0 typography-meta text-muted-foreground">
@@ -482,7 +514,7 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({ permission, onRe
 
           <PermissionRequestContent permission={permission} />
 
-          <PermissionActions permission={permission} isResponding={isResponding} onRespond={(response) => void respond(response)} variant="inline" />
+          <PermissionActions permission={permission} isResponding={isResponding} onRespond={respond} variant="inline" />
         </div>
       </div>
     </div>

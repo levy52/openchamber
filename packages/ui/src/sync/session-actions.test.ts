@@ -136,11 +136,11 @@ mock.module("@/lib/opencode/client", () => ({
       sessionId: string,
       requestId: string,
       reply: string,
-      options?: { directory?: string | null },
+      options?: { directory?: string | null; message?: string },
     ) => {
       replyCalls.push({
         method: "permission.reply",
-        params: { sessionID: sessionId, requestID: requestId, reply, directory: options?.directory },
+        params: { sessionID: sessionId, requestID: requestId, reply, directory: options?.directory, message: options?.message },
       })
       if (permissionReplyError) throw permissionReplyError
       return true
@@ -2050,6 +2050,29 @@ describe("optimisticSend target directory", () => {
 describe("respondToPermission passes directory", () => {
   beforeEach(() => {
     replyCalls.length = 0
+  })
+
+  test("sends the comment with a rejection to the requesting session", async () => {
+    const childStores = createChildStores([])
+    const { setActionRefs, respondToPermission } = await import("./session-actions")
+    setActionRefs(childStores, () => "/test/project")
+
+    await respondToPermission("child-session", "perm-child", "reject", "/child/project", "Use the read-only command instead")
+
+    expect(replyCalls[0].params).toMatchObject({
+      sessionID: "child-session", requestID: "perm-child", reply: "reject",
+      directory: "/child/project", message: "Use the read-only command instead",
+    })
+  })
+
+  test("does not attach a rejection message to an approval", async () => {
+    const childStores = createChildStores([])
+    const { setActionRefs, respondToPermission } = await import("./session-actions")
+    setActionRefs(childStores, () => "/test/project")
+
+    await respondToPermission("session-a", "perm-1", "once", undefined, "unused")
+
+    expect(replyCalls[0].params.message).toBeUndefined()
   })
 
   test("passes directory from child store when permission is found", async () => {

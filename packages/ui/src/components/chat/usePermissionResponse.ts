@@ -53,18 +53,25 @@ export const usePermissionResponse = (
   const column: ColumnKind = useChatColumnActions().pinned ? 'pinned' : 'main';
   const [isResponding, setIsResponding] = React.useState(false);
   const [hasResponded, setHasResponded] = React.useState(false);
+  const responseState = React.useRef<'pending' | 'answered' | null>(null);
   const respondToPermission = sessionActions.respondToPermission;
   const canSave = canSavePermission(permission.save);
 
-  const respond = React.useCallback(async (response: PermissionReply) => {
+  const respond = React.useCallback(async (response: PermissionReply, message?: string): Promise<boolean> => {
+    if (responseState.current !== null) return false;
+    responseState.current = 'pending';
     setIsResponding(true);
     try {
-      await respondToPermission(permission.sessionID, permission.id, response);
+      await respondToPermission(permission.sessionID, permission.id, response, undefined, message);
+      responseState.current = 'answered';
       setHasResponded(true);
       onResponse?.(response);
+      return true;
     } catch (error) {
       console.error('[PermissionCard] Failed to respond to permission:', error);
+      return false;
     } finally {
+      if (responseState.current === 'pending') responseState.current = null;
       setIsResponding(false);
     }
   }, [onResponse, permission.id, permission.sessionID, respondToPermission]);
@@ -83,6 +90,7 @@ export const usePermissionResponse = (
         if (entry.column === target) owner = entry;
       }
       if (owner !== card) return;
+      if (event.target instanceof Element && event.target.closest('[data-permission-reason]')) return;
       const response = permissionShortcutReply(event, canSave);
       if (!response) return;
       event.preventDefault();
