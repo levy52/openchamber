@@ -139,11 +139,7 @@ for (const variant of ['inline', 'dock'] as const) {
       expect(button('Deny and send').disabled).toBe(true);
       await typeReason('  \n  ');
       expect(button('Deny and send').disabled).toBe(true);
-      const form = host.querySelector('form');
-      if (!form) throw new Error('Missing reason form');
-      await act(async () => {
-        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-      });
+      await click('Deny and send');
       expect(calls).toHaveLength(0);
     });
 
@@ -186,6 +182,28 @@ for (const variant of ['inline', 'dock'] as const) {
     });
   });
 }
+
+describe('reason controls inside the composer', () => {
+  test('sending the reason creates no nested form and does not submit the composer', async () => {
+    const { respond, calls } = responseRecorder();
+    const outerSubmit = () => outerCalls.push(true);
+    const outerCalls: boolean[] = [];
+    await act(async () => root.render(
+      <I18nProvider>
+        <form onSubmit={(event) => { event.preventDefault(); outerSubmit(); }}>
+          <PermissionActions permission={permission} variant="inline" isResponding={false} onRespond={respond} />
+        </form>
+      </I18nProvider>,
+    ));
+    await click('Deny with reason');
+    expect(host.querySelectorAll('form')).toHaveLength(1);
+    expect(button('Deny and send').type).toBe('button');
+    await typeReason('Use a read-only command');
+    await click('Deny and send');
+    expect(calls).toEqual([['reject', 'Use a read-only command']]);
+    expect(outerCalls).toHaveLength(0);
+  });
+});
 
 describe('permission response submission and shortcuts', () => {
   const ConnectedActions = () => {

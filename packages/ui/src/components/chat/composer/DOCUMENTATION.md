@@ -79,6 +79,10 @@ The BTW sheet keeps the inline `PermissionCard` for its child session's
 requests; both render the request through `PermissionRequestContent` and
 `PermissionActions`.
 
+Permission reason controls use a plain container and explicit button clicks,
+never a nested form or submit button: the dock already sits inside the
+composer form, and a native submit can navigate away without sending the reply.
+
 A read-only chat (a subagent session, an archived space) mounts no composer,
 so `ChatContainer` mounts `PermissionDock` and `FormDock` itself above the
 read-only banner. A subagent's requests then show in its own chat and in its

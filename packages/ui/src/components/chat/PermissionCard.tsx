@@ -374,13 +374,15 @@ export const PermissionActions: React.FC<{
   const hasSave = always.full !== undefined;
   const canSave = canSavePermission(permission.save);
 
+  const submitReason = React.useCallback(() => {
+    const trimmed = reason.trim();
+    if (isResponding || !trimmed) return;
+    void onRespond('reject', trimmed).then((success) => setFailed(!success));
+  }, [isResponding, onRespond, reason]);
+
   if (editingReason) {
     return (
-      <form data-permission-reason className="px-3 py-2 space-y-2" onSubmit={(event) => {
-        event.preventDefault();
-        if (isResponding || !reason.trim()) return;
-        void onRespond('reject', reason.trim()).then((success) => setFailed(!success));
-      }}>
+      <div data-permission-reason className="px-3 py-2 space-y-2">
         <label className="block typography-meta" htmlFor={`permission-reason-${permission.id}`}>{t('chat.permissionCard.reasonLabel')}</label>
         <textarea
           id={`permission-reason-${permission.id}`}
@@ -394,9 +396,11 @@ export const PermissionActions: React.FC<{
         {failed ? <p role="alert" className="typography-meta text-[var(--status-error-text)]">{t('chat.permissionCard.reasonError')}</p> : null}
         <div className="flex justify-end gap-2">
           <Button type="button" variant="ghost" size="sm" disabled={isResponding} onClick={() => { setEditingReason(false); setFailed(false); }}>{t('chat.permissionCard.reasonCancel')}</Button>
-          <Button type="submit" variant="destructive" size="sm" disabled={isResponding || !reason.trim()}>{t('chat.permissionCard.reasonSubmit')}</Button>
+          <Button type="button" variant="destructive" size="sm" disabled={isResponding || !reason.trim()} onClick={submitReason}>
+            {t('chat.permissionCard.reasonSubmit')}
+          </Button>
         </div>
-      </form>
+      </div>
     );
   }
 
