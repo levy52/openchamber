@@ -3688,6 +3688,7 @@ export const dict: Record<I18nKey, string> = {
   'chat.permissionCard.reasonLabel': '거부 사유',
   'chat.permissionCard.reasonCancel': '취소',
   'chat.permissionCard.reasonSubmit': '거부하고 보내기',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter로 사유 보내기',
   'chat.permissionCard.reasonError': '거부를 보내지 못했습니다. 다시 시도하세요.',
   'chat.permissionCard.replaceAll': '모든 항목을 바꿉니다',
   'chat.compaction.running': '대화를 압축하는 중',

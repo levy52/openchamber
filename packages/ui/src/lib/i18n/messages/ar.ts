@@ -3605,6 +3605,7 @@ export const dict = {
   'chat.permissionCard.reasonLabel': 'سبب الرفض',
   'chat.permissionCard.reasonCancel': 'إلغاء',
   'chat.permissionCard.reasonSubmit': 'رفض وإرسال',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'اضغط Enter لإرسال السبب',
   'chat.permissionCard.reasonError': 'تعذر إرسال الرفض. حاول مرة أخرى.',
   'chat.permissionCard.replaceAll': 'يستبدل كل التكرارات',
   'chat.compaction.running': 'جارٍ ضغط المحادثة',

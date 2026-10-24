@@ -3667,6 +3667,7 @@ export const dict = {
   'chat.permissionCard.reasonLabel': 'Reden voor weigering',
   'chat.permissionCard.reasonCancel': 'Annuleren',
   'chat.permissionCard.reasonSubmit': 'Weigeren en verzenden',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter om de reden te verzenden',
   'chat.permissionCard.reasonError': 'Weigering verzenden mislukt. Probeer opnieuw.',
   'chat.permissionCard.replaceAll': 'Vervangt elk voorkomen',
   'chat.compaction.running': 'Gesprek wordt ingekort',

@@ -3605,6 +3605,7 @@ export const dict = {
   'chat.permissionCard.reasonLabel': 'סיבת הדחייה',
   'chat.permissionCard.reasonCancel': 'ביטול',
   'chat.permissionCard.reasonSubmit': 'דחה ושלח',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter לשליחת הסיבה',
   'chat.permissionCard.reasonError': 'לא ניתן לשלוח את הדחייה. נסה שוב.',
   'chat.permissionCard.replaceAll': 'מחליף כל מופע',
   'chat.compaction.running': 'דוחס את השיחה',

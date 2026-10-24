@@ -152,6 +152,29 @@ for (const variant of ['inline', 'dock'] as const) {
       expect(calls).toEqual([['reject', 'Use a read-only command']]);
     });
 
+    test('Enter in the reason field submits without a newline or composer submit', async () => {
+      const { respond, calls } = responseRecorder();
+      const outerSubmit = () => outerCalls.push(true);
+      const outerCalls: boolean[] = [];
+      await act(async () => root.render(
+        <I18nProvider>
+          <form onSubmit={(event) => { event.preventDefault(); outerSubmit(); }}>
+            <PermissionActions permission={permission} variant={variant} isResponding={false} onRespond={respond} />
+          </form>
+        </I18nProvider>,
+      ));
+      await click('Deny with reason');
+      await typeReason('Use a read-only command');
+      await act(async () => {
+        textarea().dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter', bubbles: true, cancelable: true,
+        }));
+      });
+      expect(calls).toEqual([['reject', 'Use a read-only command']]);
+      expect(textarea().value).toBe('Use a read-only command');
+      expect(outerCalls).toHaveLength(0);
+    });
+
     test('failed submission retains the reason for retry', async () => {
       const { respond, calls } = responseRecorder(false, true);
       await render(respond);

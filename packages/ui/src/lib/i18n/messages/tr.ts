@@ -3686,6 +3686,7 @@ export const dict = {
   'chat.permissionCard.reasonLabel': 'Ret gerekçesi',
   'chat.permissionCard.reasonCancel': 'İptal',
   'chat.permissionCard.reasonSubmit': 'Reddet ve gönder',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Gerekçeyi göndermek için Enter',
   'chat.permissionCard.reasonError': 'Ret gönderilemedi. Tekrar deneyin.',
   'chat.permissionCard.replaceAll': 'Tüm eşleşmeleri değiştirir',
   'chat.compaction.running': 'Sohbet sıkıştırılıyor',

@@ -3689,6 +3689,7 @@ export const dict: Record<I18nKey, string> = {
   'chat.permissionCard.reasonLabel': 'Причина відмови',
   'chat.permissionCard.reasonCancel': 'Скасувати',
   'chat.permissionCard.reasonSubmit': 'Відхилити й надіслати',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter, щоб надіслати причину',
   'chat.permissionCard.reasonError': 'Не вдалося надіслати відмову. Спробуйте ще раз.',
   'chat.permissionCard.replaceAll': 'Замінює всі входження',
   'chat.compaction.running': 'Стискаємо розмову',

@@ -3689,6 +3689,7 @@ export const dict: Record<I18nKey, string> = {
   'chat.permissionCard.reasonLabel': '拒绝理由',
   'chat.permissionCard.reasonCancel': '取消',
   'chat.permissionCard.reasonSubmit': '拒绝并发送',
+  'chat.permissionCard.reasonSubmitShortcutAria': '按 Enter 发送拒绝理由',
   'chat.permissionCard.reasonError': '无法发送拒绝，请重试。',
   'chat.permissionCard.replaceAll': '替换所有匹配项',
   'chat.compaction.running': '正在压缩对话',

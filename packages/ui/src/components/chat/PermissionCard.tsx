@@ -12,6 +12,7 @@ import { useI18n, type I18nKey } from '@/lib/i18n';
 import { getVisiblePermissionPatterns } from './permissionCardPatterns';
 import { permissionFilePreviewsSchema } from './permissionFilePreviews';
 import { formatShortcutForDisplay } from '@/lib/shortcuts';
+import { isIMECompositionEvent } from '@/lib/ime';
 import { toolFileDiffs } from '@/lib/opencode/tools';
 import { getPermissionToolPresentation, getToolDisplayName } from './permissionToolPresentation';
 import { canSavePermission, describeSavePatterns, permissionSummaryMetadataSchema, summarizePermission, type PermissionTarget } from './permissionSummary';
@@ -389,6 +390,12 @@ export const PermissionActions: React.FC<{
           autoFocus
           value={reason}
           onChange={(event) => { setReason(event.target.value); setFailed(false); }}
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter' || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+            if (isIMECompositionEvent(event)) return;
+            event.preventDefault();
+            submitReason();
+          }}
           disabled={isResponding}
           className="oc-raised oc-field w-full min-h-20 rounded-md px-2 py-1.5 typography-meta"
           aria-invalid={failed || undefined}
@@ -396,8 +403,9 @@ export const PermissionActions: React.FC<{
         {failed ? <p role="alert" className="typography-meta text-[var(--status-error-text)]">{t('chat.permissionCard.reasonError')}</p> : null}
         <div className="flex justify-end gap-2">
           <Button type="button" variant="ghost" size="sm" disabled={isResponding} onClick={() => { setEditingReason(false); setFailed(false); }}>{t('chat.permissionCard.reasonCancel')}</Button>
-          <Button type="button" variant="destructive" size="sm" disabled={isResponding || !reason.trim()} onClick={submitReason}>
+          <Button type="button" variant="destructive" size="sm" disabled={isResponding || !reason.trim()} onClick={submitReason} title={t('chat.permissionCard.reasonSubmitShortcutAria')}>
             {t('chat.permissionCard.reasonSubmit')}
+            <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('enter')}</kbd>
           </Button>
         </div>
       </div>

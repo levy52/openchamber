@@ -3686,6 +3686,7 @@ export const dict = {
   'chat.permissionCard.reasonLabel': 'Grund für die Ablehnung',
   'chat.permissionCard.reasonCancel': 'Abbrechen',
   'chat.permissionCard.reasonSubmit': 'Ablehnen und senden',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter zum Senden des Grundes',
   'chat.permissionCard.reasonError': 'Ablehnung konnte nicht gesendet werden. Erneut versuchen.',
   'chat.permissionCard.replaceAll': 'Ersetzt jedes Vorkommen',
   'chat.compaction.running': 'Unterhaltung wird komprimiert',

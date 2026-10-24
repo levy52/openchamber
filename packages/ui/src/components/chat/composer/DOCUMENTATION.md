@@ -81,7 +81,12 @@ requests; both render the request through `PermissionRequestContent` and
 
 Permission reason controls use a plain container and explicit button clicks,
 never a nested form or submit button: the dock already sits inside the
-composer form, and a native submit can navigate away without sending the reply.
+composer form, and a nested submit bubbled to the composer's primary action.
+
+Enter in the reason field sends the denial, and Shift+Enter adds a newline.
+Ctrl/Cmd+Enter and Alt+Enter are left alone: the first has no meaning there,
+and the second would otherwise answer the request behind the user's back
+(the permission shortcuts ignore events from the reason controls).
 
 A read-only chat (a subagent session, an archived space) mounts no composer,
 so `ChatContainer` mounts `PermissionDock` and `FormDock` itself above the

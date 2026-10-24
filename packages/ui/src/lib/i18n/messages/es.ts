@@ -3689,6 +3689,7 @@ export const dict: Record<I18nKey, string> = {
   'chat.permissionCard.reasonLabel': 'Motivo de la denegación',
   'chat.permissionCard.reasonCancel': 'Cancelar',
   'chat.permissionCard.reasonSubmit': 'Denegar y enviar',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter para enviar el motivo',
   'chat.permissionCard.reasonError': 'No se pudo enviar la denegación. Inténtalo de nuevo.',
   'chat.permissionCard.replaceAll': 'Reemplaza todas las apariciones',
   'chat.compaction.running': 'Compactando la conversación',

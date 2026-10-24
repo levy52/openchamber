@@ -3667,6 +3667,7 @@ export const dict = {
   'chat.permissionCard.reasonLabel': 'Reason for denial',
   'chat.permissionCard.reasonCancel': 'Cancel',
   'chat.permissionCard.reasonSubmit': 'Deny and send',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter to send the reason',
   'chat.permissionCard.reasonError': 'Could not send the denial. Try again.',
   'chat.permissionCard.replaceAll': 'Replaces every occurrence',
   'chat.compaction.running': 'Compacting the conversation',

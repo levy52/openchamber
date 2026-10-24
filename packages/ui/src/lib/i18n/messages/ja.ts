@@ -3688,6 +3688,7 @@ export const dict: Record<I18nKey, string> = {
   'chat.permissionCard.reasonLabel': '拒否する理由',
   'chat.permissionCard.reasonCancel': 'キャンセル',
   'chat.permissionCard.reasonSubmit': '拒否して送信',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter で理由を送信',
   'chat.permissionCard.reasonError': '拒否を送信できませんでした。再試行してください。',
   'chat.permissionCard.replaceAll': 'すべての箇所を置き換えます',
   'chat.compaction.running': '会話を圧縮しています',

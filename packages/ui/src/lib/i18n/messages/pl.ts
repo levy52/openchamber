@@ -3693,6 +3693,7 @@ export const dict: Record<I18nKey, string> = {
   'chat.permissionCard.reasonLabel': 'Powód odmowy',
   'chat.permissionCard.reasonCancel': 'Anuluj',
   'chat.permissionCard.reasonSubmit': 'Odmów i wyślij',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Enter, aby wysłać powód',
   'chat.permissionCard.reasonError': 'Nie udało się wysłać odmowy. Spróbuj ponownie.',
   'chat.permissionCard.replaceAll': 'Zastępuje każde wystąpienie',
   'chat.compaction.running': 'Kompaktowanie rozmowy',

@@ -3687,6 +3687,7 @@ export const dict = {
   'chat.permissionCard.reasonLabel': 'Motif du refus',
   'chat.permissionCard.reasonCancel': 'Annuler',
   'chat.permissionCard.reasonSubmit': 'Refuser et envoyer',
+  'chat.permissionCard.reasonSubmitShortcutAria': 'Entrée pour envoyer le motif',
   'chat.permissionCard.reasonError': 'Impossible d’envoyer le refus. Réessayez.',
   'chat.permissionCard.replaceAll': 'Remplace toutes les occurrences',
   'chat.compaction.running': 'Compaction de la conversation',
