@@ -9,7 +9,9 @@ description: Use when creating or modifying OpenChamber UI text, labels, buttons
 
 User-facing UI text must go through `@/lib/i18n`; do not hardcode English strings in components.
 
-Use this skill for any React UI change that adds or edits visible text, accessible labels, placeholders, tooltips, toasts, dialogs, settings labels, navigation labels, or empty/error states.
+## What the text says
+
+UI text tells the person what they get and what to do: what an option gives them, what happened, what fixes it. Engineering reasons (layout jumps, races, what the code avoids) belong in code comments and commit messages. Example: "Shows the model's thinking as it arrives. When off, the block stays folded and opens with a click." An error names the known cause and the action ("reconnect the repository's account in Settings"), never a generic "something went wrong" when the cause is known; correcting such text is ordinary implementation work, not a product decision.
 
 ## Translate everything immediately (no English placeholders)
 
@@ -104,20 +106,25 @@ date
   : t('dialog.delete.description', { count })
 ```
 
-## What Counts As UI Text
+## Desktop Native Menus
 
-- Button and menu labels
-- Settings labels and descriptions
-- Placeholder text
-- Tooltip content
-- Dialog titles/descriptions/actions
-- Toast title/description/action labels
-- Empty/error/loading states
-- `aria-label`, `title`, image `alt` text when user-facing
+The Electron app menu and the right-click context menu are native, outside `@/lib/i18n`. Their labels live in `packages/electron/menu-locales.mjs` (`MENU_LOCALE_DICTIONARIES`, `CONTEXT_MENU_LABEL_DICTIONARIES`), keyed by the same locale codes as the UI. A new menu item gets its label in every locale there, and a new UI language gets its own entry there in the same change; `menu-locales.test.mjs` checks key parity.
 
-## Exceptions
+## Adding a UI Language
 
-Do not translate:
+A new locale code lands in all of these in one change:
+
+- `packages/ui/src/lib/i18n/runtime.ts`: the `Locale` union, `LOCALES`, `LOCALE_LABEL_KEYS`, and `normalizeLocale` (include legacy tags the platforms still send, such as `iw` for Hebrew). A right-to-left language also joins `RTL_LOCALES`; the layout side is owned by `rtl-layout`.
+- `store.ts` (lazy import), `intl.ts` (Intl tag), `bootstrap.ts` (startup strings), `messages.test.ts`.
+- `messages/<locale>.ts` and `messages/<locale>.settings.ts`, a `<locale>` block in every `messages/*.i18n.ts`, and a `common.language.<name>` label in every existing dictionary.
+- `packages/electron/menu-locales.mjs` (see above).
+- `packages/web/server/lib/opencode/settings-helpers.js` `UI_LOCALE_VALUES`: without it the server drops the saved choice. `packages/web/server/lib/walkthrough/languages.js` names the language for walkthrough prompts.
+
+## Translation Boundary
+
+Translate visible text, placeholders, tooltips, dialogs, toasts, empty/error/loading states, and user-facing `aria-label`, `title`, and `alt` text.
+
+Keep these literal:
 
 - Product names: `OpenChamber`, `OpenCode`, `GitHub`
 - Protocol/tool acronyms: `MCP`, `SSE`, `WebSocket`, `API`
@@ -125,10 +132,11 @@ Do not translate:
 - File paths, command names, environment variables
 - User/generated content
 
-## Review Checklist
+## Completion Criteria
 
 - No new hardcoded user-facing English in changed UI files.
-- Every new key exists in all dictionaries.
+- Every new key exists in all dictionaries with a real translation, including `packages/electron/menu-locales.mjs` for native menu labels.
+- All translated values are resolved inside a reactive render/hook boundary.
 - No locale state added to broad/shared stores.
 - No full app remount for locale changes.
 - Locale switch preserves current UI state.

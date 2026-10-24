@@ -7,6 +7,7 @@ import { EXIT_CODE, TunnelCliError } from './cli-errors.js';
 import { getDataDir } from './cli-paths.js';
 import { hasUiPasswordConfigured } from './cli-network.js';
 import { searchPathFor } from './cli-executables.js';
+import { injectedEnvKeys } from '../../server/lib/injected-env.js';
 
 const STARTUP_SERVICE_ID = 'dev.openchamber.web';
 
@@ -74,10 +75,17 @@ function getMacosStartupWrapperPath() {
   return path.join(getDataDir(), 'bin', 'OpenChamber');
 }
 
+function getWindowsStartupWrapperPath() {
+  return path.join(getDataDir(), 'bin', 'OpenChamber.ps1');
+}
+
 function collectStartupEnv(options = {}) {
+  // Variables OpenChamber itself put into this shell (the desktop app's
+  // terminal, an agent's shell) describe that instance, not the service.
+  const injected = injectedEnvKeys(process.env);
   const env = options.envSnapshot === false ? {} : Object.fromEntries(
     Object.entries(process.env)
-      .filter(([key, value]) => shouldPersistStartupEnv(key, value))
+      .filter(([key, value]) => !injected.has(key) && shouldPersistStartupEnv(key, value))
       .map(([key, value]) => [key, String(value)])
   );
 
@@ -156,15 +164,37 @@ function removeStartupEnvFile() {
   try { fs.unlinkSync(getStartupEnvFilePath()); } catch {}
 }
 
+const PNPM_STORE_SEGMENT = `${path.sep}.pnpm${path.sep}`;
+const PACKAGE_SEGMENT = `${path.sep}node_modules${path.sep}@openchamber${path.sep}web${path.sep}`;
+
+// pnpm keeps every installed version in its own store directory and links the
+// current one into node_modules. A startup service pointed at the store path
+// keeps launching the old version after an update, so prefer the link.
+function stablePnpmEntrypoint(resolved, exists = fs.existsSync) {
+  const storeIndex = resolved.indexOf(PNPM_STORE_SEGMENT);
+  if (storeIndex < 0) return null;
+  const packageIndex = resolved.indexOf(PACKAGE_SEGMENT, storeIndex);
+  if (packageIndex < 0) return null;
+  const stable = path.join(
+    resolved.slice(0, storeIndex),
+    '@openchamber',
+    'web',
+    resolved.slice(packageIndex + PACKAGE_SEGMENT.length),
+  );
+  return exists(stable) ? stable : null;
+}
+
 function resolveCliEntrypoint() {
   const entry = typeof process.argv[1] === 'string' && process.argv[1].trim().length > 0
     ? process.argv[1]
     : path.join(__dirname, 'cli.js');
+  let resolved;
   try {
-    return fs.realpathSync(entry);
+    resolved = fs.realpathSync(entry);
   } catch {
     return path.resolve(entry);
   }
+  return stablePnpmEntrypoint(resolved) ?? resolved;
 }
 
 function buildStartupArgs(options = {}) {
@@ -189,6 +219,24 @@ exec ${startupShellQuote(process.execPath)} ${args}
   return wrapperPath;
 }
 
+function writeWindowsStartupWrapper(options = {}) {
+  const wrapperPath = getWindowsStartupWrapperPath();
+  const envFilePath = getStartupEnvFilePath();
+  const startupArgs = buildStartupArgs(options).map(powershellQuote).join(' ');
+  const ps1Content = [
+    `$envFile=${powershellQuote(envFilePath)}`,
+    `if (Test-Path $envFile) { Get-Content $envFile | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { $v=$matches[2]; if ($v.StartsWith("'") -and $v.EndsWith("'")) { $v=$v.Substring(1,$v.Length-2).Replace("'\\''","'") }; [Environment]::SetEnvironmentVariable($matches[1], $v, 'Process') } } }`,
+    `& ${powershellQuote(process.execPath)} ${startupArgs}`,
+  ].join('; ');
+  fs.mkdirSync(path.dirname(wrapperPath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(wrapperPath, ps1Content, { mode: 0o700 });
+  return wrapperPath;
+}
+
+function buildWindowsStartupTaskCommand(wrapperPath) {
+  return `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${wrapperPath}"`;
+}
+
 function buildMacosLaunchAgent(options = {}) {
   const wrapperPath = writeMacosStartupWrapper(options);
   const args = [wrapperPath];
@@ -208,9 +256,7 @@ function buildMacosLaunchAgent(options = {}) {
   <array>
 ${argXml}
   </array>
-${envXml}  <key>ProcessType</key>
-  <string>Background</string>
-  <key>RunAtLoad</key>
+${envXml}  <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
@@ -239,6 +285,8 @@ ExecStart="${systemdEscapeArg(process.execPath)}" ${args}
 WorkingDirectory=${systemdUnitPath(os.homedir())}
 Restart=always
 RestartSec=5
+# A graceful shutdown on SIGTERM exits 143; a stop is not a failure.
+SuccessExitStatus=143
 
 [Install]
 WantedBy=default.target
@@ -261,6 +309,52 @@ function runStartupCommand(command, args, options = {}) {
   return result;
 }
 
+function parseLingerState(stdout) {
+  if (typeof stdout !== 'string') {
+    return null;
+  }
+  const match = stdout.match(/^Linger=([A-Za-z]+)\s*$/m);
+  if (!match) {
+    return null;
+  }
+  const value = match[1].toLowerCase();
+  if (value === 'yes') return true;
+  if (value === 'no') return false;
+  return null;
+}
+
+function getCurrentUsername() {
+  try {
+    const name = os.userInfo().username;
+    if (typeof name === 'string' && name.length > 0) {
+      return name;
+    }
+  } catch {
+    // userInfo() can throw when the uid has no passwd entry; fall back to env.
+  }
+  return process.env.USER || process.env.LOGNAME || '';
+}
+
+// A systemd --user service only keeps running without an active login session
+// when the user has lingering enabled. Detect it so `startup enable` can warn
+// that the service may otherwise stop on logout. Returns null when the state
+// cannot be determined (no username, loginctl unavailable, or odd output).
+function getUserLingerEnabled(user) {
+  if (!user) {
+    return null;
+  }
+  let result;
+  try {
+    result = runStartupCommand('loginctl', ['show-user', user, '-p', 'Linger'], { allowFailure: true });
+  } catch {
+    return null;
+  }
+  if (result.status !== 0) {
+    return null;
+  }
+  return parseLingerState(result.stdout);
+}
+
 function getStartupStatus() {
   const paths = getStartupServicePaths();
   if (!paths.servicePath) {
@@ -274,6 +368,7 @@ function getStartupStatus() {
     const enabledResult = runStartupCommand('systemctl', ['--user', 'is-enabled', 'openchamber.service'], { allowFailure: true });
     const activeResult = runStartupCommand('systemctl', ['--user', 'is-active', 'openchamber.service'], { allowFailure: true });
     const activeState = (activeResult.stdout || '').trim() || 'inactive';
+    const lingerUser = getCurrentUsername();
     return {
       supported: true,
       platform: paths.platform,
@@ -281,6 +376,8 @@ function getStartupStatus() {
       active: activeState === 'active',
       activeState,
       servicePath: paths.servicePath,
+      lingerEnabled: getUserLingerEnabled(lingerUser),
+      lingerUser: lingerUser || null,
     };
   }
   return {
@@ -318,21 +415,16 @@ function enableStartupService(options = {}) {
     return getStartupStatus();
   }
 
-  const envFilePath = writeStartupEnvFile(options);
-  const startupArgs = buildStartupArgs(options).map(powershellQuote).join(', ');
-  const powerShellCommand = [
-    `$envFile=${powershellQuote(envFilePath)}`,
-    `if (Test-Path $envFile) { Get-Content $envFile | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { $v=$matches[2]; if ($v.StartsWith("'") -and $v.EndsWith("'")) { $v=$v.Substring(1,$v.Length-2).Replace("'\\''","'") }; [Environment]::SetEnvironmentVariable($matches[1], $v, 'Process') } } }`,
-    `& ${powershellQuote(process.execPath)} ${startupArgs}`,
-  ].join('; ');
-  const taskArgs = `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "${powerShellCommand.replace(/"/g, '\\"')}"`;
+  writeStartupEnvFile(options);
+  const wrapperPath = writeWindowsStartupWrapper(options);
+  const taskCommand = buildWindowsStartupTaskCommand(wrapperPath);
   runStartupCommand('schtasks.exe', [
     '/Create',
     '/TN', STARTUP_SERVICE_ID,
     '/SC', 'ONLOGON',
     '/RL', 'LIMITED',
     '/F',
-    '/TR', taskArgs,
+    '/TR', taskCommand,
   ]);
   runStartupCommand('schtasks.exe', ['/Run', '/TN', STARTUP_SERVICE_ID], { allowFailure: true });
   return getStartupStatus();
@@ -359,12 +451,17 @@ function disableStartupService() {
 
   runStartupCommand('schtasks.exe', ['/End', '/TN', STARTUP_SERVICE_ID], { allowFailure: true });
   runStartupCommand('schtasks.exe', ['/Delete', '/TN', STARTUP_SERVICE_ID, '/F'], { allowFailure: true });
+  try { fs.unlinkSync(getWindowsStartupWrapperPath()); } catch {}
+  removeStartupEnvFile();
   return getStartupStatus();
 }
 
 
 export {
+  stablePnpmEntrypoint,
+  buildSystemdUserService,
   getStartupStatus,
   enableStartupService,
   disableStartupService,
+  buildWindowsStartupTaskCommand,
 };

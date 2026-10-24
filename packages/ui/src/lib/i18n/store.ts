@@ -30,6 +30,8 @@ async function loadDictionary(locale: Locale): Promise<I18nDictionary> {
     ? await import('./messages/zh-CN') as { dict: I18nDictionary }
     : locale === 'fr'
       ? await import('./messages/fr') as { dict: I18nDictionary }
+      : locale === 'nl'
+        ? await import('./messages/nl') as { dict: I18nDictionary }
     : locale === 'zh-TW'
       ? await import('./messages/zh-TW') as { dict: I18nDictionary }
       : locale === 'es'
@@ -46,7 +48,13 @@ async function loadDictionary(locale: Locale): Promise<I18nDictionary> {
                   ? await import('./messages/de') as { dict: I18nDictionary }
                   : locale === 'ja'
                     ? await import('./messages/ja') as { dict: I18nDictionary }
-                    : { dict: enDict };
+                    : locale === 'tr'
+                      ? await import('./messages/tr') as { dict: I18nDictionary }
+                      : locale === 'ar'
+                        ? await import('./messages/ar')
+                        : locale === 'he'
+                          ? await import('./messages/he')
+                          : { dict: enDict };
   dictionaries.set(locale, mod.dict);
   return mod.dict;
 }

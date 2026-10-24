@@ -1,6 +1,7 @@
 import React from 'react';
 import { UsageCard } from './UsageCard';
 import { QuotaCredentials } from './QuotaCredentials';
+import { ClaudeCodeSignIn } from './ClaudeCodeSignIn';
 import { QUOTA_PROVIDERS } from '@/lib/quota';
 import { useQuotaAutoRefresh, useQuotaStore } from '@/stores/useQuotaStore';
 import { updateDesktopSettings } from '@/lib/persistence';
@@ -14,6 +15,8 @@ import type { UsageWindows, QuotaProviderId } from '@/types';
 import { getAllModelFamilies, getDisplayModelName, sortModelFamilies, groupModelsByFamilyWithGetter } from '@/lib/quota/model-families';
 import { Icon } from "@/components/icon/Icon";
 import { useI18n } from '@/lib/i18n';
+import { useWaitingBlink } from '@/hooks/useDurationTicker';
+import { cn } from '@/lib/utils';
 import { formatTimeForPreference } from '@/lib/timeFormat';
 import { useUIStore, type TimeFormatPreference } from '@/stores/useUIStore';
 import { SettingsPageLayout } from '@/components/sections/shared/SettingsPageLayout';
@@ -44,9 +47,11 @@ export const UsagePage: React.FC = () => {
   const setSelectedProvider = useQuotaStore((state) => state.setSelectedProvider);
   const loadSettings = useQuotaStore((state) => state.loadSettings);
   const fetchAllQuotas = useQuotaStore((state) => state.fetchAllQuotas);
+  const fetchProviderQuota = useQuotaStore((state) => state.fetchProviderQuota);
   const isLoading = useQuotaStore((state) => state.isLoading);
+  const blink = useWaitingBlink(isLoading);
   const lastUpdated = useQuotaStore((state) => state.lastUpdated);
-  const error = useQuotaStore((state) => state.error);
+  const refreshErrors = useQuotaStore((state) => state.refreshErrors);
   const dropdownProviderIds = useQuotaStore((state) => state.dropdownProviderIds);
   const setDropdownProviderIds = useQuotaStore((state) => state.setDropdownProviderIds);
   const selectedModels = useQuotaStore((state) => state.selectedModels);
@@ -76,11 +81,21 @@ export const UsagePage: React.FC = () => {
   const providerMeta = QUOTA_PROVIDERS.find((provider) => provider.id === selectedProviderId);
   const providerName = providerMeta?.name ?? selectedProviderId ?? t('settings.usage.sidebar.title');
   const usage = selectedResult?.usage;
-  const selectedProviderError = selectedResult?.configured && !selectedResult.ok
-    ? selectedResult.error
-    : null;
+  const refreshError = selectedProviderId ? refreshErrors[selectedProviderId] : undefined;
+  const selectedProviderError = refreshError
+    ? usage
+      ? t('header.services.usageRefreshFailedStale', { error: refreshError })
+      : refreshError
+    : selectedResult?.configured && !selectedResult.ok
+      ? selectedResult.error
+      : null;
   const showInDropdown = selectedProviderId ? dropdownProviderIds.includes(selectedProviderId) : false;
-  const hasCredentialsForm = selectedProviderId === 'opencode-go' || selectedProviderId === 'ollama-cloud' || selectedProviderId === 'cursor';
+  const credentialProviderId = selectedProviderId === 'exe-dev'
+    || selectedProviderId === 'cursor'
+    || selectedProviderId === 'zenmux'
+    ? selectedProviderId
+    : null;
+  const hasCredentialsForm = credentialProviderId !== null;
   const handleDropdownToggle = React.useCallback((enabled: boolean) => {
     if (!selectedProviderId) {
       return;
@@ -150,7 +165,7 @@ export const UsagePage: React.FC = () => {
   if (!selectedProviderId) {
     return (
         <div className="flex h-full items-center justify-center text-muted-foreground">
-        <p className="typography-body">{t('settings.usage.page.empty.selectProvider')}</p>
+        <p className="typography-ui-label">{t('settings.usage.page.empty.selectProvider')}</p>
       </div>
     );
   }
@@ -161,20 +176,25 @@ export const UsagePage: React.FC = () => {
       titleLeading={<ProviderLogo providerId={selectedProviderId} className="h-5 w-5 shrink-0" />}
       description={
         isLoading ? (
-          <span className="animate-pulse typography-settings-description text-muted-foreground">{t('settings.usage.page.header.refreshing')}</span>
+          <span className={cn('typography-settings-description text-muted-foreground', blink)}>{t('settings.usage.page.header.refreshing')}</span>
+        ) : selectedResult?.planLabel ? (
+          t('settings.usage.page.header.lastUpdatedWithPlan', {
+            plan: selectedResult.planLabel,
+            time: formatTime(lastUpdated, timeFormatPreference),
+          })
         ) : (
           t('settings.usage.page.header.lastUpdated', { time: formatTime(lastUpdated, timeFormatPreference) })
         )
       }
       showSaveStatus
     >
-      <SettingsSection divider={false} settingsItem="usage.header-menu">
+      <SettingsSection divider={false} settingsItem="usage.work-status-panel">
         <SettingsCheckboxRow
           checked={showInDropdown}
           onChange={handleDropdownToggle}
-          label={t('settings.usage.page.options.showInHeader')}
-          ariaLabel={t('settings.usage.page.options.showInHeaderAria')}
-          info={t('settings.usage.page.options.showInHeaderTooltip')}
+          label={t('settings.usage.page.options.showInWorkStatus')}
+          ariaLabel={t('settings.usage.page.options.showInWorkStatusAria')}
+          info={t('settings.usage.page.options.showInWorkStatusTooltip')}
         />
       </SettingsSection>
 
@@ -182,32 +202,46 @@ export const UsagePage: React.FC = () => {
         <p className="typography-ui-label text-foreground pb-8">{t('settings.usage.page.state.noData')}</p>
       )}
 
-      {(error || selectedProviderError) && (
-        <div className="mb-8 rounded-lg border border-[var(--status-error-border)] bg-[var(--status-error-background)] px-4 py-3">
+      {/* Only the selected provider's own failure belongs in its panel. The
+          store's global `error` is whichever provider failed first and has no
+          UI consumer left; shown here it labeled DeepSeek with Claude's
+          rate-limit message. */}
+      {selectedProviderError && (
+        <div className="mb-8 rounded-lg bg-[var(--status-error-background)] px-4 py-3">
           <p className="typography-ui-label font-medium text-[var(--status-error)]">{t('settings.usage.page.state.refreshFailedTitle')}</p>
-          <p className="typography-meta text-[var(--status-error)]/80 mt-1">{error ?? selectedProviderError}</p>
+          <p className="typography-meta text-[var(--status-error)]/80 mt-1">{selectedProviderError}</p>
         </div>
       )}
 
       {/* Providers with an inline credentials form don't need the "go to Providers" banner — the form IS the fix. */}
       {selectedResult && !selectedResult.configured && !hasCredentialsForm && (
-        <div className="mb-8 rounded-lg border border-[var(--status-warning-border)] bg-[var(--status-warning-background)] px-4 py-3">
-          <p className="typography-ui-label font-medium text-[var(--status-warning)]">{t('settings.usage.page.state.providerNotConfiguredTitle')}</p>
-          <p className="typography-meta text-[var(--status-warning)]/80 mt-1">
-            {t('settings.usage.page.state.providerNotConfiguredDescription')}
-          </p>
+        <div className="mb-8 rounded-lg bg-[var(--status-warning-background)] px-4 py-3">
+          {/* Claude usage comes from Claude Code's own login, which Providers cannot add. */}
+          {selectedProviderId === 'claude' ? (
+            <>
+              <p className="typography-ui-label font-medium text-[var(--status-warning)]">{t('settings.usage.page.state.claudeSignedOutTitle')}</p>
+              <ClaudeCodeSignIn onSignedIn={() => void fetchProviderQuota('claude')} />
+            </>
+          ) : (
+            <>
+              <p className="typography-ui-label font-medium text-[var(--status-warning)]">{t('settings.usage.page.state.providerNotConfiguredTitle')}</p>
+              <p className="typography-meta text-[var(--status-warning)]/80 mt-1">
+                {t('settings.usage.page.state.providerNotConfiguredDescription')}
+              </p>
+            </>
+          )}
         </div>
       )}
 
-      {(selectedProviderId === 'opencode-go' || selectedProviderId === 'ollama-cloud' || selectedProviderId === 'cursor') && (
-        <QuotaCredentials providerId={selectedProviderId} providerName={providerName} />
+      {credentialProviderId && (
+        <QuotaCredentials providerId={credentialProviderId} providerName={providerName} />
       )}
 
       {usage?.windows && Object.keys(usage.windows).length > 0 && (
         <SettingsSection settingsItem="usage.model-quotas">
           <div className="divide-y divide-[var(--surface-subtle)]">
             {Object.entries(usage.windows).map(([label, window]) => (
-              <UsageCard key={label} title={label} window={window} />
+              <UsageCard key={label} title={label} window={window} providerId={selectedProviderId} />
             ))}
           </div>
         </SettingsSection>
@@ -231,7 +265,7 @@ export const UsagePage: React.FC = () => {
                   onOpenChange={() => toggleFamilyCollapsed(family.id)}
                 >
                   <CollapsibleTrigger className="flex w-full items-center justify-between py-0.5 group">
-                    <div className="flex items-center gap-1.5 text-left">
+                    <div className="flex items-center gap-1.5 text-start">
                       <span className="typography-ui-label font-normal text-foreground">{family.label}</span>
                       <span className="typography-micro text-muted-foreground">
                         ({familyModels.length})
@@ -283,7 +317,7 @@ export const UsagePage: React.FC = () => {
                   onOpenChange={() => toggleFamilyCollapsed('other')}
                 >
                   <CollapsibleTrigger className="flex w-full items-center justify-between py-0.5 group">
-                    <div className="flex items-center gap-1.5 text-left">
+                    <div className="flex items-center gap-1.5 text-start">
                       <span className="typography-ui-label font-normal text-foreground">{t('settings.usage.page.section.otherModels')}</span>
                       <span className="typography-micro text-muted-foreground">
                         ({otherModels.length})

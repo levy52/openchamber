@@ -1,15 +1,24 @@
-export type UiFontOption = 'inter' | 'geist-sans' | 'atkinson-hyperlegible' | 'source-sans-3' | 'roboto' | 'noto-sans' | 'dm-sans' | 'manrope' | 'system';
+export type UiFontOption = 'inter' | 'fixel' | 'geist-sans' | 'atkinson-hyperlegible' | 'source-sans-3' | 'roboto' | 'noto-sans' | 'dm-sans' | 'manrope' | 'system' | 'custom';
 
-export type MonoFontOption = 'jetbrains-mono' | 'fira-code' | 'geist-mono' | 'commit-mono' | 'source-code-pro' | 'cascadia-code' | 'roboto-mono' | 'iosevka' | 'system-mono';
+export type MonoFontOption = 'jetbrains-mono' | 'fira-code' | 'geist-mono' | 'commit-mono' | 'source-code-pro' | 'cascadia-code' | 'roboto-mono' | 'iosevka' | 'system-mono' | 'custom';
 
-export interface FontFaceSource {
+interface FontFaceSourceBase {
     family: string;
-    packageName: string;
-    filePrefix: string;
     weights: number[];
 }
 
-export interface FontOptionDefinition<T extends string> {
+interface FontsourceFaceSource extends FontFaceSourceBase {
+    packageName: string;
+    filePrefix: string;
+}
+
+interface DirectFontFaceSource extends FontFaceSourceBase {
+    urls: Record<number, string>;
+}
+
+export type FontFaceSource = FontsourceFaceSource | DirectFontFaceSource;
+
+interface FontOptionDefinition<T extends string> {
     id: T;
     label: string;
     description: string;
@@ -25,6 +34,21 @@ export const UI_FONT_OPTIONS: FontOptionDefinition<UiFontOption>[] = [
         description: 'Modern UI sans with excellent readability at small sizes.',
         stack: '"Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
         source: { family: 'Inter', packageName: '@fontsource/inter', filePrefix: 'inter', weights: [400, 500, 600] }
+    },
+    {
+        id: 'fixel',
+        label: 'Fixel Text',
+        description: 'Humanist geometric sans-serif with full Ukrainian support.',
+        stack: '"Fixel Text", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        source: {
+            family: 'Fixel Text',
+            weights: [400, 500, 600],
+            urls: {
+                400: 'https://cdn.jsdelivr.net/gh/MacPaw/Fixel@f6ee910e98add47e830db87f1a754130506c11a2/fonts/webfonts/FixelText-Regular.woff2',
+                500: 'https://cdn.jsdelivr.net/gh/MacPaw/Fixel@f6ee910e98add47e830db87f1a754130506c11a2/fonts/webfonts/FixelText-Medium.woff2',
+                600: 'https://cdn.jsdelivr.net/gh/MacPaw/Fixel@f6ee910e98add47e830db87f1a754130506c11a2/fonts/webfonts/FixelText-SemiBold.woff2'
+            }
+        }
     },
     {
         id: 'geist-sans',
@@ -79,7 +103,7 @@ export const UI_FONT_OPTIONS: FontOptionDefinition<UiFontOption>[] = [
         id: 'system',
         label: 'System',
         description: 'Native operating system interface font.',
-        stack: '"SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'
+        stack: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'
     }
 ];
 
@@ -157,8 +181,21 @@ export const CODE_FONT_OPTION_MAP = buildFontMap(CODE_FONT_OPTIONS);
 export const DEFAULT_UI_FONT: UiFontOption = 'system';
 export const DEFAULT_MONO_FONT: MonoFontOption = 'system-mono';
 
+/** The option that uses a font installed on this device, named by the user. */
+export const CUSTOM_FONT_ID = 'custom';
+
 export const isUiFontOption = (value: unknown): value is UiFontOption =>
-    typeof value === 'string' && value in UI_FONT_OPTION_MAP;
+    value === CUSTOM_FONT_ID || (typeof value === 'string' && value in UI_FONT_OPTION_MAP);
 
 export const isMonoFontOption = (value: unknown): value is MonoFontOption =>
-    typeof value === 'string' && value in CODE_FONT_OPTION_MAP;
+    value === CUSTOM_FONT_ID || (typeof value === 'string' && value in CODE_FONT_OPTION_MAP);
+
+/**
+ * A stack that tries the named font first, then `fallback` (the system font),
+ * so a name that is not installed still renders. Quotes and characters that
+ * could end the CSS value are dropped from the name.
+ */
+export const customFontStack = (name: string, fallback: string): string => {
+    const family = name.replace(/["'\\;{}<>]/g, '').trim();
+    return family ? `"${family}", ${fallback}` : fallback;
+};

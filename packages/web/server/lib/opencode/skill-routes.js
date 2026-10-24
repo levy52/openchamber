@@ -1,5 +1,20 @@
-import { createOpencodeClient } from '@opencode-ai/sdk/v2';
-import { buildDeferredRestartResponse } from './config-mutation-response.js';
+import { OpenCode } from '@opencode/client';
+import { buildAppliedResponse } from './config-mutation-response.js';
+import { OPENCODE_CONFIG_DIR } from './shared.js';
+import { skillSwitchRequestSchema } from './config-v2.js';
+import { setSkillEnabled } from './skill-switch.js';
+import { asNonEmptyString } from '../shared/guards.js';
+import { appendInstalledSources, isInstalledFromSource, readInstalledSources, removeInstalledSources } from '../skills-catalog/installed-sources.js';
+
+/**
+ * Matches how OpenCode reads its own boolean env flags: any value other than
+ * unset, empty, "0" or "false" enables the flag.
+ */
+const isEnvFlagEnabled = (value) => {
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized.length > 0 && normalized !== '0' && normalized !== 'false';
+};
 
 export const registerSkillRoutes = (app, dependencies) => {
   const {
@@ -30,17 +45,78 @@ export const registerSkillRoutes = (app, dependencies) => {
     SKILL_DIR,
     getCuratedSkillsSources,
     getCacheKey,
-    getCachedScan,
-    setCachedScan,
+    scanWithCache,
     parseSkillRepoSource,
     scanSkillsRepository,
     installSkillsFromRepository,
-    scanClawdHubPage,
-    installSkillsFromClawdHub,
-    isClawdHubSource,
+    fetchGitHubRepoMetas,
     getProfiles,
     getProfile,
+    createHttpsCredentialReference,
+    resolveSourceControlAccount,
+    credentialResolver,
   } = dependencies;
+
+  const resolveCatalogGitIdentity = async (identityId, source) => {
+    if (!identityId || identityId === 'global') return { ok: true, identity: null };
+
+    const profile = getProfile(identityId);
+    if (!profile) {
+      return { ok: false, error: { kind: 'authRequired', message: 'Selected Git identity is unavailable' } };
+    }
+
+    const transport = profile.transport ?? 'system';
+    if (transport === 'system') return { ok: true, identity: null };
+    if (transport === 'anonymous') return { ok: true, identity: { anonymous: true, transport } };
+
+    const parsed = parseSkillRepoSource(source);
+    if (!parsed.ok) return { ok: true, identity: null };
+
+    if (transport === 'ssh') {
+      return {
+        ok: true,
+        identity: {
+          transport,
+          credentialId: profile.sshCredentialId,
+          endpoint: parsed.cloneUrlSsh,
+        },
+      };
+    }
+
+    if (transport === 'account' && profile.account && resolveSourceControlAccount && createHttpsCredentialReference) {
+      const account = await resolveSourceControlAccount(profile.account);
+      if (account?.credentialId !== profile.account.accountId
+        || account.status !== 'valid'
+        || !Number.isSafeInteger(account.credentialRevision)
+        || account.credentialRevision < 1) {
+        return { ok: false, error: { kind: 'authRequired', message: 'Selected Git identity is unavailable' } };
+      }
+
+      let credentialId;
+      try {
+        credentialId = createHttpsCredentialReference({
+          provider: profile.account.provider,
+          instance: profile.account.instance,
+          credentialId: account.credentialId,
+          credentialRevision: account.credentialRevision,
+          providerUserId: account.providerUserId,
+        });
+      } catch {
+        return { ok: false, error: { kind: 'authRequired', message: 'Selected Git identity is unavailable' } };
+      }
+
+      return {
+        ok: true,
+        identity: {
+          transport: 'https',
+          credentialId,
+          endpoint: parsed.cloneUrlHttps,
+        },
+      };
+    }
+
+    return { ok: false, error: { kind: 'authRequired', message: 'Selected Git identity is unavailable' } };
+  };
 
   const findWorktreeRootForSkills = (workingDirectory) => {
     if (!workingDirectory) return null;
@@ -79,7 +155,10 @@ export const registerSkillRoutes = (app, dependencies) => {
     return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
   };
 
-  const inferSkillScopeAndSourceFromPath = (skillPath, workingDirectory) => {
+  // `projectAncestors` is `getSkillProjectAncestors(workingDirectory)`, worked
+  // out once per list: it probes the disk up to the repository root, and a
+  // list has hundreds of skills.
+  const inferSkillScopeAndSourceFromPath = (skillPath, projectAncestors) => {
     const resolvedPath = typeof skillPath === 'string' ? path.resolve(skillPath) : '';
     const home = os.homedir();
     const source = resolvedPath.includes(`${path.sep}.agents${path.sep}skills${path.sep}`)
@@ -88,7 +167,6 @@ export const registerSkillRoutes = (app, dependencies) => {
         ? 'claude'
         : 'opencode';
 
-    const projectAncestors = getSkillProjectAncestors(workingDirectory);
     const isProjectScoped = projectAncestors.some((ancestor) => {
       const candidates = [
         path.join(ancestor, '.opencode'),
@@ -103,7 +181,7 @@ export const registerSkillRoutes = (app, dependencies) => {
     }
 
     const userRoots = [
-      path.join(home, '.config', 'opencode'),
+      OPENCODE_CONFIG_DIR,
       path.join(home, '.opencode'),
       path.join(home, '.claude', 'skills'),
       path.join(home, '.agents', 'skills'),
@@ -117,31 +195,43 @@ export const registerSkillRoutes = (app, dependencies) => {
     return { scope: SKILL_SCOPE.USER, source };
   };
 
+  // Returns null when OpenCode's list could not be read (not running, error,
+  // timeout, malformed payload) so callers can tell a failed fetch from a
+  // genuinely empty list.
   const fetchOpenCodeDiscoveredSkills = async (workingDirectory) => {
     if (!getOpenCodePort()) {
-      return [];
+      return null;
     }
 
     try {
-      const client = createOpencodeClient({
+      const client = OpenCode.make({
         baseUrl: buildOpenCodeUrl('/', '').replace(/\/$/, ''),
-        directory: workingDirectory || undefined,
-        headers: getOpenCodeAuthHeaders(),
-        fetch: (request) => fetch(request, { signal: AbortSignal.timeout(8_000) }),
+        headers: {
+          ...getOpenCodeAuthHeaders(),
+          // v2 scopes a request with a header, not a `directory` option, and
+          // rejects non-ASCII header values, so the path is percent-encoded.
+          ...(workingDirectory ? { 'x-opencode-directory': encodeURIComponent(workingDirectory) } : {}),
+        },
+        fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(8_000) }),
       });
 
-      const response = await client.app.skills(
-        workingDirectory ? { directory: workingDirectory } : undefined,
-      );
+      const response = await client.skill.list();
       const payload = response?.data;
       if (!Array.isArray(payload)) {
-        return [];
+        return null;
       }
 
+      const projectAncestors = getSkillProjectAncestors(workingDirectory);
       return payload
         .map((item) => {
           const name = typeof item?.name === 'string' ? item.name.trim() : '';
-          const location = typeof item?.location === 'string' ? item.location : '';
+          // OpenCode v1's skill payload used `location`; v2 renamed the field
+          // to `path`. Accept both, or the whole authoritative list is dropped
+          // and the panel falls back to the (smaller) local disk scan.
+          const rawLocation = typeof item?.path === 'string' ? item.path : (typeof item?.location === 'string' ? item.location : '');
+          // v1 marked built-in skills with `<built-in>`; v2 gives them a synthetic
+          // `/builtin/<id>.md` path. Normalize so they stay read-only in the panel.
+          const location = rawLocation.startsWith('/builtin/') ? '<built-in>' : rawLocation;
           const description = typeof item?.description === 'string' ? item.description : '';
           const content = typeof item?.content === 'string' ? item.content : '';
           if (!name || !location) {
@@ -149,6 +239,9 @@ export const registerSkillRoutes = (app, dependencies) => {
           }
           if (location === '<built-in>') {
             return {
+              // The path no longer carries the id, and a built-in's id can
+              // differ from its name (`opencode` / `OpenCode`); policies name the id.
+              id: asNonEmptyString(item?.id) ?? name,
               name,
               path: location,
               scope: SKILL_SCOPE.USER,
@@ -157,7 +250,7 @@ export const registerSkillRoutes = (app, dependencies) => {
               content,
             };
           }
-          const inferred = inferSkillScopeAndSourceFromPath(location, workingDirectory);
+          const inferred = inferSkillScopeAndSourceFromPath(location, projectAncestors);
           const skill = {
             name,
             path: location,
@@ -173,7 +266,7 @@ export const registerSkillRoutes = (app, dependencies) => {
         .filter(Boolean);
     } catch (error) {
       console.error('Failed to list OpenCode skills:', error);
-      return [];
+      return null;
     }
   };
 
@@ -184,22 +277,6 @@ export const registerSkillRoutes = (app, dependencies) => {
     } catch {
       return [];
     }
-  };
-
-  const resolveGitIdentity = (profileId) => {
-    if (!profileId) {
-      return null;
-    }
-    try {
-      const profile = getProfile(profileId);
-      const sshKey = profile?.sshKey;
-      if (typeof sshKey === 'string' && sshKey.trim()) {
-        return { sshKey: sshKey.trim() };
-      }
-    } catch {
-      // ignore
-    }
-    return null;
   };
 
   // Prefer an explicit request directory, then soft-fallback to the active
@@ -233,13 +310,19 @@ export const registerSkillRoutes = (app, dependencies) => {
         return res.status(400).json({ error });
       }
       const openCodeSkills = await fetchOpenCodeDiscoveredSkills(directory);
-      const localSkills = discoverSkills(directory);
-      const skills = mergeDiscoveredSkills(openCodeSkills, localSkills);
+      const parsedFiles = new Map();
+      const localSkills = await discoverSkills(directory, { parsedFiles });
+      const skills = mergeDiscoveredSkills(openCodeSkills ?? [], localSkills);
 
-      const enrichedSkills = skills.map((skill) => {
-        const sources = getSkillSources(skill.name, directory, skill);
+      // One skill at a time: each await hands the event loop back, so other
+      // requests are served while hundreds of skills are read.
+      const enrichedSkills = [];
+      for (const skill of skills) {
+        // The list carries no supporting files; the skill page reads them
+        // from GET /api/config/skills/:name.
+        const sources = await getSkillSources(skill.name, directory, skill, { includeSupportingFiles: false, parsedFiles });
         const skillPath = typeof skill.path === 'string' ? skill.path : null;
-        return {
+        enrichedSkills.push({
           ...skill,
           sources,
           renamable: Boolean(
@@ -247,13 +330,56 @@ export const registerSkillRoutes = (app, dependencies) => {
             && skillPath !== '<built-in>'
             && isManagedSkillPath(skillPath, directory)
           ),
-        };
-      });
+        });
+      }
 
-      res.json({ skills: enrichedSkills });
+      // OpenCode decides which external skill roots it loads from process
+      // env, and the browser cannot read that. Report the flags alongside the
+      // scan so the client can narrow its list to what the agent can actually
+      // invoke.
+      //
+      // OpenCode's own skill-list endpoint is not usable for this: on 1.18.14
+      // it returns only global and builtin skills, omitting the project
+      // `.agents`/`.claude` skills the agent demonstrably has.
+      const body = {
+        skills: enrichedSkills,
+        externalSkills: {
+          // `OPENCODE_DISABLE_CLAUDE_CODE` is the broad switch; the specific
+          // one wins independently — OpenCode ORs them.
+          claudeDisabled: isEnvFlagEnabled(process.env.OPENCODE_DISABLE_CLAUDE_CODE)
+            || isEnvFlagEnabled(process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS),
+          allDisabled: isEnvFlagEnabled(process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS),
+        },
+      };
+      // The list is only the disk scan when OpenCode's own list failed:
+      // built-in skills and anything OpenCode finds only through its config
+      // are missing, so the client must not treat this as complete.
+      if (openCodeSkills === null) {
+        body.openCodeSkillsUnavailable = true;
+      }
+      res.json(body);
     } catch (error) {
       console.error('Failed to list skills:', error);
       res.status(500).json({ error: 'Failed to list skills' });
+    }
+  });
+
+  // Turns one skill off or back on for agents (`skill-switch.js`).
+  app.put('/api/config/skill-switch', async (req, res) => {
+    try {
+      const parsed = skillSwitchRequestSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'id must be a skill id, enabled a boolean and scope user or project' });
+      }
+      const { id, enabled, scope } = parsed.data;
+      const { directory, error } = await resolveSkillsDirectory(req);
+      if (error || (scope === 'project' && !directory)) {
+        return res.status(400).json({ error: error || 'A project skill needs a directory' });
+      }
+      res.json(setSkillEnabled({ id, enabled, scope, directory }));
+    } catch (error) {
+      console.error('Failed to switch skill:', error);
+      res.status(500).json({ error: error.message || 'Failed to switch skill' });
     }
   });
 
@@ -278,9 +404,26 @@ export const registerSkillRoutes = (app, dependencies) => {
       }));
 
       const sources = [...curatedSources, ...customSources];
-      const sourcesForUi = sources.map(({ gitIdentityId, ...rest }) => rest);
 
-      res.json({ ok: true, sources: sourcesForUi, itemsBySource: {}, pageInfoBySource: {} });
+      const githubRepos = sources
+        .map((src) => parseSkillRepoSource(src.source))
+        .filter((parsed) => parsed.ok && parsed.host === 'github.com')
+        .map((parsed) => parsed.normalizedRepo);
+      const repoMetas = await fetchGitHubRepoMetas(githubRepos);
+
+      const sourcesForUi = sources.map(({ gitIdentityId, excludedSkills, ...rest }) => {
+        const parsed = parseSkillRepoSource(rest.source);
+        const meta = parsed.ok && parsed.host === 'github.com'
+          ? repoMetas[parsed.normalizedRepo] || {}
+          : {};
+        return {
+          ...rest,
+          stars: typeof meta.stars === 'number' ? meta.stars : null,
+          repoUpdatedAt: typeof meta.repoUpdatedAt === 'string' ? meta.repoUpdatedAt : null,
+        };
+      });
+
+      res.json({ ok: true, sources: sourcesForUi, itemsBySource: {} });
     } catch (error) {
       console.error('Failed to load skills catalog:', error);
       res.status(500).json({ ok: false, error: { kind: 'unknown', message: error.message || 'Failed to load catalog' } });
@@ -300,7 +443,6 @@ export const registerSkillRoutes = (app, dependencies) => {
       }
 
       const refresh = String(req.query.refresh || '').toLowerCase() === 'true';
-      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
 
       const curatedSources = getCuratedSkillsSources();
       const settings = await readSettingsFromDisk();
@@ -323,30 +465,10 @@ export const registerSkillRoutes = (app, dependencies) => {
       }
 
       const resolvedDiscovered = mergeDiscoveredSkills(
-        await fetchOpenCodeDiscoveredSkills(directory),
-        discoverSkills(directory),
+        (await fetchOpenCodeDiscoveredSkills(directory)) ?? [],
+        await discoverSkills(directory),
       );
       const installedByName = new Map(resolvedDiscovered.map((s) => [s.name, s]));
-
-      if (src.sourceType === 'clawdhub' || isClawdHubSource(src.source)) {
-        const scanned = await scanClawdHubPage({ cursor: cursor || null });
-        if (!scanned.ok) {
-          return res.status(500).json({ ok: false, error: scanned.error });
-        }
-
-        const items = (scanned.items || []).map((item) => {
-          const installed = installedByName.get(item.skillName);
-          return {
-            ...item,
-            sourceId: src.id,
-            installed: installed
-              ? { isInstalled: true, scope: installed.scope, source: installed.source }
-              : { isInstalled: false },
-          };
-        });
-
-        return res.json({ ok: true, items, nextCursor: scanned.nextCursor || null });
-      }
 
       const parsed = parseSkillRepoSource(src.source);
       if (!parsed.ok) {
@@ -356,34 +478,54 @@ export const registerSkillRoutes = (app, dependencies) => {
       const effectiveSubpath = src.defaultSubpath || parsed.effectiveSubpath || null;
       const cacheKey = getCacheKey({
         normalizedRepo: parsed.normalizedRepo,
+        ref: parsed.ref,
         subpath: effectiveSubpath || '',
         identityId: src.gitIdentityId || '',
       });
+      const resolvedIdentity = await resolveCatalogGitIdentity(src.gitIdentityId, src.source);
+      if (!resolvedIdentity.ok) {
+        return res.status(401).json({
+          ok: false,
+          error: { ...resolvedIdentity.error, identities: listGitIdentitiesForResponse() },
+        });
+      }
 
-      let scanResult = !refresh ? getCachedScan(cacheKey) : null;
-      if (!scanResult) {
-        const scanned = await scanSkillsRepository({
+      const scanResult = await scanWithCache(
+        cacheKey,
+        () => scanSkillsRepository({
           source: src.source,
           subpath: src.defaultSubpath,
           defaultSubpath: src.defaultSubpath,
-          identity: resolveGitIdentity(src.gitIdentityId),
-        });
+          identity: resolvedIdentity.identity,
+          credentialResolver,
+        }),
+        { refresh },
+      );
 
-        if (!scanned.ok) {
-          return res.status(500).json({ ok: false, error: scanned.error });
+      if (!scanResult.ok) {
+        if (scanResult.error?.kind === 'authRequired') {
+          return res.status(401).json({
+            ok: false,
+            error: { ...scanResult.error, identities: listGitIdentitiesForResponse() },
+          });
         }
-
-        scanResult = scanned;
-        setCachedScan(cacheKey, scanResult);
+        return res.status(500).json({ ok: false, error: scanResult.error });
       }
 
-      const items = (scanResult.items || []).map((item) => {
+      const excludedSkills = new Set(src.excludedSkills || []);
+      // Provenance recorded at install time makes the badge source-aware; a
+      // name the registry has never heard of keeps the old name match, so
+      // skills installed before the registry existed look unchanged (#4756).
+      const provenanceByName = readInstalledSources();
+      const items = (scanResult.items || []).filter((item) => !excludedSkills.has(item.skillName)).map((item) => {
         const installed = installedByName.get(item.skillName);
+        const isInstalled = Boolean(installed)
+          && isInstalledFromSource(provenanceByName, item.skillName, src.id, item.skillDir);
         return {
           sourceId: src.id,
           ...item,
           gitIdentityId: src.gitIdentityId,
-          installed: installed
+          installed: isInstalled
             ? { isInstalled: true, scope: installed.scope, source: installed.source }
             : { isInstalled: false },
         };
@@ -402,12 +544,19 @@ export const registerSkillRoutes = (app, dependencies) => {
   app.post('/api/config/skills/scan', async (req, res) => {
     try {
       const { source, subpath, gitIdentityId } = req.body || {};
-      const identity = resolveGitIdentity(gitIdentityId);
+      const resolvedIdentity = await resolveCatalogGitIdentity(gitIdentityId, source);
+      if (!resolvedIdentity.ok) {
+        return res.status(401).json({
+          ok: false,
+          error: { ...resolvedIdentity.error, identities: listGitIdentitiesForResponse() },
+        });
+      }
 
       const result = await scanSkillsRepository({
         source,
         subpath,
-        identity,
+        identity: resolvedIdentity.identity,
+        credentialResolver,
       });
 
       if (!result.ok) {
@@ -436,6 +585,7 @@ export const registerSkillRoutes = (app, dependencies) => {
       const {
         source,
         subpath,
+        sourceId,
         gitIdentityId,
         scope,
         targetSource,
@@ -456,47 +606,19 @@ export const registerSkillRoutes = (app, dependencies) => {
         workingDirectory = resolved.directory;
       }
 
-      if (isClawdHubSource(source)) {
-        const result = await installSkillsFromClawdHub({
-          scope,
-          targetSource,
-          workingDirectory,
-          userSkillDir: SKILL_DIR,
-          selections,
-          conflictPolicy,
-          conflictDecisions,
-        });
-
-        if (!result.ok) {
-          if (result.error?.kind === 'conflicts') {
-            return res.status(409).json({ ok: false, error: result.error });
-          }
-          return res.status(400).json({ ok: false, error: result.error });
-        }
-
-        const installed = result.installed || [];
-        const skipped = result.skipped || [];
-        const requiresRestart = installed.length > 0;
-
-        return res.json({
-          ok: true,
-          installed,
-          skipped,
-          ...(requiresRestart
-            ? buildDeferredRestartResponse('Skills installed successfully. Restart OpenCode to apply.')
-            : {
-              requiresReload: false,
-              message: 'No skills were installed',
-            }),
+      const resolvedIdentity = await resolveCatalogGitIdentity(gitIdentityId, source);
+      if (!resolvedIdentity.ok) {
+        return res.status(401).json({
+          ok: false,
+          error: { ...resolvedIdentity.error, identities: listGitIdentitiesForResponse() },
         });
       }
-
-      const identity = resolveGitIdentity(gitIdentityId);
 
       const result = await installSkillsFromRepository({
         source,
         subpath,
-        identity,
+        identity: resolvedIdentity.identity,
+        credentialResolver,
         scope,
         targetSource,
         workingDirectory,
@@ -526,14 +648,32 @@ export const registerSkillRoutes = (app, dependencies) => {
 
       const installed = result.installed || [];
       const skipped = result.skipped || [];
-      const requiresRestart = installed.length > 0;
+      const installedAny = installed.length > 0;
+      const provenanceSourceId = asNonEmptyString(sourceId);
+
+      if (installedAny && provenanceSourceId) {
+        try {
+          appendInstalledSources(installed.map((entry) => ({
+            skillName: entry.skillName,
+            skillDir: entry.skillDir,
+            scope: entry.scope,
+            source: entry.source,
+            sourceId: provenanceSourceId,
+            sourceRef: source,
+          })));
+        } catch (error) {
+          // Provenance only refines the Installed badge; a failed write must
+          // not fail an install that already succeeded.
+          console.error('Failed to record skill install provenance:', error);
+        }
+      }
 
       res.json({
         ok: true,
         installed,
         skipped,
-        ...(requiresRestart
-          ? buildDeferredRestartResponse('Skills installed successfully. Restart OpenCode to apply.')
+        ...(installedAny
+          ? buildAppliedResponse('Skills installed successfully.')
           : {
             requiresReload: false,
             message: 'No skills were installed',
@@ -552,9 +692,9 @@ export const registerSkillRoutes = (app, dependencies) => {
       if (error) {
         return res.status(400).json({ error });
       }
-      const discoveredSkill = (await fetchOpenCodeDiscoveredSkills(directory))
+      const discoveredSkill = ((await fetchOpenCodeDiscoveredSkills(directory)) ?? [])
         .find((skill) => skill.name === skillName) || null;
-      const sources = getSkillSources(skillName, directory, discoveredSkill);
+      const sources = await getSkillSources(skillName, directory, discoveredSkill);
 
       res.json({
         name: skillName,
@@ -581,9 +721,9 @@ export const registerSkillRoutes = (app, dependencies) => {
         return res.status(400).json({ error });
       }
 
-      const discoveredSkill = (await fetchOpenCodeDiscoveredSkills(directory))
+      const discoveredSkill = ((await fetchOpenCodeDiscoveredSkills(directory)) ?? [])
         .find((skill) => skill.name === skillName) || null;
-      const sources = getSkillSources(skillName, directory, discoveredSkill);
+      const sources = await getSkillSources(skillName, directory, discoveredSkill);
       if (!sources.md.exists || !sources.md.dir) {
         return res.status(404).json({ error: 'Skill not found' });
       }
@@ -617,9 +757,9 @@ export const registerSkillRoutes = (app, dependencies) => {
       console.log('[Server] Creating skill:', skillName);
       console.log('[Server] Scope:', scope, 'Working directory:', directory);
 
-      createSkill(skillName, { ...config, source: skillSource }, directory, scope);
-      res.json(buildDeferredRestartResponse(
-        `Skill ${skillName} created successfully. Restart OpenCode to apply.`,
+      await createSkill(skillName, { ...config, source: skillSource }, directory, scope);
+      res.json(buildAppliedResponse(
+        `Skill ${skillName} created successfully.`,
       ));
     } catch (error) {
       console.error('Failed to create skill:', error);
@@ -640,24 +780,21 @@ export const registerSkillRoutes = (app, dependencies) => {
         const newName = updates.renameTo.trim();
         console.log(`[Server] Renaming skill: ${skillName} -> ${newName}`);
         console.log('[Server] Working directory:', directory);
-        renameSkill(skillName, newName, directory);
-        await refreshOpenCodeAfterConfigChange('skill rename');
-
+        await renameSkill(skillName, newName, directory);
+        // OpenCode 2 watches the skills directories: the renamed folder is
+        // picked up like any other write, no restart and no client reload.
         return res.json({
-          success: true,
+          ...buildAppliedResponse(`Skill renamed to ${newName} successfully.`),
           name: newName,
-          requiresReload: true,
-          message: `Skill renamed to ${newName} successfully. Reloading interface…`,
-          reloadDelayMs: clientReloadDelayMs,
         });
       }
 
       console.log(`[Server] Updating skill: ${skillName}`);
       console.log('[Server] Working directory:', directory);
 
-      updateSkill(skillName, updates, directory, updates?.targetPath);
-      res.json(buildDeferredRestartResponse(
-        `Skill ${skillName} updated successfully. Restart OpenCode to apply.`,
+      await updateSkill(skillName, updates, directory, updates?.targetPath);
+      res.json(buildAppliedResponse(
+        `Skill ${skillName} updated successfully.`,
       ));
     } catch (error) {
       console.error('[Server] Failed to update skill:', error);
@@ -678,9 +815,9 @@ export const registerSkillRoutes = (app, dependencies) => {
         return res.status(400).json({ error });
       }
 
-      const discoveredSkill = (await fetchOpenCodeDiscoveredSkills(directory))
+      const discoveredSkill = ((await fetchOpenCodeDiscoveredSkills(directory)) ?? [])
         .find((skill) => skill.name === skillName) || null;
-      const sources = getSkillSources(skillName, directory, discoveredSkill);
+      const sources = await getSkillSources(skillName, directory, discoveredSkill);
       if (!sources.md.exists || !sources.md.dir) {
         return res.status(404).json({ error: 'Skill not found' });
       }
@@ -712,9 +849,9 @@ export const registerSkillRoutes = (app, dependencies) => {
         return res.status(400).json({ error });
       }
 
-      const discoveredSkill = (await fetchOpenCodeDiscoveredSkills(directory))
+      const discoveredSkill = ((await fetchOpenCodeDiscoveredSkills(directory)) ?? [])
         .find((skill) => skill.name === skillName) || null;
-      const sources = getSkillSources(skillName, directory, discoveredSkill);
+      const sources = await getSkillSources(skillName, directory, discoveredSkill);
       if (!sources.md.exists || !sources.md.dir) {
         return res.status(404).json({ error: 'Skill not found' });
       }
@@ -742,9 +879,26 @@ export const registerSkillRoutes = (app, dependencies) => {
         return res.status(400).json({ error });
       }
 
-      deleteSkill(skillName, directory);
-      res.json(buildDeferredRestartResponse(
-        `Skill ${skillName} deleted successfully. Restart OpenCode to apply.`,
+      // `scope` and `source` together narrow the delete to that one copy.
+      const scope = asNonEmptyString(req.query.scope);
+      const source = asNonEmptyString(req.query.source);
+      let location;
+      if (scope || source) {
+        if (!['user', 'project'].includes(scope) || !['opencode', 'claude', 'agents'].includes(source)) {
+          return res.status(400).json({ error: 'scope must be user or project and source opencode, claude or agents' });
+        }
+        location = { scope, source };
+      }
+
+      deleteSkill(skillName, directory, location);
+      try {
+        removeInstalledSources(skillName);
+      } catch (error) {
+        // Provenance only refines the Installed badge; the skill is gone either way.
+        console.error('Failed to forget skill install provenance:', error);
+      }
+      res.json(buildAppliedResponse(
+        `Skill ${skillName} deleted successfully.`,
       ));
     } catch (error) {
       console.error('Failed to delete skill:', error);

@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { z } from 'zod';
 import type { UpdateInfo, UpdateProgress } from '@/lib/desktop';
 import { getDeviceInfo } from '@/lib/device';
 import { useUIStore } from './useUIStore';
@@ -11,6 +12,8 @@ import {
   isVSCodeRuntime,
   isWebRuntime,
 } from '@/lib/desktop';
+import { formatMessage, useI18nStore } from '@/lib/i18n/store';
+import { getUpdateInstallErrorMessage } from '@/lib/updateInstallError';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { getClientPlatform, isCapacitorApp } from '@/lib/platform';
 
@@ -21,6 +24,7 @@ type UpdateState = {
   available: boolean;
   downloading: boolean;
   downloaded: boolean;
+  installing: boolean;
   info: UpdateInfo | null;
   progress: UpdateProgress | null;
   error: string | null;
@@ -136,6 +140,39 @@ function mapRuntimeParams(runtime: ClientRuntime): URLSearchParams {
   return params;
 }
 
+export function parseUpdateCheckResponse(data: {
+  available?: boolean;
+  version?: string;
+  currentVersion?: string;
+  body?: string;
+  releaseUrl?: string;
+  downloadUrl?: string;
+  nextSuggestedCheckInSec?: number;
+  packageManager?: string;
+  updateCommand?: string;
+  installBlocked?: string;
+}): UpdateInfo {
+  return {
+    available: data.available ?? false,
+    version: data.version,
+    currentVersion: data.currentVersion ?? 'unknown',
+    body: data.body,
+    releaseUrl: data.releaseUrl,
+    downloadUrl: data.downloadUrl,
+    nextSuggestedCheckInSec:
+      typeof data.nextSuggestedCheckInSec === 'number' && Number.isFinite(data.nextSuggestedCheckInSec)
+        ? data.nextSuggestedCheckInSec
+        : undefined,
+    packageManager: data.packageManager,
+    updateCommand: data.updateCommand,
+    installBlocked: data.installBlocked === 'service-manager'
+      || data.installBlocked === 'manual-install'
+      || data.installBlocked === 'desktop-host'
+      ? data.installBlocked
+      : undefined,
+  };
+}
+
 async function checkForWebUpdates(runtime: ClientRuntime, currentVersion?: string): Promise<UpdateInfo | null> {
   try {
     const params = mapRuntimeParams(runtime);
@@ -155,25 +192,40 @@ async function checkForWebUpdates(runtime: ClientRuntime, currentVersion?: strin
       throw new Error(`Server responded with ${response.status}`);
     }
 
-    const data = await response.json();
-    return {
-      available: data.available ?? false,
-      version: data.version,
-      currentVersion: data.currentVersion ?? 'unknown',
-      body: data.body,
-      releaseUrl: data.releaseUrl,
-      downloadUrl: data.downloadUrl,
-      nextSuggestedCheckInSec:
-        typeof data.nextSuggestedCheckInSec === 'number' && Number.isFinite(data.nextSuggestedCheckInSec)
-          ? data.nextSuggestedCheckInSec
-          : undefined,
-      packageManager: data.packageManager,
-      updateCommand: data.updateCommand,
-    };
+    return parseUpdateCheckResponse(await response.json());
   } catch (error) {
     console.warn('Failed to check for updates:', error);
     return null;
   }
+}
+
+const updateCheckFailure = z.object({ error: z.string().trim().min(1) });
+
+/**
+ * Checks the OpenChamber server the native app is connected to, not the app
+ * itself. The shared store's `mobile` check is about the app build (store or
+ * APK updates); this asks the server about its own version, exactly like a
+ * browser on that server would, so the result can be installed through the
+ * server's own update route. Throws on failure so callers never read a failed
+ * check as "up to date".
+ */
+export async function checkConnectedServerForUpdates(): Promise<UpdateInfo> {
+  const params = mapRuntimeParams('web');
+  // The app's own check already reports usage for this install; asking about
+  // the server must not count the phone a second time as a web client.
+  params.set('reportUsage', 'false');
+  const response = await runtimeFetch(`/api/openchamber/update-check?${params.toString()}`, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    // A desktop host that cannot update itself (for example a Linux build
+    // outside its AppImage) explains why in `error`; keep that reason.
+    const failure = updateCheckFailure.safeParse(payload);
+    throw new Error(failure.success ? failure.data.error : `Server responded with ${response.status}`);
+  }
+  return parseUpdateCheckResponse(payload ?? {});
 }
 
 function detectRuntimeType(): 'desktop' | 'web' | 'vscode' | 'mobile' | null {
@@ -193,6 +245,7 @@ const initialState: UpdateState = {
   available: false,
   downloading: false,
   downloaded: false,
+  installing: false,
   info: null,
   progress: null,
   error: null,
@@ -308,26 +361,32 @@ export const useUpdateStore = create<UpdateStore>()((set, get) => ({
   },
 
   restartToUpdate: async () => {
-    const { downloaded, runtimeType } = get();
+    const { downloaded, installing, runtimeType } = get();
 
-    if (runtimeType !== 'desktop' || !downloaded) {
+    // A restart is already in flight: the app is shutting down, so a second
+    // click must not invoke the updater again. The main process guards the
+    // same race; this keeps the dialog in its restarting state.
+    if (runtimeType !== 'desktop' || !downloaded || installing) {
       return;
     }
+
+    set({ error: null, installing: true });
 
     try {
       const ok = await restartToApplyUpdate();
       if (!ok) {
-        throw new Error('Desktop restart only works on Local instance');
+        // No desktop bridge at all — the update was never installable here.
+        throw new Error(formatMessage(useI18nStore.getState().dictionary, 'updateDialog.error.restartUnavailable'));
       }
     } catch (error) {
-      set({
-        error: error instanceof Error ? error.message : 'Failed to restart',
-      });
+      // Keep the real installer failure; the dialog shows it and the button
+      // stays clickable for another attempt.
+      set({ installing: false, error: getUpdateInstallErrorMessage(error instanceof Error ? error : new Error(String(error))) });
     }
   },
 
   dismiss: () => {
-    set({ available: false, downloaded: false, info: null });
+    set({ available: false, downloaded: false, installing: false, info: null });
   },
 
   reset: () => {

@@ -5,6 +5,7 @@
  * @module quota
  */
 
+/** @public */
 export {
   listConfiguredQuotaProviders,
   fetchQuotaForProvider,
@@ -14,6 +15,7 @@ export {
   fetchCodexQuota,
   fetchCursorQuota,
   fetchDeepseekQuota,
+  fetchHyperQuota,
   fetchCopilotQuota,
   fetchCopilotAddonQuota,
   fetchKimiQuota,

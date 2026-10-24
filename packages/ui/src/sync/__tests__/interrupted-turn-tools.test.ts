@@ -1,12 +1,12 @@
 /**
- * Tests for interrupted-turn reconciliation (#2577): when a managed OpenCode
- * process dies mid-turn, the persisted turn never settles — the trailing
- * assistant message has no time.completed and its tool parts stay running.
- * Once the session is authoritatively settled, `interruptedTurnToolParts`
- * finalizes the orphaned parts locally.
+ * Tests for interrupted-turn reconciliation (#2577): when OpenCode records a
+ * turn as interrupted or failed, the trailing assistant message can still
+ * lack time.completed and its tool parts can stay running.
+ * `interruptedTurnToolParts` completes the assistant message as aborted and
+ * finalizes orphaned parts; its callers decide that OpenCode said so.
  */
 import { describe, expect, test } from "bun:test"
-import type { Message, Part } from "@opencode-ai/sdk/v2/client"
+import type { Message, Part, ToolPart } from "@/lib/opencode/model"
 import { interruptedTurnToolParts } from "../sync-context"
 import type { DirectoryStore } from "../child-store"
 import { INITIAL_STATE } from "../types"
@@ -17,51 +17,34 @@ function state(overrides: Partial<DirectoryStore> = {}): DirectoryStore {
     session_status: {},
     message: {},
     part: {},
-    question: {},
+    form: {},
     permission: {},
     ...overrides,
   } as unknown as DirectoryStore
 }
 
+function toolPart(id: string, messageID: string, state: ToolPart["state"]): Part {
+  return { id, messageID, sessionID: "ses_1", type: "tool", callID: `call-${id}`, tool: "bash", state }
+}
+
 function runningTool(id: string, messageID: string, start = 1000): Part {
-  return {
-    id,
-    messageID,
-    sessionID: "ses_1",
-    type: "tool",
-    tool: "bash",
-    state: { status: "running", time: { start }, input: {} },
-  } as unknown as Part
+  return toolPart(id, messageID, { status: "running", time: { start }, input: {} })
 }
 
 function completedTool(id: string, messageID: string): Part {
-  return {
-    id,
-    messageID,
-    sessionID: "ses_1",
-    type: "tool",
-    tool: "bash",
-    state: { status: "completed", time: { start: 1000, end: 2000 }, input: {} },
-  } as unknown as Part
+  return toolPart(id, messageID, { status: "completed", output: "", time: { start: 1000, end: 2000 }, input: {} })
 }
 
 function pendingTool(id: string, messageID: string): Part {
-  return {
-    id,
-    messageID,
-    sessionID: "ses_1",
-    type: "tool",
-    tool: "bash",
-    state: { status: "pending", time: { start: 1000 }, input: {} },
-  } as unknown as Part
+  return toolPart(id, messageID, { status: "pending", input: {}, raw: "" })
 }
 
 function unfinishedAssistantMessage(id: string): Message {
-  return { id, sessionID: "ses_1", role: "assistant", parentID: "", modelID: "", providerID: "", mode: "primary", system: "", agent: "", model: "", time: { created: 10 } } as unknown as Message
+  return { id, sessionID: "ses_1", role: "assistant", modelID: "model", providerID: "provider", agent: "build", time: { created: 10 } }
 }
 
 function finishedAssistantMessage(id: string): Message {
-  return { id, sessionID: "ses_1", role: "assistant", parentID: "", modelID: "", providerID: "", mode: "primary", system: "", agent: "", model: "", time: { created: 10, completed: 2000 } } as unknown as Message
+  return { id, sessionID: "ses_1", role: "assistant", modelID: "model", providerID: "provider", agent: "build", time: { created: 10, completed: 2000 } }
 }
 
 describe("interruptedTurnToolParts (#2577)", () => {
@@ -74,10 +57,16 @@ describe("interruptedTurnToolParts (#2577)", () => {
 
     const result = interruptedTurnToolParts(store, "ses_1", 5000)
     expect(result).not.toBeNull()
-    const part = result!.parts[0] as { state: { status: string; error: string; time: { end: number } } }
+    const part = result!.parts![0] as { state: { status: string; error: string; time: { end: number } } }
     expect(part.state.status).toBe("error")
     expect(part.state.error).toBe("Interrupted")
     expect(part.state.time.end).toBe(5000)
+    expect(result!.messages[0]).toEqual({
+      ...unfinishedAssistantMessage("msg_1"),
+      time: { created: 10, completed: 5000 },
+      error: { type: "aborted", message: "aborted" },
+      closedLocally: true,
+    })
   })
 
   test("busy session is never marked (live work)", () => {
@@ -89,12 +78,12 @@ describe("interruptedTurnToolParts (#2577)", () => {
     expect(interruptedTurnToolParts(store, "ses_1")).toBeNull()
   })
 
-  test("absent status is unknown, not settled — never marked", () => {
+  test("an unknown status does not block a turn OpenCode recorded as stopped", () => {
     const store = state({
       message: { ses_1: [unfinishedAssistantMessage("msg_1")] },
       part: { msg_1: [runningTool("tool_1", "msg_1")] },
     })
-    expect(interruptedTurnToolParts(store, "ses_1")).toBeNull()
+    expect(interruptedTurnToolParts(store, "ses_1")).not.toBeNull()
   })
 
   test("finished message is not an interruption (tail refresh reconciles it)", () => {
@@ -106,12 +95,12 @@ describe("interruptedTurnToolParts (#2577)", () => {
     expect(interruptedTurnToolParts(store, "ses_1")).toBeNull()
   })
 
-  test("pending question means the turn is waiting for input, not interrupted", () => {
+  test("pending form means the turn is waiting for input, not interrupted", () => {
     const store = state({
       session_status: { ses_1: { type: "idle" } },
       message: { ses_1: [unfinishedAssistantMessage("msg_1")] },
       part: { msg_1: [runningTool("tool_1", "msg_1")] },
-      question: { ses_1: [{ id: "q_1", sessionID: "ses_1", questions: [{ question: "?", header: "h", options: [{ label: "a", description: "" }] }] }] },
+      form: { ses_1: [{ id: "form_1", sessionID: "ses_1", title: "Pick one", fields: [{ key: "a", type: "boolean" }] }] },
     })
     expect(interruptedTurnToolParts(store, "ses_1")).toBeNull()
   })
@@ -121,7 +110,7 @@ describe("interruptedTurnToolParts (#2577)", () => {
       session_status: { ses_1: { type: "idle" } },
       message: { ses_1: [unfinishedAssistantMessage("msg_1")] },
       part: { msg_1: [runningTool("tool_1", "msg_1")] },
-      permission: { ses_1: [{ id: "p_1", sessionID: "ses_1", permission: "bash", patterns: [], metadata: {}, always: [] }] },
+      permission: { ses_1: [{ id: "p_1", sessionID: "ses_1", action: "bash", resources: [], metadata: {} }] },
     })
     expect(interruptedTurnToolParts(store, "ses_1")).toBeNull()
   })
@@ -137,16 +126,62 @@ describe("interruptedTurnToolParts (#2577)", () => {
 
     const result = interruptedTurnToolParts(store, "ses_1", 5000)
     expect(result).not.toBeNull()
-    const statuses = result!.parts.map((part) => (part as { state: { status: string } }).state.status)
+    const statuses = result!.parts!.map((part) => (part as { state: { status: string } }).state.status)
     expect(statuses).toEqual(["error", "completed", "error"])
   })
 
-  test("no active parts → no change", () => {
+  test("unfinished assistant with no tools is completed as aborted", () => {
     const store = state({
       session_status: { ses_1: { type: "idle" } },
       message: { ses_1: [unfinishedAssistantMessage("msg_1")] },
-      part: { msg_1: [completedTool("tool_2", "msg_1")] },
+      part: {},
     })
-    expect(interruptedTurnToolParts(store, "ses_1")).toBeNull()
+
+    const result = interruptedTurnToolParts(store, "ses_1", 5000)
+    expect(result).not.toBeNull()
+    expect(result!.parts).toBe(undefined)
+    expect(result!.messages[0]).toEqual({
+      ...unfinishedAssistantMessage("msg_1"),
+      time: { created: 10, completed: 5000 },
+      error: { type: "aborted", message: "aborted" },
+      closedLocally: true,
+    })
+  })
+
+  test("a failed turn closes the message with the error OpenCode reported", () => {
+    const store = state({
+      session_status: { ses_1: { type: "idle" } },
+      message: { ses_1: [unfinishedAssistantMessage("msg_1")] },
+      part: {},
+    })
+    const quota = { type: "provider", message: "quota exceeded" }
+
+    const result = interruptedTurnToolParts(store, "ses_1", 5000, quota)
+    expect(result!.messages[0]).toEqual({
+      ...unfinishedAssistantMessage("msg_1"),
+      time: { created: 10, completed: 5000 },
+      error: quota,
+      closedLocally: true,
+    })
+  })
+
+  test("completed tools are untouched while the unfinished assistant is aborted", () => {
+    const completed = completedTool("tool_2", "msg_1")
+    const store = state({
+      session_status: { ses_1: { type: "idle" } },
+      message: { ses_1: [unfinishedAssistantMessage("msg_1")] },
+      part: { msg_1: [completed] },
+    })
+
+    const result = interruptedTurnToolParts(store, "ses_1", 5000)
+    expect(result).not.toBeNull()
+    expect(result!.parts).toBe(undefined)
+    expect(store.part.msg_1[0]).toBe(completed)
+    expect(result!.messages[0]).toEqual({
+      ...unfinishedAssistantMessage("msg_1"),
+      time: { created: 10, completed: 5000 },
+      error: { type: "aborted", message: "aborted" },
+      closedLocally: true,
+    })
   })
 })

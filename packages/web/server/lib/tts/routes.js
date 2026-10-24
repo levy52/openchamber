@@ -2,6 +2,17 @@ import express from 'express';
 import { normalizeCustomOpenAIBaseURL } from './base-url.js';
 import { summarizeText, sanitizeForTTS, sanitizeForNote } from '../text/summarization.js';
 
+import { detectTextLanguage, languageOfLocale, pickVoiceForLanguage } from './language-detect.js';
+import { ENTERPRISE_MODE_ERROR, isEnterpriseMode } from '../enterprise-mode.js';
+import { describeVoiceKeys, readVoiceKey, updateVoiceKeys } from './voice-keys.js';
+
+// HTTP header values must be printable latin1; macOS voice names can be localized
+// (e.g. "Milena (Русский (Россия))") and Node rejects non-latin1 header content
+// outright. Percent-encode so the X-Speech-Voice header is always safe.
+export function speechVoiceHeaderValue(voice) {
+  return encodeURIComponent(voice);
+}
+
 export function registerTtsRoutes(app, { sayTTSCapability }) {
   let ttsModulePromise = null;
   const getTtsModule = async () => {
@@ -11,11 +22,27 @@ export function registerTtsRoutes(app, { sayTTSCapability }) {
     return ttsModulePromise;
   };
 
+  // Which voice keys are stored; the keys themselves never leave the server.
+  app.get('/api/voice/keys', (_req, res) => {
+    res.json(describeVoiceKeys());
+  });
+
+  app.put('/api/voice/keys', express.json({ limit: '16kb' }), (req, res) => {
+    try {
+      res.json(updateVoiceKeys(req.body));
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : 'Invalid voice keys' });
+    }
+  });
+
   app.post('/api/voice/token', async (req, res) => {
     console.log('[Voice] Token request received:', {
       contentType: req.headers['content-type'] || null,
     });
     try {
+      if (isEnterpriseMode()) {
+        return res.status(403).json({ allowed: false, error: ENTERPRISE_MODE_ERROR });
+      }
       const openaiApiKey = process.env.OPENAI_API_KEY;
       console.log('[Voice] OpenAI API Key present:', !!openaiApiKey);
 
@@ -58,14 +85,24 @@ export function registerTtsRoutes(app, { sayTTSCapability }) {
         return res.status(400).json({ error: 'Text is required' });
       }
 
+      // Without a custom server this is OpenAI's cloud; a custom one has
+      // already been held to this machine by the URL check above.
+      if (isEnterpriseMode() && !normalizedBaseURL) {
+        return res.status(403).json({ error: ENTERPRISE_MODE_ERROR });
+      }
+
       // Dynamically import the TTS service (ESM)
       const { ttsService } = await getTtsModule();
 
       // Check availability - server-configured key, client-provided key, or custom server URL
-      const hasServerKey = ttsService.isAvailable();
-      const hasClientKey = apiKey && typeof apiKey === 'string' && apiKey.trim().length > 0;
+      const hasServerKey = await ttsService.isAvailable();
       const hasCustomBaseURL = typeof normalizedBaseURL === 'string' && normalizedBaseURL.length > 0;
-      
+      // The key stored for this kind of server; a key in the body is what
+      // clients from before the server kept them sent, and still wins.
+      const requestKey = typeof apiKey === 'string' && apiKey.trim() ? apiKey.trim() : undefined;
+      const clientKey = requestKey ?? readVoiceKey(hasCustomBaseURL ? 'openaiCompatible' : 'openai');
+      const hasClientKey = Boolean(clientKey);
+
       if (!hasServerKey && !hasClientKey && !hasCustomBaseURL) {
         return res.status(503).json({ 
           error: 'TTS service not available. Please configure OpenAI in OpenCode, provide an API key, or set a custom server URL in settings.' 
@@ -83,7 +120,7 @@ export function registerTtsRoutes(app, { sayTTSCapability }) {
         model,
         speed,
         instructions,
-        apiKey: hasClientKey ? apiKey.trim() : undefined,
+        apiKey: clientKey,
         baseURL: hasCustomBaseURL ? normalizedBaseURL : undefined,
       });
 
@@ -133,8 +170,10 @@ export function registerTtsRoutes(app, { sayTTSCapability }) {
   app.get('/api/tts/status', async (_req, res) => {
     try {
       const { ttsService } = await getTtsModule();
+      const enterpriseMode = isEnterpriseMode();
       res.json({
-        available: ttsService.isAvailable(),
+        available: !enterpriseMode && await ttsService.isAvailable(),
+        enterpriseMode,
         voices: [
           'alloy', 'ash', 'ballad', 'coral', 'echo', 'fable',
           'nova', 'onyx', 'sage', 'shimmer', 'verse', 'marin', 'cedar'
@@ -154,7 +193,8 @@ export function registerTtsRoutes(app, { sayTTSCapability }) {
   // macOS 'say' command TTS speak endpoint
   app.post('/api/tts/say/speak', async (req, res) => {
     try {
-      const { text, voice = 'Samantha', rate = 200 } = req.body || {};
+      const { text, rate = 200, language, languageSample } = req.body || {};
+      let voice = typeof req.body?.voice === 'string' && req.body.voice.trim() ? req.body.voice.trim() : 'Samantha';
       
       if (!text || typeof text !== 'string' || !text.trim()) {
         return res.status(400).json({ error: 'Text is required' });
@@ -163,6 +203,23 @@ export function registerTtsRoutes(app, { sayTTSCapability }) {
       // Check if we're on macOS
       if (process.platform !== 'darwin') {
         return res.status(503).json({ error: 'macOS say command not available on this platform' });
+      }
+
+      // `language: 'auto'`: keep the chosen voice while it speaks the text's
+      // language, otherwise switch to an installed voice that does. A
+      // language with no installed voice keeps the chosen voice — say still
+      // reads the text, just with an accent — rather than failing.
+      let resolvedLanguage = null;
+      if (language === 'auto') {
+        const capability = await sayTTSCapability;
+        const voices = Array.isArray(capability?.voices) ? capability.voices : [];
+        const sample = typeof languageSample === 'string' && languageSample.trim() ? languageSample.slice(0, 4000) : text;
+        resolvedLanguage = detectTextLanguage(sample).language;
+        const chosen = voices.find((entry) => entry.name === voice);
+        if (languageOfLocale(chosen?.locale) !== resolvedLanguage) {
+          const match = pickVoiceForLanguage(resolvedLanguage, voices);
+          if (match) voice = match;
+        }
       }
       
       const { exec } = await import('child_process');
@@ -195,6 +252,8 @@ export function registerTtsRoutes(app, { sayTTSCapability }) {
       
       // Send audio response
       res.setHeader('Content-Type', 'audio/mp4');
+      res.setHeader('X-Speech-Voice', speechVoiceHeaderValue(voice));
+      if (resolvedLanguage) res.setHeader('X-Speech-Language', resolvedLanguage);
       res.setHeader('Content-Length', audioBuffer.length);
       res.send(audioBuffer);
       
@@ -223,7 +282,7 @@ export function registerTtsRoutes(app, { sayTTSCapability }) {
           ? req.headers['x-language'].trim()
           : undefined;
         const authHeader = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'].trim() : '';
-        const apiKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
+        const apiKey = (authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined) || readVoiceKey('stt');
 
         if (!req.body || !Buffer.isBuffer(req.body) || req.body.length === 0) {
           return res.status(400).json({ error: 'Audio data is required' });

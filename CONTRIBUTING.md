@@ -1,5 +1,55 @@
 # Contributing to OpenChamber
 
+## Before you start
+
+Bug fixes and small improvements: just open the PR. That's most of what gets
+merged, and a typical merged PR is around 200 lines.
+
+New features, changes to how something behaves for users, or reworks of how a
+module is put together: start an
+[Ideas discussion](https://github.com/openchamber/openchamber/discussions/categories/ideas)
+first, and start it before the code. Say what you were trying to do, what got
+in your way, and what you'd want instead, in your own words. A screenshot or a
+rough mockup helps more than a specification.
+
+A post describing something you already built is a report, not a discussion:
+the decision is made by then, and it gets closed along with the PR behind it.
+Not because it was drafted by an AI, we all use AI, but because it arrives
+after the only moment when talking would have changed anything. If you have an
+idea of how you'd implement it, or a branch already sketched out, bring it as a
+question: here's how I'd do it, does that shape work? A branch you're willing
+to change is a proposal. Once the shape is agreed, build it and link the
+discussion from the PR.
+
+Wait for the answer before you build. A pull request that carries a product
+decision, with no discussion behind it and no maintainer go-ahead, is not
+getting reviewed, whatever shape the code is in. That "yes, go ahead" is the
+thing that makes it worth your evening.
+
+**What counts as a product decision?** Anything where two reasonable people
+could disagree about whether it should exist or how it should behave. In
+practice: a new button, panel, setting or command; a changed default; a
+shortcut or gesture that now does something else; different wording, ordering
+or grouping in the UI; anything that turns existing behavior on or off for
+everyone. Also removing or working around behavior the code marks as
+deliberate: if a comment says something is skipped on purpose, then "is that
+actually a bug?" is a product question, and it comes first.
+
+Not a product decision: a crash, wrong data, something that doesn't work the
+way it plainly says it does, a performance fix that keeps behavior identical.
+Those are bugs. Just open the PR.
+
+Not sure? Ask in the discussion first. It costs you one paragraph and saves
+you the whole pull request.
+
+A large PR with no discussion behind it gets a `needs-discussion` label and a
+comment asking for one. It stays parked until the discussion exists. Nobody is
+shooing you away, we just can't review a product decision inside a 3,000-line
+diff.
+
+The single maintainer reviews everything by hand. Small, focused PRs get
+reviewed first; a PR that mixes unrelated fixes waits for the largest of them.
+
 ## Getting Started
 
 ```bash
@@ -7,6 +57,11 @@ git clone https://github.com/openchamber/openchamber.git
 cd openchamber
 bun install
 ```
+
+To start over from a fresh state, `bun run clean` removes every `node_modules`
+and build output (`dist`, `dist-*`, built-in extensions), packaged desktop
+builds in `packages/electron/dist` included. Then run `bun install` again. Add
+`-- --dry-run` to see the list without deleting anything.
 
 ## Dev Scripts
 
@@ -37,7 +92,7 @@ macOS builds create `dmg` and `zip` files. You need Xcode/build tools for notari
 
 Windows builds create an NSIS installer. If signing env vars are not set, the build script makes an unsigned installer.
 
-Linux builds produce an AppImage for the native x64 or arm64 host.
+Linux builds produce an AppImage, a `.deb` and an `.rpm` for the native x64 or arm64 host. The `.rpm` needs `rpmbuild` (the `rpm` package on Debian/Ubuntu).
 
 For desktop-specific details, see [`packages/electron/README.md`](./packages/electron/README.md).
 
@@ -96,7 +151,7 @@ Windows:
 bun run electron:build
 ```
 
-Linux x64 and arm64 AppImages are packaged natively on the matching host architecture. Use Bun for dependency installation and packaging orchestration:
+Linux x64 and arm64 packages are built natively on the matching host architecture. Use Bun for dependency installation and packaging orchestration:
 
 ```bash
 OPENCHAMBER_TARGET_ARCH=x64 bun run electron:build
@@ -113,8 +168,20 @@ The final AppImage verifier checks desktop identity and the architecture of Elec
 ```bash
 bun run type-check   # Must pass
 bun run lint         # Must pass
+bun run test         # Must pass
 bun run build        # Must succeed
 ```
+
+`bun run test` runs every suite in the repository: shared UI, VS Code, Electron,
+web/server, and the root scripts. The UI, VS Code, and Electron suites keep
+module-level singletons, so `scripts/run-isolated-tests.mjs` gives each test file
+its own process instead of letting load order decide the result. Run a single
+file directly while iterating (`bun test <file>`).
+
+UI tests run on happy-dom, where DOMPurify stops visiting the siblings of a node
+it removed: test each malicious payload in its own call, or a combined payload
+passes or fails for the wrong reason. The UI's `bun:test` type shim is trimmed
+(no `test.each`, no `toMatch`): use loops and `regex.test()` with `toBe`.
 
 For docs-only changes, validation may be enough:
 
@@ -139,31 +206,54 @@ without reconstructing the contributor's work.
 
 Before opening a pull request:
 
-1. Read [`AGENTS.md`](./AGENTS.md), every project skill matching the character
+1. For anything that is not a bug fix or a small improvement, make sure the
+   [Ideas discussion](https://github.com/openchamber/openchamber/discussions/categories/ideas)
+   happened first, that a maintainer said go ahead, and link it. Opening one
+   after the implementation, to describe what you already built, closes the
+   post and this pull request with it; opening the pull request without the
+   go-ahead means nobody reviews it.
+2. Read [`AGENTS.md`](./AGENTS.md), every project skill matching the character
    of the change, and the nearest package README and module `DOCUMENTATION.md`.
-2. Keep the change focused. Separate unrelated cleanup or refactors.
-3. Run the validation required by the applicable project guidance, not only
+3. Keep the change focused. Separate unrelated cleanup or refactors.
+4. Run the validation required by the applicable project guidance, not only
    the broad commands above.
-4. Complete the pull request template with concrete, current evidence.
+5. Complete the pull request template with concrete, current evidence.
 
 ### Pull Request Contract
 
 Every pull request must explain:
 
-- **Intent:** the user or maintainer problem being solved and the resulting
-  behavior.
-- **Non-goals:** nearby behavior intentionally left unchanged when the scope
-  could otherwise be ambiguous.
-- **Affected surfaces:** packages, runtimes, persisted/external contracts, and
-  user-visible states affected by the change.
-- **Repository guidance:** the skills and owning documentation that were
-  applicable, why they applied, and how the implementation satisfies their
-  important constraints.
+- **What and why:** the story of the change in plain words, the way you'd
+  tell it to a colleague in chat: what was wrong as the user saw it, what
+  they see now, why this way. Not a walk through the diff, not a file list,
+  not a bullet per commit; the reviewer reads the diff. If nearby behavior is
+  deliberately left unchanged and a reader might expect otherwise, say so in
+  a line.
+- **Affected surfaces:** packages, persisted/external contracts, and
+  user-visible states affected by the change, plus one line per runtime (web,
+  desktop, VS Code, hosted mobile, Capacitor mobile) saying what the change
+  does there. "Not applicable" is an answer; a blank row is not. Write that
+  list while deciding what to build, not after: it is the same list the pull
+  request template asks for.
 - **Validation:** exact automated and manual checks performed, their result,
   and anything that was not verified. A command name without a result is not
   evidence.
-- **Risk and failure behavior:** meaningful failure, rollback, cleanup,
-  compatibility, security, performance, or cross-runtime considerations.
+- **Live run:** if your change touches behavior a user can reach at run time,
+  say that you ran the built or running app and exercised the changed path.
+  This is in addition to any screenshot, recording, or measurement the change
+  needs, never instead of one: a screenshot shows what a surface looks like,
+  a live run says a person reached it in a running build.
+  Name the runtime you used (web, desktop, VS Code, hosted mobile, or Capacitor
+  mobile), the operating system, and what you saw. Reading the diff, passing
+  types, and green CI are not a live run. If you genuinely cannot run it, say
+  so and explain why; an honest gap is reviewable, a claim we later find hollow
+  is not.
+- **Risks:** meaningful failure, rollback, cleanup, compatibility, security,
+  performance, or cross-runtime considerations.
+
+You still have to read the project skills and module docs that match your
+change (step 1 above); the reviewer checks the code against them. You don't
+have to list them in the PR.
 
 Do not claim a runtime, platform, relay path, performance characteristic, or
 interaction is correct based only on type-checking or linting. If required
@@ -175,6 +265,12 @@ User-visible changes require evidence that lets a reviewer compare the
 behavior before and after the change. Attach screenshots for static states and
 a short recording for motion, gestures, drag-and-drop, focus, or multi-step
 interactions.
+
+Evidence goes in the PR description: drag screenshots, recordings and logs into
+the GitHub editor and GitHub hosts them. Never commit them to the branch (an
+`evidence/` or `pr-evidence/` folder, request logs, traces): committed, they
+ship in every clone of the repository, and the intake check asks you to remove
+them.
 
 Claims about performance, memory, CPU, rendering, startup, or similar empirical
 behavior require relevant before and after measurements.
@@ -197,7 +293,7 @@ state why it remains valid. If there is genuinely no user-visible change, say
 so and provide a concrete reason; deleting the evidence section is not an
 exemption.
 
-### Review Enforcement
+### Review enforcement
 
 The automated reviewer performs one unified review of correctness, repository
 guidance compliance, pull request quality, and evidence. It independently
@@ -209,8 +305,10 @@ The reviewer records the exact HEAD it inspected and returns one verdict:
 
 - `PASS`: no blocking correctness, compliance, or evidence issue was found.
 - `NEEDS_EVIDENCE`: no correctness, repository-guidance, or contribution-contract
-  blocker was found, but a required screenshot, interaction recording, or
-  empirical measurement is missing, stale, contradictory, or inadequate.
+  blocker was found, but a required screenshot, interaction recording,
+  empirical measurement, or live-run statement is missing, stale,
+  contradictory, or inadequate. A change to user-reachable behavior with no
+  live-run statement does not reach `PASS`.
 - `BLOCKED`: a concrete correctness, security, repository-rule, or contribution
   contract violation must be fixed.
 - `HUMAN_REVIEW_REQUIRED`: the change affects review policy or another boundary
@@ -231,6 +329,28 @@ verify a trustworthy result, in which case it applies `review:automation-failed`
 Each completed review creates a new comment tied to its reviewed HEAD so the
 conversation remains chronological. Previous review comments are not rewritten.
 
+### Size label and parking
+
+Every PR gets a `size:XS` to `size:XXL` label from its changed lines. Tests,
+lockfiles and translation catalogs (`packages/ui/src/lib/i18n/messages`) don't
+count, so a one-line settings change that touches twelve locale files is still
+`size:XS`.
+
+A `size:XL` or larger PR with no Ideas discussion linked in its body also gets
+`needs-discussion` and a comment. Link the discussion (or shrink the PR) and
+the label comes off on the next push or edit. Repo collaborators are exempt:
+the team settles product questions before the work starts.
+
+### Keeping PRs active
+
+Stale PRs add review load and make it hard to tell what's still being worked on, so the stale bot keeps the open list current. A PR with no activity for 28 days is automatically labeled `stale`, and closed 7 days later if it stays inactive. To keep a PR open:
+
+- Push updates or respond to review feedback
+- Leave a comment if you're waiting on a reviewer
+- Add the `pinned`, `security`, or `help wanted` label to exempt a long-running PR from the stale bot
+
+Reopening a closed PR is fine if it becomes relevant again.
+
 ## Project Structure
 
 ```
@@ -247,11 +367,11 @@ See [AGENTS.md](./AGENTS.md) for detailed architecture reference.
 
 You can still help:
 
-- Report bugs or UX issues — even "this felt confusing" is valuable feedback
+- Report bugs. Even "this felt confusing" is useful. Write issues in English (machine translation is fine); reports in other languages wait until someone translates them
 - Test on different devices, browsers, or OS versions
-- Suggest features or improvements via issues
-- Help others in Discord
+- Suggest features in [Ideas discussions](https://github.com/openchamber/openchamber/discussions/categories/ideas). The issue tracker is for bugs only
+- Answer questions in [Q&A discussions](https://github.com/openchamber/openchamber/discussions/categories/q-a)
 
 ## Questions?
 
-Open an [issue](https://github.com/openchamber/openchamber/issues) or ask in [Discord](https://discord.gg/ZYRSdnwwKA).
+Open a [Q&A discussion](https://github.com/openchamber/openchamber/discussions/categories/q-a).

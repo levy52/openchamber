@@ -2,11 +2,11 @@ import React from 'react';
 import { lazyWithChunkRecovery } from '@/lib/chunkLoadRecovery';
 import { isMobileSurfaceRuntime } from '@/lib/runtimeSurface';
 import { cn } from '@/lib/utils';
-import { loadMarkdownRendererModule } from './markdownRendererLoader';
+import { getLoadedMarkdownRendererModule, loadMarkdownRendererModule } from './markdownRendererLoader';
+import type { MarkdownRendererProps, SimpleMarkdownRendererProps as SimpleRendererProps } from './MarkdownRendererImpl';
 
 // Thin lazy wrapper around the MarkdownRenderer implementation.
-// The full implementation (marked + Shiki highlighting + KaTeX + morphdom
-// DOM morphing, plus beautiful-mermaid) is loaded on demand, keeping the
+// Streamdown, its official plugins and beautiful-mermaid load on demand, keeping the
 // initial bundle lean.
 
 const MarkdownRendererLazy = lazyWithChunkRecovery(() =>
@@ -37,14 +37,26 @@ const MobileMarkdownFallback = (props: { content?: unknown; className?: unknown;
   );
 };
 
-export const MarkdownRenderer: React.FC<React.ComponentPropsWithoutRef<typeof MarkdownRendererLazy>> = (props) => (
-  <React.Suspense fallback={<MobileMarkdownFallback {...props} />}>
-    <MarkdownRendererLazy {...props} />
-  </React.Suspense>
-);
+export const MarkdownRenderer: React.FC<MarkdownRendererProps> = (props) => {
+  const loaded = getLoadedMarkdownRendererModule();
+  if (loaded) return <loaded.MarkdownRenderer {...props} />;
+  return (
+    <React.Suspense fallback={<MobileMarkdownFallback {...props} />}>
+      <MarkdownRendererLazy {...props} />
+    </React.Suspense>
+  );
+};
 
-export const SimpleMarkdownRenderer: React.FC<React.ComponentPropsWithoutRef<typeof SimpleMarkdownRendererLazy>> = (props) => (
-  <React.Suspense fallback={<MobileMarkdownFallback {...props} />}>
-    <SimpleMarkdownRendererLazy {...props} />
-  </React.Suspense>
-);
+type SimpleMarkdownRendererProps = SimpleRendererProps & {
+  fallbackContent?: React.ReactNode;
+};
+
+export const SimpleMarkdownRenderer: React.FC<SimpleMarkdownRendererProps> = ({ fallbackContent, ...props }) => {
+  const loaded = getLoadedMarkdownRendererModule();
+  if (loaded) return <loaded.SimpleMarkdownRenderer {...props} />;
+  return (
+    <React.Suspense fallback={fallbackContent ?? <MobileMarkdownFallback {...props} />}>
+      <SimpleMarkdownRendererLazy {...props} />
+    </React.Suspense>
+  );
+};

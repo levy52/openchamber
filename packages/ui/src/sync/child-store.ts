@@ -2,7 +2,7 @@ import { create, type StoreApi } from "zustand"
 import type { DirState, State } from "./types"
 import { INITIAL_STATE, MAX_DIR_STORES, DIR_IDLE_TTL_MS, EVICTION_GRACE_MS } from "./types"
 import { pickDirectoriesToEvict, canDisposeDirectory, hasPendingBlockingRequests } from "./eviction"
-import { readDirCache, persistVcs, persistProjectMeta, persistIcon, persistSessions } from "./persist-cache"
+import { forgetDirCache, readDirCache, persistVcs, persistProjectMeta, persistIcon, persistSessions } from "./persist-cache"
 import { normalizePath } from "@/lib/pathNormalization"
 import { startSessionLoadPerformanceEvent } from "./session-load-performance"
 import { countSyncPerformance } from "./performance-diagnostics"
@@ -18,7 +18,7 @@ export type DirectoryStore = State & {
 type BlockingRequestSubscriber = () => void
 type BlockingRequestSubscribers = WeakMap<StoreApi<DirectoryStore>, Map<string, Set<BlockingRequestSubscriber>>>
 const permissionSubscribersByStore: BlockingRequestSubscribers = new WeakMap()
-const questionSubscribersByStore: BlockingRequestSubscribers = new WeakMap()
+const formSubscribersByStore: BlockingRequestSubscribers = new WeakMap()
 
 type SessionMessageChange = {
   messagesChanged: boolean
@@ -80,21 +80,38 @@ export function subscribeDirectoryPermission(
   return subscribeBlockingRequest(permissionSubscribersByStore, store, sessionID, listener)
 }
 
-export function subscribeDirectoryQuestion(
+export function subscribeDirectoryPermissions(
+  store: StoreApi<DirectoryStore>,
+  sessionIDs: readonly string[],
+  listener: BlockingRequestSubscriber,
+): () => void {
+  return subscribeBlockingRequests(permissionSubscribersByStore, store, sessionIDs, listener)
+}
+
+export function subscribeDirectoryForm(
   store: StoreApi<DirectoryStore>,
   sessionID: string,
   listener: BlockingRequestSubscriber,
 ): () => void {
-  return subscribeBlockingRequest(questionSubscribersByStore, store, sessionID, listener)
+  return subscribeBlockingRequest(formSubscribersByStore, store, sessionID, listener)
 }
 
-export function subscribeDirectoryQuestions(
+export function subscribeDirectoryForms(
+  store: StoreApi<DirectoryStore>,
+  sessionIDs: readonly string[],
+  listener: BlockingRequestSubscriber,
+): () => void {
+  return subscribeBlockingRequests(formSubscribersByStore, store, sessionIDs, listener)
+}
+
+function subscribeBlockingRequests(
+  subscribersByStore: BlockingRequestSubscribers,
   store: StoreApi<DirectoryStore>,
   sessionIDs: readonly string[],
   listener: BlockingRequestSubscriber,
 ): () => void {
   const unsubscribers = [...new Set(sessionIDs.filter(Boolean))].map((sessionID) => (
-    subscribeBlockingRequest(questionSubscribersByStore, store, sessionID, listener)
+    subscribeBlockingRequest(subscribersByStore, store, sessionID, listener)
   ))
   return () => {
     for (const unsubscribe of unsubscribers) unsubscribe()
@@ -127,7 +144,7 @@ function subscribeBlockingRequest(
 
 const notifyChangedBlockingRequests = <T,>(
   subscribersByStore: BlockingRequestSubscribers,
-  counter: "permissionChangeCallbacks" | "questionChangeCallbacks",
+  counter: "permissionChangeCallbacks" | "formChangeCallbacks",
   store: StoreApi<DirectoryStore>,
   current: Record<string, T>,
   previous: Record<string, T>,
@@ -142,6 +159,19 @@ const notifyChangedBlockingRequests = <T,>(
   }
   for (const listener of changedListeners) {
     countSyncPerformance(counter)
+    listener()
+  }
+}
+
+const notifyAllFormSubscribers = (store: StoreApi<DirectoryStore>): void => {
+  const subscribers = formSubscribersByStore.get(store)
+  if (!subscribers || subscribers.size === 0) return
+  const listeners = new Set<BlockingRequestSubscriber>()
+  for (const sessionListeners of subscribers.values()) {
+    for (const listener of sessionListeners) listeners.add(listener)
+  }
+  for (const listener of listeners) {
+    countSyncPerformance("formChangeCallbacks")
     listener()
   }
 }
@@ -207,6 +237,7 @@ export type DirectoryBootstrapReason =
   | "project-expanded"
   | "worktree-expanded"
   | "server-connected"
+  | "location-shutdown"
   | "action-demand"
 
 export type DirectoryBootstrapDemand = {
@@ -222,7 +253,12 @@ export type DirectoryBootstrapFailureReason = "os-permission" | "generic"
 export type DirectoryBootstrapContext = DirectoryBootstrapDemand & {
   generation: number
   isCurrent: () => boolean
+  trackInitialization: (initialization: Promise<void>) => void
 }
+
+type DirectoryInitialization =
+  | { state: "running" | "complete"; token: symbol }
+  | { state: "failed"; token: symbol; reason: DirectoryBootstrapFailureReason }
 
 const BOOTSTRAP_PRIORITY: Record<DirectoryBootstrapPriority, number> = {
   selected: 0,
@@ -249,14 +285,32 @@ type ManualBootstrapDemand = {
   revision: number
 }
 
-function createDirectoryStore(directory: string): StoreApi<DirectoryStore> {
+/** Live state an event gap can leave wrong: a running turn or a pending request. */
+function holdsLiveState(state: State | undefined): boolean {
+  if (!state) return false
+  if (hasPendingBlockingRequests(state)) return true
+  for (const status of Object.values(state.session_status ?? {})) {
+    if (status && status.type !== "idle") return true
+  }
+  return false
+}
+
+/** Whether the store lists one of these sessions or holds a status for it. */
+function ownsAnySession(state: State, sessionIDs: ReadonlySet<string>): boolean {
+  if (state.session.some((session) => sessionIDs.has(session.id))) return true
+  return Object.keys(state.session_status ?? {}).some((sessionID) => sessionIDs.has(sessionID))
+}
+
+function createDirectoryStore(directory: string, seedSessions: boolean): StoreApi<DirectoryStore> {
   // Restore cached metadata from localStorage
   const cached = readDirCache(directory)
 
   // Stale-while-revalidate: seed the session list from cache so the sidebar
   // paints chats instantly. Bootstrap replaces it with the authoritative list
   // while preserving session mutations that happened after the request began.
-  const cachedSessions = cached.sessions ?? INITIAL_STATE.session
+  // A directory the owner says not to seed, an isolated space this window does
+  // not know among them, starts empty and waits for the authoritative list.
+  const cachedSessions = (seedSessions ? cached.sessions : undefined) ?? INITIAL_STATE.session
 
   const store = create<DirectoryStore>()((set) => ({
     ...INITIAL_STATE,
@@ -278,7 +332,10 @@ function createDirectoryStore(directory: string): StoreApi<DirectoryStore> {
     if (state.icon !== prev.icon) persistIcon(directory, state.icon)
     if (state.session !== prev.session) persistSessions(directory, state.session)
     notifyChangedBlockingRequests(permissionSubscribersByStore, "permissionChangeCallbacks", store, state.permission, prev.permission)
-    notifyChangedBlockingRequests(questionSubscribersByStore, "questionChangeCallbacks", store, state.question, prev.question)
+    notifyChangedBlockingRequests(formSubscribersByStore, "formChangeCallbacks", store, state.form, prev.form)
+    // Row badges read forms from the cross-directory index until this store's
+    // bootstrap completes, so a status change can change their answer.
+    if (state.status !== prev.status) notifyAllFormSubscribers(store)
     notifyChangedSessionMessages(store, state, prev)
   })
 
@@ -299,16 +356,32 @@ export class ChildStoreManager {
   private readonly runningBootstraps = new Map<string, RunningBootstrap>()
   private readonly bootstrapStates = new Map<string, DirectoryBootstrapState>()
   private readonly bootstrapFailures = new Map<string, DirectoryBootstrapFailureReason>()
+  private readonly initializations = new Map<string, DirectoryInitialization>()
+  /** Stores that may have missed events and re-read on their next demand. */
+  private readonly staleDirectories = new Set<string>()
 
   private onBootstrap?: (context: DirectoryBootstrapContext) => Promise<void> | void
   private onDispose?: (directory: string) => void
+  /**
+   * Whether a new store of a directory may seed its session list from the persisted cache;
+   * every directory may when unset. Given at construction, so no store, a consumer's during
+   * the first render included, is made without it.
+   */
+  private readonly seedsSessions?: (directory: string) => boolean
   private isBooting?: (directory: string) => boolean
   private isLoadingSessions?: (directory: string) => boolean
+  private isCurrentScope?: () => boolean
   private bootstrapConcurrency = 2
   private bootstrapGeneration = 0
   private bootstrapSequence = 0
+  private bootstrapRunSequence = 0
+  private readonly directoryBootstrapRuns = new Map<string, number>()
   private manualBootstrapDemandRevision = 0
   private disposed = false
+
+  constructor(options: { seedsSessions?: (directory: string) => boolean } = {}) {
+    this.seedsSessions = options.seedsSessions
+  }
 
   private notifyRegistrySubscribers() {
     for (const subscriber of this.registrySubscribers) {
@@ -325,6 +398,7 @@ export class ChildStoreManager {
     onDispose?: (directory: string) => void
     isBooting?: (directory: string) => boolean
     isLoadingSessions?: (directory: string) => boolean
+    isCurrentScope?: () => boolean
     bootstrapConcurrency?: number
   }): () => void {
     const generation = ++this.bootstrapGeneration
@@ -333,7 +407,18 @@ export class ChildStoreManager {
     this.onDispose = callbacks.onDispose
     this.isBooting = callbacks.isBooting
     this.isLoadingSessions = callbacks.isLoadingSessions
+    this.isCurrentScope = callbacks.isCurrentScope
     this.bootstrapConcurrency = Math.max(1, Math.floor(callbacks.bootstrapConcurrency ?? 2))
+    // A list may have finished before reconfiguration invalidated its still-
+    // running initialization. It no longer owns a scheduler slot to requeue it.
+    const interrupted = [...this.initializations].filter(([, initialization]) => initialization.state === "running")
+    for (const [directory] of interrupted) this.initializations.delete(directory)
+    for (const [directory] of interrupted) {
+      this.requestBootstrap({
+        ...(this.aggregateBootstrapDemand(directory) ?? { directory, priority: "background", reason: "action-demand" }),
+        force: true,
+      })
+    }
     this.pumpBootstrapQueue()
 
     return () => {
@@ -343,6 +428,7 @@ export class ChildStoreManager {
       this.onDispose = undefined
       this.isBooting = undefined
       this.isLoadingSessions = undefined
+      this.isCurrentScope = undefined
     }
   }
 
@@ -409,7 +495,7 @@ export class ChildStoreManager {
 
     let store = this.children.get(normalizedDirectory)
     if (!store) {
-      store = createDirectoryStore(normalizedDirectory)
+      store = createDirectoryStore(normalizedDirectory, this.seedsSessions?.(normalizedDirectory) ?? true)
       this.children.set(normalizedDirectory, store)
       this.notifyRegistrySubscribers()
     }
@@ -456,6 +542,99 @@ export class ChildStoreManager {
     this.queueBootstrap(nextDemand)
   }
 
+  /**
+   * OpenCode's event stream restarted, so every bootstrapped store may have
+   * missed events. Only the stores in use re-read now: the current directory,
+   * those with foreground demand, and those showing live state the gap may
+   * have made wrong (a running turn, a pending permission or form). Every
+   * other store stays stale and re-reads when foreground demand returns. On v2 a
+   * directory read starts that directory's location and MCP servers, so
+   * re-reading every open store would start a fleet per directory.
+   *
+   * Returns the directories queued now.
+   */
+  refreshAfterStreamRestart(currentDirectory?: string | null): ReadonlySet<string> {
+    const queued = new Set<string>()
+    if (this.disposed) return queued
+    for (const [directory, store] of this.children) {
+      // A store that never finished a bootstrap has its first one pending.
+      if (store.getState().status === "loading") continue
+      this.staleDirectories.add(directory)
+    }
+    const current = currentDirectory ? normalizePath(currentDirectory) : null
+    if (current && this.staleDirectories.has(current)) {
+      this.requestBootstrap({ directory: current, priority: "selected", reason: "server-connected", force: true })
+      queued.add(current)
+    }
+    // A run that starts deletes its directory from the set; iterate a copy.
+    for (const directory of [...this.staleDirectories]) {
+      // Already queued, or a run that started after the gap covers it.
+      if (queued.has(directory) || !this.staleDirectories.has(directory)) continue
+      const demand = this.aggregateBootstrapDemand(directory)
+      if (demand && demand.priority !== "background") {
+        this.queueBootstrap({ ...demand, force: true })
+        queued.add(directory)
+        continue
+      }
+      if (!holdsLiveState(this.children.get(directory)?.getState())) continue
+      // Background priority runs one directory at a time behind foreground work.
+      this.queueBootstrap({ directory, priority: "background", reason: "server-connected", force: true })
+      queued.add(directory)
+    }
+    return queued
+  }
+
+  /**
+   * `refreshAfterStreamRestart` judges stores by what they showed before the
+   * gap, so a store that looked idle misses a turn that started, or a
+   * permission or form asked, during it. The caller reads OpenCode's global
+   * active-session list (one request that starts no location) and passes it
+   * here. A session waiting on a permission or form is still running its
+   * turn, so it is in that list. Stale stores that own one of those sessions
+   * re-read now at background priority; the rest stay deferred.
+   *
+   * Returns the directories queued now.
+   */
+  refreshStaleDirectoriesWithActiveSessions(activeSessionIDs: ReadonlySet<string>): ReadonlySet<string> {
+    const queued = new Set<string>()
+    if (this.disposed || activeSessionIDs.size === 0) return queued
+    for (const directory of [...this.staleDirectories]) {
+      // Already queued by the restart pass or by demand since.
+      if (this.bootstrapQueue.has(directory) || !this.staleDirectories.has(directory)) continue
+      const state = this.children.get(directory)?.getState()
+      if (!state || !ownsAnySession(state, activeSessionIDs)) continue
+      this.queueBootstrap({ directory, priority: "background", reason: "server-connected", force: true })
+      queued.add(directory)
+    }
+    return queued
+  }
+
+  /**
+   * OpenCode answered for the first time. A bootstrap that failed before then
+   * most likely failed because OpenCode was still starting, and a failed
+   * bootstrap is not retried without force. Foreground demand re-reads now;
+   * other failed stores re-read on their next foreground demand. Complete
+   * stores are left alone: each directory read starts that directory's
+   * location, so only failed ones are worth one.
+   *
+   * Returns the directories queued now.
+   */
+  retryFailedBootstraps(): ReadonlySet<string> {
+    const queued = new Set<string>()
+    if (this.disposed) return queued
+    for (const [directory, state] of [...this.bootstrapStates]) {
+      if (state !== "failed") continue
+      const demand = this.aggregateBootstrapDemand(directory)
+      if (demand && demand.priority !== "background") {
+        this.queueBootstrap({ ...demand, force: true })
+        queued.add(directory)
+        continue
+      }
+      this.staleDirectories.add(directory)
+    }
+    return queued
+  }
+
   setBootstrapDemand(owner: string, demands: DirectoryBootstrapDemand[]): void {
     if (!owner || this.disposed) return
     const next = new Map<string, DirectoryBootstrapDemand>()
@@ -487,6 +666,17 @@ export class ChildStoreManager {
     return normalizedDirectory ? this.bootstrapFailures.get(normalizedDirectory) : undefined
   }
 
+  getInitializationState(directory: string): DirectoryInitialization["state"] | undefined {
+    const normalizedDirectory = normalizePath(directory)
+    return normalizedDirectory ? this.initializations.get(normalizedDirectory)?.state : undefined
+  }
+
+  getInitializationFailure(directory: string): DirectoryBootstrapFailureReason | undefined {
+    const normalizedDirectory = normalizePath(directory)
+    const initialization = normalizedDirectory ? this.initializations.get(normalizedDirectory) : undefined
+    return initialization?.state === "failed" ? initialization.reason : undefined
+  }
+
   subscribeBootstrap(listener: () => void): () => void {
     this.bootstrapSubscribers.add(listener)
     return () => this.bootstrapSubscribers.delete(listener)
@@ -500,6 +690,11 @@ export class ChildStoreManager {
       if (!result || BOOTSTRAP_PRIORITY[demand.priority] < BOOTSTRAP_PRIORITY[result.priority]) result = demand
     }
     return result
+  }
+
+  private hasForegroundBootstrapDemand(directory: string): boolean {
+    const demand = this.aggregateBootstrapDemand(directory)
+    return Boolean(demand && demand.priority !== "background")
   }
 
   private reconcileBootstrapQueue(): void {
@@ -526,8 +721,11 @@ export class ChildStoreManager {
     this.pumpBootstrapQueue()
   }
 
-  private queueBootstrap(demand: DirectoryBootstrapDemand, notify = true): boolean {
-    const directory = demand.directory
+  private queueBootstrap(input: DirectoryBootstrapDemand, notify = true): boolean {
+    const directory = input.directory
+    // Foreground demand for a stale store means it is in use again: re-read it.
+    const reuse = !input.force && input.priority !== "background" && this.staleDirectories.has(directory)
+    const demand = reuse ? { ...input, force: true } : input
     const store = this.children.get(directory)
     const state = this.bootstrapStates.get(directory)
     if (!demand.force && (state === "complete" || state === "failed" || store?.getState().status === "complete")) {
@@ -575,11 +773,13 @@ export class ChildStoreManager {
   }
 
   private pumpBootstrapQueue(): void {
-    if (!this.onBootstrap || this.disposed) return
+    if (!this.onBootstrap || this.disposed || this.isCurrentScope?.() === false) return
     while (this.runningBootstraps.size < this.bootstrapConcurrency) {
       const next = this.nextBootstrap()
       if (!next) return
       this.bootstrapQueue.delete(next.directory)
+      // This run reads after the gap; a later failure is recorded as failed.
+      this.staleDirectories.delete(next.directory)
       const token = {}
       const running: RunningBootstrap = {
         ...next,
@@ -596,15 +796,28 @@ export class ChildStoreManager {
         queuedMs: Math.max(0, Date.now() - next.enqueuedAt),
       })
 
+      // Initialization outlives the list scheduler's slot. Keep commit authority
+      // tied to this store and run sequence, not the slot's transient token.
+      // A newer bootstrap or runtime generation invalidates both phases.
+      const runSequence = ++this.bootstrapRunSequence
+      this.directoryBootstrapRuns.set(next.directory, runSequence)
+      const store = this.children.get(next.directory)
+      const isCurrentScope = this.isCurrentScope
       const isCurrent = () => (
         !this.disposed
+        && isCurrentScope?.() !== false
         && this.bootstrapGeneration === running.generation
-        && this.runningBootstraps.get(next.directory)?.token === token
-        && this.children.has(next.directory)
+        && this.directoryBootstrapRuns.get(next.directory) === runSequence
+        && this.children.get(next.directory) === store
       )
       let bootstrapPromise: Promise<void>
       try {
-        bootstrapPromise = Promise.resolve(this.onBootstrap({ ...next, generation: running.generation, isCurrent }))
+        bootstrapPromise = Promise.resolve(this.onBootstrap({
+          ...next,
+          generation: running.generation,
+          isCurrent,
+          trackInitialization: (initialization) => this.trackInitialization(next, initialization, isCurrent),
+        }))
       } catch (error) {
         bootstrapPromise = Promise.reject(error)
       }
@@ -631,7 +844,7 @@ export class ChildStoreManager {
           }
         })
         .finally(() => {
-          const executionBecameStale = this.bootstrapGeneration !== running.generation || this.disposed
+          const executionBecameStale = this.bootstrapGeneration !== running.generation || this.disposed || isCurrentScope?.() === false
           if (this.runningBootstraps.get(next.directory)?.token === token) {
             this.runningBootstraps.delete(next.directory)
           }
@@ -652,12 +865,56 @@ export class ChildStoreManager {
     }
   }
 
+  private trackInitialization(
+    demand: DirectoryBootstrapDemand,
+    initialization: Promise<void>,
+    isCurrent: () => boolean,
+  ): void {
+    const token = Symbol()
+    const { directory } = demand
+    const canCommit = () => isCurrent() && this.initializations.get(directory)?.token === token
+    const finish = startSessionLoadPerformanceEvent({ operation: "bootstrap.environment", caller: demand.reason })
+    this.initializations.set(directory, { state: "running", token })
+    this.notifyBootstrapSubscribers()
+    void initialization.then(() => {
+      if (!canCommit()) return finish("stale")
+      this.initializations.set(directory, { state: "complete", token })
+      finish("complete")
+      this.notifyBootstrapSubscribers()
+    }, (error) => {
+      if (!canCommit()) return finish("stale")
+      this.initializations.set(directory, {
+        state: "failed", token,
+        reason: isFilesystemError(error) && error.reason === "os-permission" ? "os-permission" : "generic",
+      })
+      finish("error")
+      this.notifyBootstrapSubscribers()
+    })
+  }
+
+  /**
+   * A directory the host no longer has, an isolated space that was deleted among them: its
+   * store lists nothing, its persisted cache goes, and the store is disposed once nothing in
+   * this window holds it. A consumer still mounted on it keeps an empty store, as the host's
+   * own answer would leave it.
+   */
+  forgetDirectory(directory: string): void {
+    const normalizedDirectory = normalizePath(directory)
+    if (!normalizedDirectory) return
+    const store = this.children.get(normalizedDirectory)
+    if (store && store.getState().session.length > 0) {
+      store.setState({ session: [], sessionTotal: 0, sessionListSource: "empty" })
+    }
+    forgetDirCache(normalizedDirectory)
+    this.disposeDirectory(normalizedDirectory)
+  }
+
   disposeDirectory(directory: string): boolean {
     if (
       !canDisposeDirectory({
         directory,
         hasStore: this.children.has(directory),
-        pinned: this.pinned(directory),
+        pinned: this.pinned(directory) || this.hasForegroundBootstrapDemand(directory),
         booting: this.bootstrapStates.get(directory) === "queued"
           || this.bootstrapStates.get(directory) === "running"
           || (this.isBooting?.(directory) ?? false),
@@ -673,6 +930,9 @@ export class ChildStoreManager {
     this.manualBootstrapDemands.delete(directory)
     this.bootstrapStates.delete(directory)
     this.bootstrapFailures.delete(directory)
+    this.directoryBootstrapRuns.delete(directory)
+    this.initializations.delete(directory)
+    this.staleDirectories.delete(directory)
     for (const demands of this.bootstrapDemandsByOwner.values()) demands.delete(directory)
     this.children.delete(directory)
     this.notifyRegistrySubscribers()
@@ -688,10 +948,13 @@ export class ChildStoreManager {
   runEviction(skip?: string) {
     const stores = [...this.children.keys()]
     if (stores.length === 0) return
+    const protectedDirectories = new Set(stores.filter((directory) => (
+      this.pinned(directory) || this.hasForegroundBootstrapDemand(directory)
+    )))
     const list = pickDirectoriesToEvict({
       stores,
       state: this.lifecycle,
-      pins: new Set(stores.filter((d) => this.pinned(d))),
+      pins: protectedDirectories,
       max: MAX_DIR_STORES,
       ttl: DIR_IDLE_TTL_MS,
       graceMs: EVICTION_GRACE_MS,
@@ -735,6 +998,9 @@ export class ChildStoreManager {
     this.runningBootstraps.clear()
     this.bootstrapStates.clear()
     this.bootstrapFailures.clear()
+    this.initializations.clear()
+    this.staleDirectories.clear()
+    this.directoryBootstrapRuns.clear()
     this.bootstrapDemandsByOwner.clear()
     this.manualBootstrapDemands.clear()
     this.notifyBootstrapSubscribers()

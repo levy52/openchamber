@@ -5,15 +5,20 @@
  * @module quota/providers
  */
 
+import { readOpenCodeCredentials } from '../../opencode/auth.js';
 import { buildResult } from '../utils/index.js';
 
-import * as claude from './claude.js';
+import * as claude from './claude/index.js';
+import * as clinePass from './cline-pass.js';
 import * as codex from './codex.js';
 import * as copilot from './copilot.js';
-import * as crof from './crof.js';
 import * as cursor from './cursor.js';
+import * as deepinfra from './deepinfra.js';
 import * as deepseek from './deepseek.js';
+import * as exeDev from './exe-dev.js';
 import * as google from './google/index.js';
+import * as antigravity from './antigravity/index.js';
+import * as hyper from './hyper.js';
 import * as kimi from './kimi.js';
 import * as nanogpt from './nanogpt.js';
 import * as openai from './openai.js';
@@ -23,6 +28,8 @@ import * as zhipuaiCodingPlan from './zhipuai-coding-plan.js';
 import * as minimaxCodingPlan from './minimax-coding-plan.js';
 import * as minimaxCnCodingPlan from './minimax-cn-coding-plan.js';
 import * as neuralwatt from './neuralwatt.js';
+import * as kilo from './kilo.js';
+import * as zenmux from './zenmux.js';
 import * as ollamaCloud from './ollama-cloud.js';
 import * as wafer from './wafer.js';
 import * as opencodeGo from './opencode-go.js';
@@ -35,17 +42,17 @@ const registry = {
     isConfigured: claude.isConfigured,
     fetchQuota: claude.fetchQuota
   },
+  'cline-pass': {
+    providerId: clinePass.providerId,
+    providerName: clinePass.providerName,
+    isConfigured: clinePass.isConfigured,
+    fetchQuota: clinePass.fetchQuota
+  },
   codex: {
     providerId: codex.providerId,
     providerName: codex.providerName,
     isConfigured: codex.isConfigured,
     fetchQuota: codex.fetchQuota
-  },
-  crof: {
-    providerId: crof.providerId,
-    providerName: crof.providerName,
-    isConfigured: crof.isConfigured,
-    fetchQuota: crof.fetchQuota
   },
   cursor: {
     providerId: cursor.providerId,
@@ -53,17 +60,41 @@ const registry = {
     isConfigured: cursor.isConfigured,
     fetchQuota: cursor.fetchQuota
   },
+  deepinfra: {
+    providerId: deepinfra.providerId,
+    providerName: deepinfra.providerName,
+    isConfigured: deepinfra.isConfigured,
+    fetchQuota: deepinfra.fetchQuota
+  },
   deepseek: {
     providerId: deepseek.providerId,
     providerName: deepseek.providerName,
     isConfigured: deepseek.isConfigured,
     fetchQuota: deepseek.fetchQuota
   },
+  'exe-dev': {
+    providerId: exeDev.providerId,
+    providerName: exeDev.providerName,
+    isConfigured: exeDev.isConfigured,
+    fetchQuota: exeDev.fetchQuota
+  },
   google: {
     providerId: google.providerId,
     providerName: google.providerName,
     isConfigured: google.isConfigured,
     fetchQuota: google.fetchGoogleQuota
+  },
+  antigravity: {
+    providerId: antigravity.providerId,
+    providerName: antigravity.providerName,
+    isConfigured: antigravity.isConfigured,
+    fetchQuota: antigravity.fetchQuota
+  },
+  hyper: {
+    providerId: hyper.providerId,
+    providerName: hyper.providerName,
+    isConfigured: hyper.isConfigured,
+    fetchQuota: hyper.fetchQuota
   },
   'zai-coding-plan': {
     providerId: zai.providerId,
@@ -143,6 +174,18 @@ const registry = {
     isConfigured: neuralwatt.isConfigured,
     fetchQuota: neuralwatt.fetchQuota
   },
+  kilo: {
+    providerId: kilo.providerId,
+    providerName: kilo.providerName,
+    isConfigured: kilo.isConfigured,
+    fetchQuota: kilo.fetchQuota
+  },
+  zenmux: {
+    providerId: zenmux.providerId,
+    providerName: zenmux.providerName,
+    isConfigured: zenmux.isConfigured,
+    fetchQuota: zenmux.fetchQuota
+  },
   xai: {
     providerId: xai.providerId,
     providerName: xai.providerName,
@@ -151,12 +194,21 @@ const registry = {
   }
 };
 
-export const listConfiguredQuotaProviders = () => {
+const pendingFetches = new Map();
+
+
+/**
+ * Providers with a usable credential. OpenCode's stored credentials are read
+ * once and handed to every provider; when OpenCode cannot be asked this
+ * throws, so a transient failure does not look like "nothing configured".
+ */
+export const listConfiguredQuotaProviders = async () => {
+  const auth = await readOpenCodeCredentials();
   const configured = [];
 
   for (const [id, provider] of Object.entries(registry)) {
     try {
-      if (provider.isConfigured()) {
+      if (provider.isConfigured(auth)) {
         configured.push(id);
       }
     } catch {
@@ -167,7 +219,7 @@ export const listConfiguredQuotaProviders = () => {
   return configured;
 };
 
-export const fetchQuotaForProvider = async (providerId) => {
+const fetchQuotaForProviderUncoalesced = async (providerId) => {
   const provider = registry[providerId];
 
   if (!provider) {
@@ -193,12 +245,26 @@ export const fetchQuotaForProvider = async (providerId) => {
   }
 };
 
+export const fetchQuotaForProvider = (providerId) => {
+  const existing = pendingFetches.get(providerId);
+  if (existing) return existing;
+
+  const pending = fetchQuotaForProviderUncoalesced(providerId).finally(() => {
+    if (pendingFetches.get(providerId) === pending) pendingFetches.delete(providerId);
+  });
+  pendingFetches.set(providerId, pending);
+  return pending;
+};
+
 export const fetchClaudeQuota = claude.fetchQuota;
 export const fetchOpenaiQuota = openai.fetchQuota;
 export const fetchGoogleQuota = google.fetchGoogleQuota;
+export const fetchAntigravityQuota = antigravity.fetchQuota;
 export const fetchCodexQuota = codex.fetchQuota;
 export const fetchCursorQuota = cursor.fetchQuota;
+export const fetchDeepinfraQuota = deepinfra.fetchQuota;
 export const fetchDeepseekQuota = deepseek.fetchQuota;
+export const fetchHyperQuota = hyper.fetchQuota;
 export const fetchCopilotQuota = copilot.fetchQuota;
 export const fetchCopilotAddonQuota = copilot.fetchQuotaAddon;
 export const fetchKimiQuota = kimi.fetchQuota;

@@ -8,8 +8,14 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import { spawn, execFile } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { execGit as executeGit } from './bridge-git-process-runtime';
+import { readConfig } from './opencodeConfig';
+import { readProjectStartCommand } from '../../web/server/lib/opencode/project-start-command.js';
+import { resolveWorktreeDirectory } from './worktree-directory';
+import { readSubmoduleState, resolveGitPathTarget, type GitPathUnavailable, type GitSubmoduleState } from './gitPathDiff';
+import { parseGitRemoteListing, type GitRemote } from './gitRemoteListing';
 import type { API as GitAPI, Repository, GitExtension, Status } from './git.d';
 
 let gitApi: GitAPI | null = null;
@@ -307,40 +313,8 @@ function cleanBranchName(branch: string): string {
 /**
  * Execute a raw git command and return the output
  */
-async function execGit(args: string[], cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return new Promise((resolve) => {
-    const normalizedCwd = normalizePath(cwd);
-    const gitPath = gitApi?.git.path || 'git';
-
-    buildGitEnv().then((env) => {
-      const proc = spawn(gitPath, args, {
-        cwd: normalizedCwd,
-        env,
-        windowsHide: true,
-      });
-
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout?.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      proc.stderr?.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      proc.on('close', (exitCode) => {
-        resolve({ stdout, stderr, exitCode: exitCode ?? 0 });
-      });
-
-      proc.on('error', (error) => {
-        resolve({ stdout: '', stderr: error.message, exitCode: 1 });
-      });
-    }).catch((error) => {
-      resolve({ stdout: '', stderr: error instanceof Error ? error.message : String(error), exitCode: 1 });
-    });
-  });
+async function execGit(args: string[], cwd: string, env?: NodeJS.ProcessEnv): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return executeGit(args, normalizePath(cwd), { binary: gitApi?.git.path || 'git', env });
 }
 
 function isValidCommitHash(hash: string): boolean {
@@ -374,8 +348,14 @@ function extractGitNumstatDestinationPath(filePath: string): string {
  * Check if a directory is a git repository
  */
 export async function checkIsGitRepository(directory: string): Promise<boolean> {
-  const result = await execGit(['rev-parse', '--is-inside-work-tree'], directory);
-  return result.exitCode === 0 && result.stdout.trim() === 'true';
+  const result = await execGit(['rev-parse', '--is-inside-work-tree', '--is-bare-repository'], directory);
+  if (result.exitCode !== 0) {
+    return false;
+  }
+  // A bare repository is not inside a work tree but is still a repository:
+  // its linked worktrees are the checkouts a user works in.
+  const [insideWorkTree, bare] = result.stdout.split('\n').map((line) => line.trim());
+  return insideWorkTree === 'true' || bare === 'true';
 }
 
 /**
@@ -424,7 +404,10 @@ export interface GitStatusResult {
   behind: number;
   files: GitStatusFile[];
   isClean: boolean;
-  diffStats?: Record<string, { insertions: number; deletions: number }>;
+  diffStats?: {
+    staged: Record<string, { insertions: number; deletions: number }>;
+    working: Record<string, { insertions: number; deletions: number }>;
+  };
   /** Present when a merge is in progress with conflicts */
   mergeInProgress?: GitMergeInProgress | null;
   /** Present when a rebase is in progress */
@@ -593,7 +576,12 @@ async function checkInProgressOperations(directory: string): Promise<{
  * Fallback: Get git status using raw git commands
  */
 async function getGitStatusRaw(directory: string): Promise<GitStatusResult> {
-  const statusResult = await execGit(['status', '--porcelain=v1', '-b', '-uall'], directory);
+  // Deliberately `-uall`: the web server lists a large untracked directory as
+  // one `dir/` entry (readStatus in web/server/lib/git/service.js) and the
+  // shared UI explains such an entry; this runtime has not adopted that bound.
+  // `--no-optional-locks`: a status that refreshes the index holds
+  // `.git/index.lock`, and a terminal `git commit` then fails (#2229).
+  const statusResult = await execGit(['--no-optional-locks', 'status', '--porcelain=v1', '-b', '-uall'], directory);
   
   if (statusResult.exitCode !== 0) {
     return {
@@ -669,6 +657,23 @@ export interface GitBranchResult {
   all: string[];
   current: string;
   branches: Record<string, GitBranchDetails>;
+}
+
+export async function getGitUnpushedBranchCounts(directory: string, requestedBranches: string[]): Promise<{ counts: Record<string, number> }> {
+  const requested = [...new Set(requestedBranches)].filter(Boolean).slice(0, 5);
+  if (requested.length === 0) return { counts: {} };
+  const local = new Set((await getGitBranchesRaw(directory)).all.filter((branch) => !branch.startsWith('remotes/')));
+  const counts: Record<string, number> = {};
+  await Promise.all(requested.map(async (branch) => {
+    if (!local.has(branch)) return;
+    const upstreamResult = await execGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', `${branch}@{upstream}`], directory);
+    const upstream = upstreamResult.exitCode === 0 ? upstreamResult.stdout.trim() : '';
+    if (!upstream) return;
+    const countResult = await execGit(['rev-list', '--count', `${upstream}..${branch}`], directory);
+    const count = countResult.exitCode === 0 ? Number.parseInt(countResult.stdout.trim(), 10) : 0;
+    if (Number.isFinite(count) && count > 0) counts[branch] = count;
+  }));
+  return { counts };
 }
 
 /**
@@ -768,7 +773,7 @@ async function getGitBranchesRaw(directory: string): Promise<GitBranchResult> {
  */
 export async function checkoutBranch(directory: string, branch: string): Promise<{ success: boolean; branch: string }> {
   const repo = await getRepository(directory);
-  
+
   if (repo) {
     try {
       await repo.checkout(branch);
@@ -830,7 +835,7 @@ export async function deleteGitBranch(directory: string, branch: string, force =
  * Delete a remote branch
  */
 export async function deleteRemoteBranch(directory: string, branch: string, remote = 'origin'): Promise<{ success: boolean }> {
-  const result = await execGit(['push', remote, '--delete', branch], directory);
+  const result = await execGit(['push', '--delete', '--', remote, branch], directory);
   return { success: result.exitCode === 0 };
 }
 
@@ -843,6 +848,7 @@ export interface GitWorktreeInfo {
   path: string;
   directoryCreated?: true;
   bootstrapStatus?: WorktreeBootstrapStatus;
+  sourceFetchFailed?: true;
 }
 
 type WorktreeListEntry = {
@@ -850,6 +856,7 @@ type WorktreeListEntry = {
   head?: string;
   branchRef?: string;
   branch?: string;
+  bare?: boolean;
 };
 
 interface GitWorktreeValidationError {
@@ -885,6 +892,11 @@ export interface CreateGitWorktreePayload {
 export interface RemoveGitWorktreePayload {
   directory: string;
   deleteLocalBranch?: boolean;
+  /**
+   * Releases the OpenCode instance that served the worktree while its path
+   * still resolves. The bridge injects it; the webview payload never carries it.
+   */
+  disposeInstance?: (worktreeDirectory: string) => Promise<void>;
 }
 
 const OPENCODE_ADJECTIVES = [
@@ -960,6 +972,14 @@ const parseWorktreePorcelain = (raw: string): WorktreeListEntry[] => {
       const branchRef = line.substring('branch '.length).trim();
       current.branchRef = branchRef;
       current.branch = cleanBranchName(branchRef);
+      continue;
+    }
+
+    // A bare repository lists itself as a worktree with a `bare` attribute
+    // and no HEAD or branch; without a working tree it is not a checkout a
+    // session can run in.
+    if (line === 'bare') {
+      current.bare = true;
     }
   }
 
@@ -1281,18 +1301,35 @@ const ensureOpenCodeProjectId = async (primaryWorktree: string): Promise<string>
   return projectId;
 };
 
-const resolveWorktreeProjectContext = async (directory: string) => {
+/**
+ * The primary checkout of a repository from its common git dir: `<root>/.git`
+ * for the checkout itself. Null for any other layout (a bare repository, a
+ * separate git dir).
+ */
+const primaryWorktreeRootFromGitDir = (gitDir: string): string | null => {
+  if (gitDir.replace(/\\/g, '/').endsWith('/.git')) {
+    return gitDir.slice(0, -'/.git'.length) || null;
+  }
+  return null;
+};
+
+const resolveWorktreeProjectContext = async (
+  directory: string,
+  options: { tolerateWorktreeRootConfigError?: boolean } = {},
+) => {
+  const tolerateWorktreeRootConfigError = options.tolerateWorktreeRootConfigError === true;
   const directoryPath = normalizeDirectoryPath(directory);
   if (!directoryPath) {
     throw new Error('Directory is required');
   }
 
-  const topResult = await runGitCommandOrThrow(
-    directoryPath,
-    ['rev-parse', '--show-toplevel'],
-    'Failed to resolve git top-level directory'
-  );
-  const sandbox = path.resolve(directoryPath, topResult.stdout.trim());
+  const topResult = await runGitCommand(directoryPath, ['rev-parse', '--show-toplevel']);
+  // A bare repository has no work tree, so `--show-toplevel` fails there; the
+  // bare directory itself still answers the object-level commands worktree
+  // creation runs against it.
+  const sandbox = topResult.success
+    ? path.resolve(directoryPath, topResult.stdout.trim())
+    : directoryPath;
 
   const commonResult = await runGitCommandOrThrow(
     sandbox,
@@ -1300,11 +1337,33 @@ const resolveWorktreeProjectContext = async (directory: string) => {
     'Failed to resolve git common directory'
   );
   const commonDir = path.resolve(sandbox, commonResult.stdout.trim());
-  const primaryWorktree = path.dirname(commonDir);
+  // `<root>/.git` resolves to the primary checkout; any other layout (a bare
+  // repository, a separate git dir) has no primary worktree, and the sandbox
+  // directory is the closest thing to one.
+  const primaryWorktree = primaryWorktreeRootFromGitDir(commonDir) || sandbox;
   const projectID = await ensureOpenCodeProjectId(primaryWorktree);
-  const worktreeRoot = path.join(getOpenCodeDataPath(), 'worktree', projectID);
+  // OpenCode's `worktree.directory` is read from the canonical checkout so a
+  // linked worktree still sees the project's saved configuration. When unset,
+  // worktrees keep landing in the data-dir folder keyed by project ID.
+  const legacyWorktreeRoot = path.join(getOpenCodeDataPath(), 'worktree', projectID);
+  // Creation must not guess a folder the user did not choose, so a config read
+  // failure propagates there. Read-only and removal paths pass
+  // `tolerateWorktreeRootConfigError` and fall back to the data-dir root.
+  let configuredWorktreeRoot: string | null = null;
+  try {
+    configuredWorktreeRoot = resolveWorktreeDirectory(readConfig(primaryWorktree), primaryWorktree);
+  } catch (error) {
+    if (!tolerateWorktreeRootConfigError) {
+      throw error;
+    }
+    console.warn(
+      '[GitService] Failed to read OpenCode worktree.directory; using the data-dir worktree root:',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  const worktreeRoot = configuredWorktreeRoot || legacyWorktreeRoot;
 
-  return { projectID, sandbox, primaryWorktree, worktreeRoot };
+  return { projectID, requestedDirectory: directoryPath, sandbox, primaryWorktree, worktreeRoot, legacyWorktreeRoot };
 };
 
 const listWorktreeEntries = async (directory: string): Promise<WorktreeListEntry[]> => {
@@ -1364,7 +1423,10 @@ const fetchRemoteBranchRef = async (primaryWorktree: string, remoteName: string,
   }
 
   const refspec = `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`;
-  await runGitCommandOrThrow(primaryWorktree, ['fetch', remote, refspec], `Failed to fetch ${remote}/${branch}`);
+  // The remote value can be payload-derived (ensureRemoteUrl, upstreamRemote,
+  // startRef, existingBranch), so `--` keeps a leading-`-` value positional
+  // instead of letting git parse it as an option (defence-in-depth).
+  await runGitCommandOrThrow(primaryWorktree, ['fetch', '--', remote, refspec], `Failed to fetch ${remote}/${branch}`);
 };
 
 const resolveBranchForExistingMode = async (primaryWorktree: string, existingBranch: string, preferredBranchName: string) => {
@@ -1470,18 +1532,6 @@ const runWorktreeStartCommand = async (directory: string, command: string): Prom
   }
 };
 
-const loadProjectStartCommand = async (projectID: string): Promise<string> => {
-  const storagePath = path.join(getOpenCodeDataPath(), 'storage', 'project', `${projectID}.json`);
-  try {
-    const raw = await fs.promises.readFile(storagePath, 'utf8');
-    const parsed = JSON.parse(raw) as { commands?: { start?: string } };
-    const start = typeof parsed?.commands?.start === 'string' ? parsed.commands.start.trim() : '';
-    return start || '';
-  } catch {
-    return '';
-  }
-};
-
 // OpenCode owns its own project/sandbox registry and records a worktree as a
 // sandbox itself when an instance boots for that directory. OpenChamber used to
 // write that state into OpenCode's storage JSON directly, behind the back of the
@@ -1528,8 +1578,10 @@ const cleanupFailedFastWorktreeCreate = async (
   }
 };
 
-const runWorktreeStartScripts = async (directory: string, projectID: string, startCommand: string | undefined) => {
-  const projectStart = await loadProjectStartCommand(projectID);
+// `projectDirectory` is the directory the worktree was requested from: the user
+// already works there, so OpenCode answers without starting another location.
+const runWorktreeStartScripts = async (directory: string, projectDirectory: string, startCommand: string | undefined) => {
+  const projectStart = await readProjectStartCommand(projectDirectory);
   if (projectStart) {
     const projectResult = await runWorktreeStartCommand(directory, projectStart);
     if (!projectResult.success) {
@@ -1550,7 +1602,7 @@ const runWorktreeStartScripts = async (directory: string, projectID: string, sta
 
 const queueWorktreeBootstrap = (args: {
   directory: string;
-  projectID: string;
+  projectDirectory: string;
   primaryWorktree: string;
   localBranch: string;
   setUpstream: boolean;
@@ -1562,7 +1614,7 @@ const queueWorktreeBootstrap = (args: {
 }) => {
   const {
     directory,
-    projectID,
+    projectDirectory,
     primaryWorktree,
     localBranch,
     setUpstream,
@@ -1591,7 +1643,7 @@ const queueWorktreeBootstrap = (args: {
         });
       }
       setWorktreeBootstrapState(directory, WORKTREE_BOOTSTRAP_PENDING, WORKTREE_PHASE_GIT_READY);
-      await runWorktreeStartScripts(directory, projectID, startCommand).catch((error) => {
+      await runWorktreeStartScripts(directory, projectDirectory, startCommand).catch((error) => {
         console.warn('[GitService] Worktree start script task failed:', error instanceof Error ? error.message : String(error));
       });
       setWorktreeBootstrapState(directory, WORKTREE_BOOTSTRAP_READY, WORKTREE_PHASE_SETUP_READY);
@@ -1611,16 +1663,16 @@ const ensureRemoteWithUrl = async (primaryWorktree: string, remoteName: string, 
     return;
   }
 
-  const getUrl = await runGitCommand(primaryWorktree, ['remote', 'get-url', name]);
+  const getUrl = await runGitCommand(primaryWorktree, ['remote', 'get-url', '--', name]);
   if (getUrl.success) {
     const currentUrl = String(getUrl.stdout || '').trim();
     if (currentUrl !== url) {
-      await runGitCommandOrThrow(primaryWorktree, ['remote', 'set-url', name, url], 'Failed to update git remote URL');
+      await runGitCommandOrThrow(primaryWorktree, ['remote', 'set-url', '--', name, url], 'Failed to update git remote URL');
     }
     return;
   }
 
-  await runGitCommandOrThrow(primaryWorktree, ['remote', 'add', name, url], 'Failed to add git remote');
+  await runGitCommandOrThrow(primaryWorktree, ['remote', 'add', '--', name, url], 'Failed to add git remote');
 };
 
 const checkRemoteBranchExists = async (primaryWorktree: string, remoteName: string, branchName: string, remoteUrl = '') => {
@@ -1632,7 +1684,7 @@ const checkRemoteBranchExists = async (primaryWorktree: string, remoteName: stri
   }
 
   const target = url || remote;
-  const lsRemote = await runGitCommand(primaryWorktree, ['ls-remote', '--heads', target, `refs/heads/${branch}`]);
+  const lsRemote = await runGitCommand(primaryWorktree, ['ls-remote', '--heads', '--', target, `refs/heads/${branch}`]);
   if (!lsRemote.success) {
     return { success: false, found: false };
   }
@@ -1641,19 +1693,6 @@ const checkRemoteBranchExists = async (primaryWorktree: string, remoteName: stri
     success: true,
     found: Boolean(String(lsRemote.stdout || '').trim()),
   };
-};
-
-const setBranchTrackingFallback = async (worktreeDirectory: string, localBranch: string, upstream: { remote: string; branch: string }) => {
-  await runGitCommandOrThrow(
-    worktreeDirectory,
-    ['config', `branch.${localBranch}.remote`, upstream.remote],
-    `Failed to set branch.${localBranch}.remote`
-  );
-  await runGitCommandOrThrow(
-    worktreeDirectory,
-    ['config', `branch.${localBranch}.merge`, `refs/heads/${upstream.branch}`],
-    `Failed to set branch.${localBranch}.merge`
-  );
 };
 
 const applyUpstreamConfiguration = async (args: {
@@ -1690,23 +1729,19 @@ const applyUpstreamConfiguration = async (args: {
     return;
   }
 
-  let fetched = true;
   try {
     await fetchRemoteBranchRef(primaryWorktree, upstream.remote, upstream.branch);
   } catch {
-    fetched = false;
-  }
-
-  if (fetched) {
-    await runGitCommandOrThrow(
-      worktreeDirectory,
-      ['branch', `--set-upstream-to=${upstream.full}`, localBranch],
-      `Failed to set upstream to ${upstream.full}`
-    );
+    // Fetch failed: leave tracking unset. Do not write branch.*.remote/merge
+    // pointing at a ref that was never fetched.
     return;
   }
 
-  await setBranchTrackingFallback(worktreeDirectory, localBranch, upstream);
+  await runGitCommandOrThrow(
+    worktreeDirectory,
+    ['branch', `--set-upstream-to=${upstream.full}`, localBranch],
+    `Failed to set upstream to ${upstream.full}`
+  );
 };
 
 /**
@@ -1714,18 +1749,23 @@ const applyUpstreamConfiguration = async (args: {
  */
 export async function listGitWorktrees(directory: string): Promise<GitWorktreeInfo[]> {
   const directoryPath = normalizeDirectoryPath(directory);
-  if (!directoryPath || !fs.existsSync(directoryPath) || !fs.existsSync(path.join(directoryPath, '.git'))) {
+  // No `.git` path check here: a bare repository's git dir is the directory
+  // itself, and git still lists its worktrees from there. A non-repository
+  // fails the git command below and reads as an empty list all the same.
+  if (!directoryPath || !fs.existsSync(directoryPath)) {
     return [];
   }
 
   try {
     const result = await runGitCommandOrThrow(directoryPath, ['worktree', 'list', '--porcelain'], 'Failed to list git worktrees');
-    return parseWorktreePorcelain(result.stdout).map((entry) => ({
-      head: entry.head || '',
-      name: path.basename(entry.worktree || ''),
-      branch: entry.branch || '',
-      path: entry.worktree,
-    }));
+    return parseWorktreePorcelain(result.stdout)
+      .filter((entry) => entry.bare !== true)
+      .map((entry) => ({
+        head: entry.head || '',
+        name: path.basename(entry.worktree || ''),
+        branch: entry.branch || '',
+        path: entry.worktree,
+      }));
   } catch (error) {
     console.warn('[GitService] Failed to list worktrees, returning empty list:', error instanceof Error ? error.message : String(error));
     return [];
@@ -1753,7 +1793,7 @@ export async function validateWorktreeCreate(directory: string, input: CreateGit
         if (parsedExistingRemote && ensureRemoteName && ensureRemoteUrl && ensureRemoteName === parsedExistingRemote.remote) {
           const lsRemote = await runGitCommand(
             context.primaryWorktree,
-            ['ls-remote', '--heads', ensureRemoteUrl, `refs/heads/${parsedExistingRemote.branch}`]
+            ['ls-remote', '--heads', '--', ensureRemoteUrl, `refs/heads/${parsedExistingRemote.branch}`]
           );
           if (!lsRemote.success) {
             throw new Error(`Unable to query remote ${ensureRemoteName}`);
@@ -1844,7 +1884,7 @@ export async function validateWorktreeCreate(directory: string, input: CreateGit
       if (!upstreamRemote || !upstreamBranch) {
         errors.push({ code: 'upstream_incomplete', message: 'upstreamRemote and upstreamBranch are required when setUpstream is true' });
       } else {
-        const remoteExists = await runGitCommand(context.primaryWorktree, ['remote', 'get-url', upstreamRemote]);
+        const remoteExists = await runGitCommand(context.primaryWorktree, ['remote', 'get-url', '--', upstreamRemote]);
         if (!remoteExists.success && (!ensureRemoteName || ensureRemoteName !== upstreamRemote)) {
           errors.push({ code: 'remote_not_found', message: `Remote not found: ${upstreamRemote}` });
         }
@@ -1970,6 +2010,7 @@ async function attachGitWorktreeToCandidate(
 
     const parsedRemoteStartRef = await resolveRemoteBranchRef(context.primaryWorktree, startRef);
     if (parsedRemoteStartRef) {
+      worktreeAddArgs.splice(2, 0, '--no-track');
       inferredUpstream = {
         remote: parsedRemoteStartRef.remote,
         branch: parsedRemoteStartRef.branch,
@@ -1977,15 +2018,8 @@ async function attachGitWorktreeToCandidate(
     }
   }
 
-  if (ensureRemoteName && ensureRemoteUrl) {
+  if (mode === 'existing' && ensureRemoteName && ensureRemoteUrl) {
     await ensureRemoteWithUrl(context.primaryWorktree, ensureRemoteName, ensureRemoteUrl);
-  }
-
-  if (mode === 'new') {
-    const parsedRemoteStartRef = await resolveRemoteBranchRef(context.primaryWorktree, startRef);
-    if (parsedRemoteStartRef) {
-      await fetchRemoteBranchRef(context.primaryWorktree, parsedRemoteStartRef.remote, parsedRemoteStartRef.branch);
-    }
   }
 
   await runGitCommandOrThrow(context.primaryWorktree, worktreeAddArgs, 'Failed to create git worktree');
@@ -2007,7 +2041,7 @@ async function attachGitWorktreeToCandidate(
 
   queueWorktreeBootstrap({
     directory: candidate.directory,
-    projectID: context.projectID,
+    projectDirectory: context.requestedDirectory,
     primaryWorktree: context.primaryWorktree,
     localBranch,
     setUpstream: shouldSetUpstream,
@@ -2031,6 +2065,124 @@ async function attachGitWorktreeToCandidate(
   };
 }
 
+const isAncestorRef = async (cwd: string, ancestor: string, descendant: string): Promise<boolean> => {
+  const result = await runGitCommand(cwd, ['merge-base', '--is-ancestor', ancestor, descendant]);
+  return result.success;
+};
+
+type PublishedLocalBranchUpstream = { remote: string; branch: string; localRef: string; trackingRef: string };
+
+/**
+ * The upstream of a local branch whose commits are all published, or null.
+ *
+ * Only the standard remote-tracking layout qualifies
+ * (`refs/remotes/<remote>/<branch>`), because that is the ref
+ * `fetchRemoteBranchRef` refreshes.
+ */
+const resolvePublishedLocalBranchUpstream = async (
+  primaryWorktree: string,
+  startRef: string,
+): Promise<PublishedLocalBranchUpstream | null> => {
+  const branch = startRef.trim().replace(/^refs\/heads\//, '');
+  if (!branch || branch === 'HEAD') return null;
+  const localRef = `refs/heads/${branch}`;
+  const refs = await runGitCommand(primaryWorktree, [
+    'for-each-ref',
+    '--format=%(refname)%00%(upstream)%00%(upstream:remotename)%00%(upstream:remoteref)',
+    localRef,
+  ]);
+  if (!refs.success) return null;
+  const line = refs.stdout.split('\n').find((entry) => entry.startsWith(`${localRef}\0`));
+  if (!line) return null;
+  const [, trackingRef = '', remote = '', remoteRef = ''] = line.split('\0');
+  const remoteBranch = remoteRef.replace(/^refs\/heads\//, '');
+  if (!remote || !remoteBranch || trackingRef !== `refs/remotes/${remote}/${remoteBranch}`) return null;
+  if (!(await isAncestorRef(primaryWorktree, localRef, trackingRef))) return null;
+  return { remote, branch: remoteBranch, localRef, trackingRef };
+};
+
+/**
+ * A local base branch with nothing unpublished starts the worktree from its
+ * freshly fetched upstream, so the worktree includes what was pushed since
+ * the last pull. The local branch itself is never moved. A branch with
+ * unpublished commits, or an upstream that no longer contains the local
+ * commits after the fetch (a force-push), keeps the local ref; a failed fetch
+ * keeps it too and says so.
+ */
+const preparePublishedLocalBranchSource = async (
+  primaryWorktree: string,
+  input: CreateGitWorktreePayload,
+  startRef: string,
+): Promise<{ input: CreateGitWorktreePayload; sourceFetchFailed: boolean }> => {
+  const upstream = await resolvePublishedLocalBranchUpstream(primaryWorktree, startRef);
+  if (!upstream) return { input, sourceFetchFailed: false };
+  try {
+    await fetchRemoteBranchRef(primaryWorktree, upstream.remote, upstream.branch);
+  } catch {
+    return { input, sourceFetchFailed: true };
+  }
+  if (!(await isAncestorRef(primaryWorktree, upstream.localRef, upstream.trackingRef))) {
+    return { input, sourceFetchFailed: false };
+  }
+  return {
+    input: { ...input, startRef: `remotes/${upstream.remote}/${upstream.branch}` },
+    sourceFetchFailed: false,
+  };
+};
+
+const prepareWorktreeCreateSource = async (
+  context: Awaited<ReturnType<typeof resolveWorktreeProjectContext>>,
+  input: CreateGitWorktreePayload,
+): Promise<{ input: CreateGitWorktreePayload; sourceFetchFailed: boolean }> => {
+  if (input.mode === 'existing') {
+    return { input, sourceFetchFailed: false };
+  }
+
+  const ensureRemoteName = String(input.ensureRemoteName || '').trim();
+  const ensureRemoteUrl = String(input.ensureRemoteUrl || '').trim();
+  if (ensureRemoteName && ensureRemoteUrl) {
+    await ensureRemoteWithUrl(context.primaryWorktree, ensureRemoteName, ensureRemoteUrl);
+  }
+
+  const startRef = normalizeStartRef(input.startRef);
+  const remoteStartRef = await resolveRemoteBranchRef(context.primaryWorktree, startRef);
+  if (!remoteStartRef) {
+    return preparePublishedLocalBranchSource(context.primaryWorktree, input, startRef);
+  }
+
+  const status = await getGitStatus(context.primaryWorktree, { mode: 'light' }).catch(() => null);
+  const trackingRef = status?.tracking
+    ? await resolveRemoteBranchRef(context.primaryWorktree, status.tracking)
+    : null;
+  const canFallbackToLocal = Boolean(
+    status?.current
+    && status.ahead === 0
+    && trackingRef?.fullRef === remoteStartRef.fullRef
+  );
+
+  try {
+    await fetchRemoteBranchRef(context.primaryWorktree, remoteStartRef.remote, remoteStartRef.branch);
+    return { input, sourceFetchFailed: false };
+  } catch (error) {
+    if (canFallbackToLocal && status?.current) {
+      return {
+        input: { ...input, startRef: status.current },
+        sourceFetchFailed: true,
+      };
+    }
+
+    const refExists = await runGitCommand(
+      context.primaryWorktree,
+      ['show-ref', '--verify', '--quiet', remoteStartRef.fullRef],
+    );
+    if (!refExists.success) {
+      throw error;
+    }
+    console.warn(`[GitService] failed to refresh ${remoteStartRef.remote}/${remoteStartRef.branch}, proceeding with the existing remote-tracking ref`);
+    return { input, sourceFetchFailed: false };
+  }
+};
+
 export async function createWorktree(directory: string, input: CreateGitWorktreePayload = {}): Promise<GitWorktreeInfo> {
   const mode = input?.mode === 'existing' ? 'existing' : 'new';
   const context = await resolveWorktreeProjectContext(directory);
@@ -2038,11 +2190,13 @@ export async function createWorktree(directory: string, input: CreateGitWorktree
   if (input?.returnAfterDirectoryCreated === true) {
     await assertWorktreeCreatePreflight(directory, input);
   }
+  const prepared = await prepareWorktreeCreateSource(context, input);
+  const preparedInput = prepared.input;
 
   await fs.promises.mkdir(context.worktreeRoot, { recursive: true });
 
-  const preferredName = String(input?.worktreeName || input?.name || '').trim();
-  const preferredBranchName = cleanBranchName(String(input?.branchName || '').trim());
+  const preferredName = String(preparedInput.worktreeName || preparedInput.name || '').trim();
+  const preferredBranchName = cleanBranchName(String(preparedInput.branchName || '').trim());
 
   const candidate = await resolveCandidateDirectory(
     context.worktreeRoot,
@@ -2051,7 +2205,7 @@ export async function createWorktree(directory: string, input: CreateGitWorktree
     context.primaryWorktree
   );
 
-  if (input?.returnAfterDirectoryCreated === true) {
+  if (preparedInput.returnAfterDirectoryCreated === true) {
     await fs.promises.mkdir(candidate.directory, { recursive: false });
 
     const bootstrapStatus = setWorktreeBootstrapState(
@@ -2065,17 +2219,17 @@ export async function createWorktree(directory: string, input: CreateGitWorktree
       updatedAt: Date.now(),
     };
     const localBranch = mode === 'existing'
-      ? cleanBranchName(String(input?.branchName || input?.existingBranch || candidate.branch || '').trim())
+      ? cleanBranchName(String(preparedInput.branchName || preparedInput.existingBranch || candidate.branch || '').trim())
       : candidate.branch;
 
-    const task = attachGitWorktreeToCandidate(context, candidate, input).catch(async (error) => {
+    const task = attachGitWorktreeToCandidate(context, candidate, preparedInput).catch(async (error) => {
       setWorktreeBootstrapFailure(candidate.directory, error);
       await cleanupFailedFastWorktreeCreate(context, candidate);
       console.warn('[GitService] Background worktree creation failed:', error instanceof Error ? error.message : String(error));
     });
     trackWorktreeBootstrapTask(candidate.directory, task);
 
-    return {
+    const result: GitWorktreeInfo = {
       head: '',
       name: candidate.name,
       branch: localBranch,
@@ -2083,9 +2237,14 @@ export async function createWorktree(directory: string, input: CreateGitWorktree
       directoryCreated: true,
       bootstrapStatus,
     };
+    if (prepared.sourceFetchFailed) {
+      result.sourceFetchFailed = true;
+    }
+    return result;
   }
 
-  return attachGitWorktreeToCandidate(context, candidate, input);
+  const result = await attachGitWorktreeToCandidate(context, candidate, preparedInput);
+  return prepared.sourceFetchFailed ? { ...result, sourceFetchFailed: true } : result;
 }
 
 export async function getWorktreeBootstrapStatus(directory: string): Promise<WorktreeBootstrapStatus> {
@@ -2107,6 +2266,133 @@ export async function getWorktreeBootstrapStatus(directory: string): Promise<Wor
   };
 }
 
+/**
+ * Releases the OpenCode instance that served a removed worktree. The bridge
+ * injects `disposeInstance`; disposal is best-effort, so a failure is warned
+ * about and never fails or rolls back the removal.
+ */
+const disposeWorktreeInstanceBestEffort = async (
+  disposeInstance: RemoveGitWorktreePayload['disposeInstance'],
+  worktreeDirectory: string,
+): Promise<void> => {
+  if (!disposeInstance) {
+    return;
+  }
+  try {
+    await disposeInstance(worktreeDirectory);
+  } catch (error) {
+    console.warn(
+      `Failed to dispose the OpenCode instance for removed worktree ${worktreeDirectory}:`,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+};
+
+// Mirrors packages/web/server/lib/git/service.js: any directory-scoped OpenCode
+// request for a folder of a worktree that is being removed starts that
+// folder's location again, local MCP servers included, and on Windows their
+// working directory keeps the folder from being deleted. The bridge proxy
+// holds such requests until the removal settles.
+type WorktreeRemoval = { root: string; settled: Promise<void> };
+const worktreeRemovalsInProgress = new Set<WorktreeRemoval>();
+
+// A requested folder need not exist; its nearest existing parent is resolved,
+// so a worktree reached through a symlink still matches.
+const canonicalPathOfExistingAncestor = async (input: string): Promise<string> => {
+  const absolutePath = path.resolve(input);
+  for (let current = absolutePath; ; current = path.dirname(current)) {
+    const realPath = await fs.promises.realpath(current).catch(() => null);
+    if (realPath !== null || path.dirname(current) === current) {
+      const normalized = path.normalize(path.join(realPath ?? current, path.relative(current, absolutePath)));
+      return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    }
+  }
+};
+
+const trackWorktreeRemoval = (canonicalDirectory: string): (() => void) => {
+  let settle = () => {};
+  const removal = { root: canonicalDirectory, settled: new Promise<void>((resolve) => { settle = resolve; }) };
+  worktreeRemovalsInProgress.add(removal);
+  return () => {
+    worktreeRemovalsInProgress.delete(removal);
+    settle();
+  };
+};
+
+/**
+ * Resolves once no removal of a worktree holding `directory` is in progress;
+ * at once when none is.
+ */
+export async function waitForWorktreeRemoval(directory: string): Promise<void> {
+  if (worktreeRemovalsInProgress.size === 0) return;
+  const key = toBootstrapStateKey(directory);
+  if (!key) return;
+  const target = await canonicalPathOfExistingAncestor(key);
+  const pending = [...worktreeRemovalsInProgress]
+    .filter((removal) => isInsideOrSameDirectory(removal.root, target))
+    .map((removal) => removal.settled);
+  await Promise.all(pending);
+}
+
+// Mirrors packages/web/server/lib/git/service.js: Windows refuses to delete a
+// folder another process still holds (a session's shell, a file watcher, an
+// editor); those handles are usually released moments later, so a busy
+// failure is retried briefly before it is reported.
+const WORKTREE_BUSY_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+const WORKTREE_BUSY_MESSAGE = 'The worktree folder is still in use by another process (a running session, terminal or editor). Stop it and try again.';
+
+// Only Windows locks a folder that is open elsewhere; on other platforms the
+// same words mean a real permission problem and are reported as they are.
+const isWorktreeBusyError = (text: string | undefined): boolean => process.platform === 'win32'
+  && /Permission denied|EBUSY|EPERM|resource busy|being used by another process/i.test(text ?? '');
+
+const removeBusyDirectory = async (targetDirectory: string): Promise<void> => {
+  try {
+    // fs.rm retries EBUSY/EPERM itself with these options.
+    await fs.promises.rm(targetDirectory, { recursive: true, force: true, maxRetries: WORKTREE_BUSY_RETRY_DELAYS_MS.length, retryDelay: WORKTREE_BUSY_RETRY_DELAYS_MS[0] });
+  } catch (error) {
+    if (error instanceof Error && isWorktreeBusyError(`${(error as NodeJS.ErrnoException).code ?? ''} ${error.message}`)) {
+      throw new Error(WORKTREE_BUSY_MESSAGE);
+    }
+    throw error;
+  }
+};
+
+// Resolves true when git removed the worktree, false when git dropped the
+// registration but left the folder behind (the caller removes it as an orphan).
+// A busy folder is released again before the next attempt, git's or the
+// orphan removal's: a request that reached OpenCode after the first release
+// has started the folder again.
+const removeGitWorktreeWhenFree = async (
+  primaryWorktree: string,
+  worktreePath: string,
+  targetCanonical: string,
+  releaseInstance: () => Promise<void>,
+): Promise<boolean> => {
+  for (let attempt = 0; ; attempt += 1) {
+    const result = await runGitCommand(primaryWorktree, ['worktree', 'remove', '--force', worktreePath]);
+    if (result.success) return true;
+    if (!isWorktreeBusyError(result.message)) {
+      throw new Error(result.message || 'Failed to remove git worktree');
+    }
+    let stillRegistered = false;
+    for (const entry of await listWorktreeEntries(primaryWorktree)) {
+      if (entry?.worktree && await canonicalPath(entry.worktree) === targetCanonical) {
+        stillRegistered = true;
+        break;
+      }
+    }
+    if (!stillRegistered) {
+      await releaseInstance();
+      return false;
+    }
+    const delay = WORKTREE_BUSY_RETRY_DELAYS_MS[attempt];
+    if (delay === undefined) throw new Error(WORKTREE_BUSY_MESSAGE);
+    await releaseInstance();
+    await wait(delay);
+  }
+};
+
 export async function removeWorktree(directory: string, input: RemoveGitWorktreePayload): Promise<boolean> {
   const targetDirectory = normalizeDirectoryPath(input?.directory);
   if (!targetDirectory) {
@@ -2115,7 +2401,7 @@ export async function removeWorktree(directory: string, input: RemoveGitWorktree
 
   await waitForActiveWorktreeBootstrap(targetDirectory);
 
-  const context = await resolveWorktreeProjectContext(directory);
+  const context = await resolveWorktreeProjectContext(directory, { tolerateWorktreeRootConfigError: true });
   const deleteLocalBranch = input?.deleteLocalBranch === true;
 
   const targetCanonical = await canonicalPath(targetDirectory);
@@ -2138,22 +2424,53 @@ export async function removeWorktree(directory: string, input: RemoveGitWorktree
     return null;
   })();
 
-  if (!matchedEntry?.worktree) {
+  const removeManagedOrphan = async ({ registered }: { registered: boolean }) => {
+    // The data-dir root is ours alone, so any leftover inside it may go. A
+    // configured worktree.directory can be shared (".." is the repository's
+    // parent, holding sibling projects), so there only a directory git had
+    // registered as this project's worktree is deleted; an unregistered one
+    // could be anything.
+    const worktreeRootCanonical = await canonicalPath(context.worktreeRoot);
+    const legacyWorktreeRootCanonical = context.legacyWorktreeRoot
+      ? await canonicalPath(context.legacyWorktreeRoot)
+      : null;
+    const insideLegacyRoot = legacyWorktreeRootCanonical !== null
+      && targetCanonical !== legacyWorktreeRootCanonical
+      && isInsideOrSameDirectory(legacyWorktreeRootCanonical, targetCanonical);
+    const insideConfiguredRoot = targetCanonical !== worktreeRootCanonical
+      && isInsideOrSameDirectory(worktreeRootCanonical, targetCanonical);
+    const isManagedOrphan = insideLegacyRoot || (registered && insideConfiguredRoot);
     const targetExists = await checkPathExists(targetDirectory);
-    if (targetExists) {
-      await fs.promises.rm(targetDirectory, { recursive: true, force: true });
+    if (targetExists && isManagedOrphan) {
+      await removeBusyDirectory(targetDirectory);
     }
+    // A removal git abandoned halfway leaves `.git/worktrees/<name>` without
+    // its gitdir; prune drops that metadata so it cannot linger.
+    await runGitCommand(context.primaryWorktree, ['worktree', 'prune']);
+  };
 
+  if (!matchedEntry?.worktree) {
+    await removeManagedOrphan({ registered: false });
     clearWorktreeBootstrapState(targetDirectory);
 
     return true;
   }
 
-  await runGitCommandOrThrow(
-    context.primaryWorktree,
-    ['worktree', 'remove', '--force', matchedEntry.worktree],
-    'Failed to remove git worktree'
-  );
+  const settleRemoval = trackWorktreeRemoval(targetCanonical);
+  // The directory is a registered linked worktree and still exists here, which
+  // is the only point where its OpenCode instance can be released by path.
+  const releaseInstance = () => disposeWorktreeInstanceBestEffort(input?.disposeInstance, matchedEntry.worktree);
+  try {
+    await releaseInstance();
+
+    const removedByGit = await removeGitWorktreeWhenFree(context.primaryWorktree, matchedEntry.worktree, targetCanonical, releaseInstance);
+    if (!removedByGit) {
+      // Git deleted its registration but not the still-locked folder.
+      await removeManagedOrphan({ registered: true });
+    }
+  } finally {
+    settleRemoval();
+  }
 
   if (deleteLocalBranch) {
     const branchName = cleanBranchName(String(matchedEntry.branchRef || matchedEntry.branch || '').trim());
@@ -2171,24 +2488,85 @@ export async function removeWorktree(directory: string, input: RemoveGitWorktree
   return true;
 }
 
+// Run snapshots live under a private namespace so they never show up as
+// branches or tags, yet stay reachable (and safe from gc) until deleted.
+// Mirrors packages/web/server/lib/git/service.js snapshotWorktree.
+const RUN_SNAPSHOT_REF_PATTERN = /^refs\/openchamber\/runs\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+const assertRunSnapshotRef = (ref: string | undefined): string => {
+  const value = typeof ref === 'string' ? ref.trim() : '';
+  if (!RUN_SNAPSHOT_REF_PATTERN.test(value) || value.includes('..')) {
+    throw new Error('Invalid snapshot ref');
+  }
+  return value;
+};
+
+const SNAPSHOT_IDENTITY_ENV = {
+  GIT_AUTHOR_NAME: 'OpenChamber',
+  GIT_AUTHOR_EMAIL: 'snapshot@openchamber.local',
+  GIT_COMMITTER_NAME: 'OpenChamber',
+  GIT_COMMITTER_EMAIL: 'snapshot@openchamber.local',
+};
+
+export async function snapshotWorktree(directory: string, input: { ref?: string }): Promise<{ ref: string; commit: string; head: string }> {
+  const worktreeDirectory = normalizeDirectoryPath(directory);
+  if (!worktreeDirectory) {
+    throw new Error('Worktree directory is required');
+  }
+  const ref = assertRunSnapshotRef(input?.ref);
+  const head = (await runGitCommandOrThrow(worktreeDirectory, ['rev-parse', '--verify', 'HEAD'], 'Worktree has no HEAD commit')).stdout.trim();
+
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'openchamber-snapshot-'));
+  const indexEnv = { GIT_INDEX_FILE: path.join(tempDir, 'index') };
+  try {
+    const run = async (args: string[], message: string, env: NodeJS.ProcessEnv = indexEnv): Promise<string> => {
+      const result = await execGit(args, worktreeDirectory, env);
+      if (result.exitCode !== 0) {
+        throw new Error(String(result.stderr || '').trim() || message);
+      }
+      return String(result.stdout || '').trim();
+    };
+    await run(['read-tree', head], 'Failed to prepare snapshot index');
+    await run(['add', '-A'], 'Failed to collect worktree changes');
+    const tree = await run(['write-tree'], 'Failed to write snapshot tree');
+    const commit = await run(
+      ['commit-tree', tree, '-p', head, '-m', 'OpenChamber run snapshot'],
+      'Failed to write snapshot commit',
+      { ...indexEnv, ...SNAPSHOT_IDENTITY_ENV },
+    );
+    await run(['update-ref', ref, commit], 'Failed to store snapshot ref', {});
+    return { ref, commit, head };
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 // ============== Diff Operations ==============
 
 /**
- * Get diff for a file
+ * Get diff for a status path. A path that no longer resolves, or a nested
+ * repository, is reported as unavailable rather than as an empty diff.
  */
 export async function getGitDiff(
   directory: string, 
   filePath: string, 
   staged = false,
   contextLines?: number
-): Promise<{ diff: string }> {
+): Promise<{ kind: 'diff'; diff: string; submodule: GitSubmoduleState | null } | GitPathUnavailable> {
+  const target = await resolveGitPathTarget(execGit, directory, filePath);
+  if (target.kind === 'unavailable') return target;
+
   const args = ['diff'];
   if (staged) args.push('--cached');
   if (typeof contextLines === 'number') args.push(`-U${contextLines}`);
-  args.push('--', filePath);
+  args.push('--', target.repoPath);
 
   const result = await execGit(args, directory);
-  return { diff: result.stdout };
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr.trim() || 'Failed to get Git diff');
+  }
+  const submodule = target.kind === 'submodule' ? await readSubmoduleState(execGit, directory, target) : null;
+  return { kind: 'diff', diff: result.stdout, submodule };
 }
 
 /**
@@ -2262,7 +2640,22 @@ export async function getGitFileDiff(
   directory: string, 
   filePath: string, 
   staged = false
-): Promise<{ original: string; modified: string; path: string }> {
+): Promise<{ kind: 'file-diff'; original: string; modified: string; path: string; submodule: GitSubmoduleState | null } | GitPathUnavailable> {
+  const target = await resolveGitPathTarget(execGit, directory, filePath);
+  if (target.kind === 'unavailable') return target;
+  if (target.kind === 'submodule') {
+    // Git's own text form of a gitlink; `submodule` carries what text cannot.
+    const submodule = await readSubmoduleState(execGit, directory, target);
+    const describeCommit = (commit: string | null) => (commit ? `Subproject commit ${commit}\n` : '');
+    return {
+      kind: 'file-diff',
+      original: describeCommit(submodule.headCommit),
+      modified: describeCommit(staged ? submodule.indexCommit : submodule.worktreeCommit),
+      path: filePath,
+      submodule,
+    };
+  }
+
   const repo = await getRepository(directory);
   
   if (repo) {
@@ -2292,14 +2685,14 @@ export async function getGitFileDiff(
         modified = Buffer.from(modifiedBytes).toString('utf8');
       }
       
-      return { original, modified, path: filePath };
+      return { kind: 'file-diff', original, modified, path: filePath, submodule: null };
     } catch (error) {
       console.error('[GitService] Failed to get file diff:', error);
     }
   }
 
   // Fallback: return empty content
-  return { original: '', modified: '', path: filePath };
+  return { kind: 'file-diff', original: '', modified: '', path: filePath, submodule: null };
 }
 
 /**
@@ -2782,7 +3175,7 @@ export async function gitPush(
         throw new Error(describePushFailure(error));
       }
 
-      const args = ['push', ...buildUpstreamOptions(gitOptions), fallbackRemote, currentBranch];
+      const args = ['push', ...buildUpstreamOptions(gitOptions), '--', fallbackRemote, currentBranch];
       await pushRaw(args);
       return normalizePushResult(currentBranch, fallbackRemote);
     }
@@ -2795,7 +3188,7 @@ export async function gitPush(
       const currentBranch = await getCurrentBranch();
       const tracking = await hasTrackingBranch();
       if (currentBranch && !tracking) {
-        const args = ['push', ...buildUpstreamOptions(gitOptions), remoteName, currentBranch];
+        const args = ['push', ...buildUpstreamOptions(gitOptions), '--', remoteName, currentBranch];
         await pushRaw(args);
         return normalizePushResult(currentBranch, remoteName);
       }
@@ -2805,7 +3198,7 @@ export async function gitPush(
   }
 
   try {
-    const args = ['push', ...normalizeGitOptions(gitOptions), remoteName];
+    const args = ['push', ...normalizeGitOptions(gitOptions), '--', remoteName];
     if (branch) {
       args.push(branch);
     }
@@ -2821,7 +3214,7 @@ export async function gitPush(
       throw new Error(describePushFailure(error));
     }
 
-    const args = ['push', ...buildUpstreamOptions(gitOptions), remoteName, fallbackBranch];
+    const args = ['push', ...buildUpstreamOptions(gitOptions), '--', remoteName, fallbackBranch];
     await pushRaw(args);
     return normalizePushResult(fallbackBranch, remoteName);
   }
@@ -2965,7 +3358,7 @@ export async function gitFetch(
 
   // Fallback to raw git
   const args = ['fetch'];
-  if (options?.remote) args.push(options.remote);
+  if (options?.remote) args.push('--', options.remote);
   if (options?.branch) args.push(options.branch);
 
   const result = await execGit(args, directory);
@@ -3086,6 +3479,14 @@ export async function getGitLog(
     }
 
     return { all: entries, latest: entries[0] || null, total: entries.length };
+  }
+
+  // A fresh `git init` sits on a branch with no commits yet: HEAD names a
+  // branch that does not resolve. Its history is empty, not an error.
+  if (!options?.to && (await execGit(['rev-parse', '--verify', '-q', 'HEAD'], directory)).exitCode !== 0) {
+    if ((await execGit(['symbolic-ref', '-q', 'HEAD'], directory)).exitCode === 0) {
+      return { all: [], latest: null, total: 0 };
+    }
   }
 
   // Prefer the local ref; fall back to origin/<from> only when the local ref
@@ -3402,12 +3803,6 @@ export async function setGitIdentity(
 
 // ============== Remote Operations ==============
 
-export interface GitRemote {
-  name: string;
-  fetchUrl: string;
-  pushUrl: string;
-}
-
 /**
  * Get list of remotes
  */
@@ -3416,27 +3811,7 @@ export async function getRemotes(directory: string): Promise<GitRemote[]> {
   if (result.exitCode !== 0) {
     return [];
   }
-
-  const remoteMap = new Map<string, GitRemote>();
-  const lines = result.stdout.split('\n').filter(Boolean);
-
-  for (const line of lines) {
-    const match = line.match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)$/);
-    if (match) {
-      const [, name, url, type] = match;
-      if (!remoteMap.has(name)) {
-        remoteMap.set(name, { name, fetchUrl: '', pushUrl: '' });
-      }
-      const remote = remoteMap.get(name)!;
-      if (type === 'fetch') {
-        remote.fetchUrl = url;
-      } else {
-        remote.pushUrl = url;
-      }
-    }
-  }
-
-  return Array.from(remoteMap.values());
+  return parseGitRemoteListing(result.stdout);
 }
 
 export async function removeRemote(directory: string, remote: string): Promise<{ success: boolean }> {
@@ -3448,7 +3823,7 @@ export async function removeRemote(directory: string, remote: string): Promise<{
     throw new Error('Cannot remove origin remote');
   }
 
-  const result = await execGit(['remote', 'remove', remoteName], directory);
+  const result = await execGit(['remote', 'remove', '--', remoteName], directory);
   if (result.exitCode !== 0) {
     throw new Error(result.stderr || result.stdout || `Failed to remove remote ${remoteName}`);
   }
@@ -3717,6 +4092,23 @@ async function canonicalizePath(filePath: string): Promise<string> {
 }
 
 /**
+ * Where `directory` sits inside its checkout: `ai` for `<checkout>/ai`, an empty
+ * string at the root. Git resolves symlinks for it, so the answer holds for a
+ * directory reached through one. Rejects when git cannot tell.
+ */
+export async function resolveRepositoryPrefix(directory: string): Promise<string> {
+  const directoryPath = normalizeDirectoryPath(directory);
+  if (!directoryPath) {
+    throw new Error('Directory is required');
+  }
+  const result = await runGitCommand(directoryPath, ['rev-parse', '--show-prefix']);
+  if (!result.success) {
+    throw new Error(result.stderr || 'Failed to resolve the repository folder');
+  }
+  return result.stdout.trim().replace(/\/+$/, '');
+}
+
+/**
  * Validate that a directory is inside a given worktree root.
  */
 export async function validateWorktreeDirectory(
@@ -3798,7 +4190,7 @@ export async function canonicalizeWorktreeState(
 
   // Resolve worktree project context (worktreeRoot)
   try {
-    const context = await resolveWorktreeProjectContext(directoryPath);
+    const context = await resolveWorktreeProjectContext(directoryPath, { tolerateWorktreeRootConfigError: true });
     worktreeRoot = await canonicalizePath(context.worktreeRoot);
   } catch {
     worktreeStatus = 'invalid';

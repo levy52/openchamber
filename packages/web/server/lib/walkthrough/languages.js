@@ -19,6 +19,7 @@ const LANGUAGE_NAMES = {
   en: 'English',
   de: 'German',
   fr: 'French',
+  nl: 'Dutch',
   'zh-CN': 'Simplified Chinese',
   'zh-TW': 'Traditional Chinese',
   uk: 'Ukrainian',
@@ -27,6 +28,9 @@ const LANGUAGE_NAMES = {
   ko: 'Korean',
   pl: 'Polish',
   ja: 'Japanese',
+  tr: 'Turkish',
+  ar: 'Arabic',
+  he: 'Hebrew',
 };
 
 /**

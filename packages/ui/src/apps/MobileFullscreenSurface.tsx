@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom';
 import { Icon } from '@/components/icon/Icon';
 import { useI18n } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
+import { isIMECompositionEvent } from '@/lib/ime';
 
 const SURFACE_ROOT_ID = 'mobile-surface-root';
 const ENTER_DELAY_MS = 16;
@@ -22,7 +23,7 @@ const ensureSurfaceRoot = (): HTMLElement | null => {
   return root;
 };
 
-export type MobileFullscreenSurfaceProps = {
+type MobileFullscreenSurfaceProps = {
   open: boolean;
   onClose: () => void;
   title?: React.ReactNode;
@@ -67,7 +68,7 @@ export const MobileFullscreenSurface: React.FC<MobileFullscreenSurfaceProps> = (
   dialogAlign = 'chat',
   children,
 }) => {
-  const { t } = useI18n();
+  const { t, direction } = useI18n();
   const rootRef = React.useRef<HTMLElement | null>(null);
   const [entered, setEntered] = React.useState(false);
   const [contentReady, setContentReady] = React.useState(false);
@@ -125,6 +126,7 @@ export const MobileFullscreenSurface: React.FC<MobileFullscreenSurfaceProps> = (
     const focusTimer = window.setTimeout(focusFirstElement, ENTER_DELAY_MS);
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !disableEscapeDismiss) {
+        if (isIMECompositionEvent(event)) return;
         onCloseRef.current();
         return;
       }
@@ -175,7 +177,7 @@ export const MobileFullscreenSurface: React.FC<MobileFullscreenSurfaceProps> = (
         'flex flex-col bg-background text-foreground',
         isDialog
           ? 'h-[min(88dvh,860px)] w-full max-w-[720px] overflow-hidden rounded-2xl border border-border/70 shadow-[0_24px_64px_rgb(0_0_0_/_0.32)]'
-          : 'oc-keyboard-inset-surface fixed inset-0 z-50',
+          : 'oc-keyboard-inset-surface oc-bottom-safe-surface fixed inset-0 z-50',
       )}
       style={isDialog ? {
         // Scale/fade instead of the push slide: the card is not a navigation
@@ -189,7 +191,8 @@ export const MobileFullscreenSurface: React.FC<MobileFullscreenSurfaceProps> = (
         // Push-style enter: slide in from the right edge; settled state drops
         // the transform entirely so the surface isn't kept on a compositing
         // layer (iOS clips those to the safe-area viewport).
-        transform: entered ? 'none' : 'translateX(100%)',
+        // A pushed page arrives from the end of the line: the right, or the left in RTL.
+        transform: entered ? 'none' : direction === 'rtl' ? 'translateX(-100%)' : 'translateX(100%)',
         transition: `transform ${ENTER_DURATION_MS}ms cubic-bezier(0.32, 0.72, 0, 1)`,
       }}
       onTransitionEnd={(event) => {
@@ -208,7 +211,7 @@ export const MobileFullscreenSurface: React.FC<MobileFullscreenSurfaceProps> = (
         >
           <button
             type="button"
-            className="-ml-1 flex size-10 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-interactive-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="-ms-1 flex size-10 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-interactive-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             aria-label={t('mobile.surface.closeAria')}
             onClick={onClose}
             style={{ touchAction: 'manipulation' }}
@@ -249,7 +252,7 @@ export const MobileFullscreenSurface: React.FC<MobileFullscreenSurfaceProps> = (
 
   return createPortal(
     <div
-      className="oc-keyboard-inset-surface fixed inset-0 z-50 flex items-center justify-center p-4 transition-opacity duration-200 ease-out"
+      className="oc-keyboard-inset-surface oc-bottom-safe-surface fixed inset-0 z-50 flex items-center justify-center p-4 transition-opacity duration-200 ease-out"
       style={{
         background: 'rgb(0 0 0 / 0.45)',
         opacity: entered ? 1 : 0,

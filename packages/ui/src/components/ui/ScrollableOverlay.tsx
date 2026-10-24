@@ -18,7 +18,11 @@ type ScrollableOverlayProps = React.HTMLAttributes<HTMLElement> & {
   scrollShadowSize?: number;
   /** Suppress the top fade (e.g. when sticky headers sit at the top edge). */
   hideTopScrollShadow?: boolean;
+  /** Suppress the bottom fade while retaining scroll-state tracking. */
+  hideBottomScrollShadow?: boolean;
   userIntentOnly?: boolean;
+  /** Pixels kept clear above the vertical scrollbar track. */
+  verticalTrackStart?: number;
   /** Forwarded to the inner element (e.g. textarea). */
   disabled?: boolean;
 };
@@ -40,7 +44,9 @@ export const ScrollableOverlay = React.forwardRef<HTMLElement, ScrollableOverlay
     useScrollShadow = false,
     scrollShadowSize,
     hideTopScrollShadow = false,
+    hideBottomScrollShadow = false,
     userIntentOnly = false,
+    verticalTrackStart,
     ...rest
   }, ref) => {
     const containerRef = React.useRef<HTMLElement | null>(null);
@@ -50,7 +56,7 @@ export const ScrollableOverlay = React.forwardRef<HTMLElement, ScrollableOverlay
     return (
       <div
         className={cn(
-          "relative flex flex-col min-h-0 w-full overflow-hidden",
+          "overlay-scrollbar-wrapper relative flex flex-col min-h-0 w-full overflow-hidden",
           preventOverscroll && "overscroll-none",
           outerClassName
         )}
@@ -61,6 +67,7 @@ export const ScrollableOverlay = React.forwardRef<HTMLElement, ScrollableOverlay
             ref={containerRef as React.Ref<HTMLElement>}
             size={scrollShadowSize}
             hideTopShadow={hideTopScrollShadow}
+            hideBottomShadow={hideBottomScrollShadow}
             className={cn(
               "overlay-scrollbar-target overlay-scrollbar-container",
               preventOverscroll && "overscroll-none",
@@ -98,6 +105,7 @@ export const ScrollableOverlay = React.forwardRef<HTMLElement, ScrollableOverlay
           disableHorizontal={disableHorizontal}
           observeMutations={observeMutations}
           userIntentOnly={userIntentOnly}
+          verticalTrackStart={verticalTrackStart}
         />
       </div>
     );

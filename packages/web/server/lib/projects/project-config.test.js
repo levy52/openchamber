@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { mkdtemp, rm, readFile, writeFile } from 'fs/promises';
 import { createProjectConfigRuntime } from './project-config.js';
+import { createProjectIdFromPath } from './project-id.js';
 
 const createRuntime = async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'oc-scheduled-project-config-'));
@@ -14,6 +15,7 @@ const createRuntime = async () => {
   });
   return {
     runtime,
+    tempRoot,
     cleanup: async () => {
       await rm(tempRoot, { recursive: true, force: true });
     },
@@ -21,6 +23,19 @@ const createRuntime = async () => {
 };
 
 describe('project-config runtime', () => {
+  it('round-trips target tasks, terminal states and agent-only overrides without changing legacy model requirements', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    try {
+      const input = { name: 'Reuse', enabled: true, targetSessionId: 'ses_target', schedule: { kind: 'daily', time: '09:00' }, execution: { prompt: 'Continue', agent: 'plan' } };
+      const saved = await runtime.upsertScheduledTask('project-test', input);
+      for (const lastStatus of ['queued', 'sent', 'skipped', 'failed', 'cancelled']) {
+        await runtime.updateScheduledTaskState('project-test', saved.task.id, { lastStatus, lastSessionId: 'ses_target' });
+        expect((await runtime.listScheduledTasks('project-test'))[0]).toMatchObject({ targetSessionId: 'ses_target', state: { lastStatus, lastSessionId: 'ses_target' } });
+      }
+      await expect(runtime.upsertScheduledTask('project-test', { ...input, targetSessionId: '../bad' })).rejects.toThrow('targetSessionId is invalid');
+      await expect(runtime.upsertScheduledTask('project-test', { ...input, targetSessionId: '' })).rejects.toThrow('execution.providerID is required');
+    } finally { await cleanup(); }
+  });
   it('creates and persists a scheduled task', async () => {
     const { runtime, cleanup } = await createRuntime();
     try {
@@ -46,6 +61,23 @@ describe('project-config runtime', () => {
       expect(reloaded[0].name).toBe('Nightly digest');
       expect(reloaded[0].schedule.timezone).toBe('UTC');
       expect(reloaded[0].schedule.times).toEqual(['09:30']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('accepts a task that follows the session defaults without a model, and still needs one when pinned', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    const task = (execution) => ({
+      name: 'Follow defaults',
+      enabled: true,
+      schedule: { kind: 'daily', time: '09:30', timezone: 'UTC' },
+      execution: { prompt: 'Summarize', ...execution },
+    });
+    try {
+      const result = await runtime.upsertScheduledTask('project-test', task({ useDefaults: true }));
+      expect(result.task.execution).toEqual({ prompt: 'Summarize', useDefaults: true });
+      await expect(runtime.upsertScheduledTask('project-test', task({}))).rejects.toThrow('execution.providerID is required');
     } finally {
       await cleanup();
     }
@@ -168,6 +200,102 @@ describe('project-config runtime', () => {
       expect(result.task.schedule.date).toBe('2026-04-20');
       expect(result.task.schedule.time).toBe('13:45');
       expect(result.task.schedule.timezone).toBe('Europe/Kyiv');
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+describe('project-config file naming', () => {
+  const nightly = {
+    name: 'nightly',
+    enabled: true,
+    schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+    execution: { prompt: 'run', providerID: 'openai', modelID: 'gpt-4.1' },
+  };
+
+  it('names the file by the id while the id fits a file name', async () => {
+    const { runtime, tempRoot, cleanup } = await createRuntime();
+    try {
+      const projectID = createProjectIdFromPath('/Users/someone/projects/demo');
+      expect(runtime.resolveProjectConfigPath(projectID)).toBe(path.join(tempRoot, `${projectID}.json`));
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('stores a project whose path is too long for a file name under a bounded name', async () => {
+    const { runtime, tempRoot, cleanup } = await createRuntime();
+    try {
+      // ~190 characters, like a scratchpad checkout nested under a worktree;
+      // the base64url id is longer than the 255-byte file name limit allows.
+      const projectPath = `/private/tmp/claude-501/${'segment-'.repeat(18)}/scratchpad/evidence/demo-repo`;
+      expect(projectPath.length).toBeGreaterThan(180);
+      const projectID = createProjectIdFromPath(projectPath);
+      expect(projectID.length).toBeGreaterThan(240);
+
+      const filePath = runtime.resolveProjectConfigPath(projectID);
+      const fileName = path.basename(filePath);
+      expect(path.dirname(filePath)).toBe(tempRoot);
+      expect(fileName.startsWith('path_sha256_')).toBe(true);
+      expect(fileName.length).toBeLessThan(100);
+      // The same id always maps to the same file.
+      expect(runtime.resolveProjectConfigPath(projectID)).toBe(filePath);
+
+      // The whole write path (lock file, temp file, rename) works on a real filesystem.
+      const created = await runtime.upsertScheduledTask(projectID, nightly);
+      expect(created.created).toBe(true);
+      const setup = await runtime.updateProjectSetup(projectID, { setupWorktree: ['bun install'] });
+      expect(setup.setupWorktree).toEqual(['bun install']);
+
+      const raw = JSON.parse(await readFile(filePath, 'utf8'));
+      expect(raw.scheduledTasks).toHaveLength(1);
+      expect(raw['setup-worktree']).toEqual(['bun install']);
+      expect(await runtime.listScheduledTasks(projectID)).toHaveLength(1);
+      expect((await runtime.readProjectSetup(projectID)).setupWorktree).toEqual(['bun install']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('reads a long id from its pre-bound file name and moves it on the next write', async () => {
+    const { runtime, tempRoot, cleanup } = await createRuntime();
+    try {
+      // Long enough for the bounded name, short enough that an older build
+      // could still have written `<id>.json` on this filesystem.
+      const projectID = `path_${'a'.repeat(200)}`;
+      const legacyPath = path.join(tempRoot, `${projectID}.json`);
+      const currentPath = runtime.resolveProjectConfigPath(projectID);
+      expect(currentPath).not.toBe(legacyPath);
+      await writeFile(legacyPath, JSON.stringify({
+        version: 1,
+        scheduledTasks: [{ id: 'task-legacy', ...nightly, state: { createdAt: 1, updatedAt: 2, lastStatus: 'idle' } }],
+        projectNotes: 'keep me',
+      }), 'utf8');
+
+      const tasks = await runtime.listScheduledTasks(projectID);
+      expect(tasks.map((task) => task.id)).toEqual(['task-legacy']);
+
+      await runtime.upsertScheduledTask(projectID, { ...nightly, name: 'weekly digest' });
+
+      const raw = JSON.parse(await readFile(currentPath, 'utf8'));
+      expect(raw.scheduledTasks.map((task) => task.id)).toEqual(['task-legacy', 'task-fixed-id']);
+      expect(raw.projectNotes).toBe('keep me');
+      await expect(readFile(legacyPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+      expect((await runtime.listScheduledTasks(projectID)).map((task) => task.name)).toEqual(['nightly', 'weekly digest']);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('treats a malformed pre-bound file as a failure, not as an empty project', async () => {
+    const { runtime, tempRoot, cleanup } = await createRuntime();
+    try {
+      const projectID = `path_${'b'.repeat(200)}`;
+      await writeFile(path.join(tempRoot, `${projectID}.json`), '{ not json', 'utf8');
+      await expect(runtime.listScheduledTasks(projectID)).rejects.toThrow();
+      await expect(runtime.upsertScheduledTask(projectID, nightly)).rejects.toThrow();
+      await expect(readFile(runtime.resolveProjectConfigPath(projectID), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     } finally {
       await cleanup();
     }
@@ -467,6 +595,385 @@ describe('project-config loop reconciliation', () => {
       expect(task.execution.goalEnabled).toBe(true);
       expect(task.execution.goalTokenBudget).toBe(20000);
       expect(task.execution.permissionAutoAccept).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  describe('fields this build does not know', () => {
+    // Simulates a config written by a newer build (or a newer UI): the task
+    // carries execution and state fields normalization here has never heard of.
+    const seedForeignTask = async (runtime, tempRoot) => {
+      const created = await runtime.upsertScheduledTask('project-test', {
+        name: 'Nightly digest',
+        enabled: true,
+        schedule: { kind: 'daily', time: '09:30', timezone: 'UTC' },
+        execution: { prompt: 'Summarize', providerID: 'openai', modelID: 'gpt-4.1', goalEnabled: true },
+      });
+      const filePath = path.join(tempRoot, 'project-test.json');
+      const stored = JSON.parse(await readFile(filePath, 'utf8'));
+      stored.scheduledTasks[0].execution.futureExecutionField = 'keep me';
+      stored.scheduledTasks[0].state.futureStateField = 42;
+      stored.scheduledTasks[0].futureTopLevelField = true;
+      await writeFile(filePath, JSON.stringify(stored, null, 2), 'utf8');
+      return { id: created.task.id, filePath };
+    };
+
+    const readStoredTask = async (filePath, id) => {
+      const stored = JSON.parse(await readFile(filePath, 'utf8'));
+      return stored.scheduledTasks.find((task) => task.id === id);
+    };
+
+    it('survive a state update after a run, and the claim update', async () => {
+      const { runtime, tempRoot, cleanup } = await createRuntime();
+      try {
+        const { id, filePath } = await seedForeignTask(runtime, tempRoot);
+
+        await runtime.updateScheduledTaskState('project-test', id, { lastStatus: 'success', lastRunAt: 1000 });
+        let stored = await readStoredTask(filePath, id);
+        expect(stored.execution.futureExecutionField).toBe('keep me');
+        expect(stored.execution.goalEnabled).toBe(true);
+        expect(stored.futureTopLevelField).toBe(true);
+        expect(stored.state.lastStatus).toBe('success');
+
+        await runtime.updateScheduledTaskStateIf('project-test', id, () => true, { lastScheduledFor: 5000 });
+        stored = await readStoredTask(filePath, id);
+        expect(stored.execution.futureExecutionField).toBe('keep me');
+        expect(stored.state.lastScheduledFor).toBe(5000);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('survive writes that replace or delete a different task, and a loop sync', async () => {
+      const { runtime, tempRoot, cleanup } = await createRuntime();
+      try {
+        const { id, filePath } = await seedForeignTask(runtime, tempRoot);
+
+        const other = await runtime.upsertScheduledTask('project-test', {
+          id: 'other-task',
+          name: 'Other',
+          enabled: true,
+          schedule: { kind: 'daily', time: '10:00', timezone: 'UTC' },
+          execution: { prompt: 'Other', providerID: 'openai', modelID: 'gpt-4.1' },
+        });
+        expect((await readStoredTask(filePath, id)).execution.futureExecutionField).toBe('keep me');
+
+        await runtime.deleteScheduledTask('project-test', other.task.id);
+        expect((await readStoredTask(filePath, id)).execution.futureExecutionField).toBe('keep me');
+
+        await runtime.reconcileLoopTasks('project-test', []);
+        expect((await readStoredTask(filePath, id)).execution.futureExecutionField).toBe('keep me');
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('are dropped only when the task itself is deliberately saved', async () => {
+      const { runtime, tempRoot, cleanup } = await createRuntime();
+      try {
+        const { id, filePath } = await seedForeignTask(runtime, tempRoot);
+        const [task] = await runtime.listScheduledTasks('project-test');
+        await runtime.upsertScheduledTask('project-test', { ...task, name: 'Renamed' });
+        const stored = await readStoredTask(filePath, id);
+        expect(stored.name).toBe('Renamed');
+        expect(stored.execution.futureExecutionField).toBeUndefined();
+      } finally {
+        await cleanup();
+      }
+    });
+  });
+
+  it('conditionally updates state only when the predicate passes (occurrence claim)', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    try {
+      const created = await runtime.upsertScheduledTask('project-test', {
+        name: 'claim-me',
+        enabled: true,
+        schedule: { kind: 'daily', time: '15:00', timezone: 'UTC' },
+        execution: { prompt: 'Run once', providerID: 'openai', modelID: 'gpt-4.1' },
+      });
+
+      const scheduledFor = Date.UTC(2026, 0, 1, 15, 0, 0);
+      const first = await runtime.updateScheduledTaskStateIf(
+        'project-test',
+        created.task.id,
+        (task) => !Number.isFinite(task.state?.lastScheduledFor),
+        {
+          lastScheduledFor: scheduledFor,
+          lastStatus: 'running',
+          nextRunAt: scheduledFor + 86_400_000,
+        },
+      );
+      expect(first.updated).toBe(true);
+      expect(first.task.state.lastScheduledFor).toBe(scheduledFor);
+
+      const second = await runtime.updateScheduledTaskStateIf(
+        'project-test',
+        created.task.id,
+        (task) => task.state?.lastScheduledFor !== scheduledFor,
+        {
+          lastScheduledFor: scheduledFor,
+          lastStatus: 'running',
+        },
+      );
+      expect(second.updated).toBe(false);
+      expect(second.task.state.lastScheduledFor).toBe(scheduledFor);
+
+      const reloaded = await runtime.listScheduledTasks('project-test');
+      expect(reloaded[0].state.lastScheduledFor).toBe(scheduledFor);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('serializes concurrent writes across two runtimes sharing a projects dir', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'oc-project-lock-contention-'));
+    const fsPromises = await import('fs/promises');
+    try {
+      const runtimeA = createProjectConfigRuntime({
+        fsPromises,
+        path,
+        projectsDirPath: tempRoot,
+        createTaskID: () => 'shared-task',
+      });
+      const runtimeB = createProjectConfigRuntime({
+        fsPromises,
+        path,
+        projectsDirPath: tempRoot,
+        createTaskID: () => 'shared-task',
+      });
+
+      await runtimeA.upsertScheduledTask('project-lock', {
+        name: 'contended',
+        enabled: true,
+        schedule: { kind: 'daily', time: '15:00', timezone: 'UTC' },
+        execution: { prompt: 'Run', providerID: 'openai', modelID: 'gpt-4.1' },
+      });
+
+      await Promise.all([
+        runtimeA.updateScheduledTaskState('project-lock', 'shared-task', {
+          lastStatus: 'success',
+          lastRunAt: 100,
+        }),
+        runtimeB.updateScheduledTaskState('project-lock', 'shared-task', {
+          lastStatus: 'error',
+          lastRunAt: 200,
+        }),
+      ]);
+
+      const tasks = await runtimeA.listScheduledTasks('project-lock');
+      expect(tasks).toHaveLength(1);
+      expect(['success', 'error']).toContain(tasks[0].state.lastStatus);
+      expect([100, 200]).toContain(tasks[0].state.lastRunAt);
+
+      const lockPath = `${runtimeA.resolveProjectConfigPath('project-lock')}.lock`;
+      await expect(fsPromises.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers from a stale-by-age project config lock and cleans it up', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    const fsPromises = await import('fs/promises');
+    try {
+      const projectID = 'stale-age';
+      const configPath = runtime.resolveProjectConfigPath(projectID);
+      const lockPath = `${configPath}.lock`;
+      await fsPromises.mkdir(path.dirname(configPath), { recursive: true });
+      await writeFile(lockPath, JSON.stringify({
+        pid: process.pid,
+        at: Date.now() - 120_000,
+      }));
+
+      const created = await runtime.upsertScheduledTask(projectID, {
+        name: 'after-stale',
+        enabled: true,
+        schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+        execution: { prompt: 'Run', providerID: 'openai', modelID: 'gpt-4.1' },
+      });
+      expect(created.created).toBe(true);
+      await expect(fsPromises.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('recovers from a stale-by-dead-pid project config lock', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    const fsPromises = await import('fs/promises');
+    try {
+      const projectID = 'stale-pid';
+      const configPath = runtime.resolveProjectConfigPath(projectID);
+      const lockPath = `${configPath}.lock`;
+      await fsPromises.mkdir(path.dirname(configPath), { recursive: true });
+      // PID unlikely to exist; kill(pid, 0) should fail with ESRCH.
+      await writeFile(lockPath, JSON.stringify({
+        pid: 2_147_483_647,
+        at: Date.now(),
+      }));
+
+      const created = await runtime.upsertScheduledTask(projectID, {
+        name: 'after-dead-pid',
+        enabled: true,
+        schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+        execution: { prompt: 'Run', providerID: 'openai', modelID: 'gpt-4.1' },
+      });
+      expect(created.created).toBe(true);
+      await expect(fsPromises.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('release does not unlink a lock stolen by another holder', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'oc-project-lock-own-'));
+    const realFs = await import('fs/promises');
+    let enteredCritical;
+    const entered = new Promise((resolve) => {
+      enteredCritical = resolve;
+    });
+    let resumeCritical;
+    const hold = new Promise((resolve) => {
+      resumeCritical = resolve;
+    });
+
+    const fsPromises = {
+      ...realFs,
+      rename: async (from, to) => {
+        if (String(from).includes('.tmp-')) {
+          enteredCritical();
+          await hold;
+        }
+        return realFs.rename(from, to);
+      },
+    };
+
+    try {
+      const runtime = createProjectConfigRuntime({
+        fsPromises,
+        path,
+        projectsDirPath: tempRoot,
+        createTaskID: () => 'owned-task',
+      });
+      const projectID = 'lock-own';
+      const lockPath = `${runtime.resolveProjectConfigPath(projectID)}.lock`;
+      const stolenPid = process.pid + 1;
+
+      const upsertPromise = runtime.upsertScheduledTask(projectID, {
+        name: 'ownership',
+        enabled: true,
+        schedule: { kind: 'daily', time: '10:00', timezone: 'UTC' },
+        execution: { prompt: 'Run', providerID: 'openai', modelID: 'gpt-4.1' },
+      });
+
+      await entered;
+      await realFs.writeFile(lockPath, JSON.stringify({
+        pid: stolenPid,
+        at: Date.now(),
+      }));
+      resumeCritical();
+      await upsertPromise;
+
+      const raw = await realFs.readFile(lockPath, 'utf8');
+      expect(JSON.parse(raw).pid).toBe(stolenPid);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('times out when a live lock holder never releases', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    const fsPromises = await import('fs/promises');
+    try {
+      const projectID = 'lock-timeout';
+      const configPath = runtime.resolveProjectConfigPath(projectID);
+      const lockPath = `${configPath}.lock`;
+      await fsPromises.mkdir(path.dirname(configPath), { recursive: true });
+      // Current process is alive — acquire must wait then throw.
+      await writeFile(lockPath, JSON.stringify({
+        pid: process.pid,
+        at: Date.now(),
+      }));
+
+      await expect(runtime.upsertScheduledTask(projectID, {
+        name: 'blocked',
+        enabled: true,
+        schedule: { kind: 'daily', time: '11:00', timezone: 'UTC' },
+        execution: { prompt: 'Run', providerID: 'openai', modelID: 'gpt-4.1' },
+      })).rejects.toThrow(/timeout acquiring project config lock/);
+    } finally {
+      await cleanup();
+    }
+  }, 15_000);
+
+  it('releases the write chain after a lock timeout so a later write can complete', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    const fsPromises = await import('fs/promises');
+    try {
+      const projectID = 'lock-timeout-recover';
+      const configPath = runtime.resolveProjectConfigPath(projectID);
+      const lockPath = `${configPath}.lock`;
+      await fsPromises.mkdir(path.dirname(configPath), { recursive: true });
+      await writeFile(lockPath, JSON.stringify({
+        pid: process.pid,
+        at: Date.now(),
+      }));
+
+      await expect(runtime.upsertScheduledTask(projectID, {
+        name: 'blocked-then-recover',
+        enabled: true,
+        schedule: { kind: 'daily', time: '11:00', timezone: 'UTC' },
+        execution: { prompt: 'Run', providerID: 'openai', modelID: 'gpt-4.1' },
+      })).rejects.toThrow(/timeout acquiring project config lock/);
+
+      // Remove the hostile lock. A wedged in-process chain would hang forever here.
+      await fsPromises.unlink(lockPath);
+
+      const created = await Promise.race([
+        runtime.upsertScheduledTask(projectID, {
+          name: 'after-timeout',
+          enabled: true,
+          schedule: { kind: 'daily', time: '12:00', timezone: 'UTC' },
+          execution: { prompt: 'Run after timeout', providerID: 'openai', modelID: 'gpt-4.1' },
+        }),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('second write hung after lock timeout')), 3_000);
+        }),
+      ]);
+
+      expect(created.created).toBe(true);
+      expect(created.task.name).toBe('after-timeout');
+      const listed = await runtime.listScheduledTasks(projectID);
+      expect(listed).toHaveLength(1);
+      expect(listed[0].name).toBe('after-timeout');
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
+  it('recovers from an unparseable lock using mtime age', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    const fsPromises = await import('fs/promises');
+    try {
+      const projectID = 'stale-unparseable';
+      const configPath = runtime.resolveProjectConfigPath(projectID);
+      const lockPath = `${configPath}.lock`;
+      await fsPromises.mkdir(path.dirname(configPath), { recursive: true });
+      // Simulate crash between open(wx) and writeFile / partial payload.
+      await writeFile(lockPath, '{not-json');
+      const staleMtime = new Date(Date.now() - 120_000);
+      await fsPromises.utimes(lockPath, staleMtime, staleMtime);
+
+      const created = await runtime.upsertScheduledTask(projectID, {
+        name: 'after-unparseable',
+        enabled: true,
+        schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+        execution: { prompt: 'Run', providerID: 'openai', modelID: 'gpt-4.1' },
+      });
+      expect(created.created).toBe(true);
+      await expect(fsPromises.access(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
     } finally {
       await cleanup();
     }

@@ -3,8 +3,9 @@
  * endpoints (faster-whisper, whisper.cpp, OpenAI, ...).
  *
  * The Whisper HTTP API cannot stream, so audio is buffered per segment and
- * transcribed on commit(). Live partials therefore only advance at segment
- * boundaries (the DictationStreamManager auto-commits every ~15s of speech).
+ * transcribed on commit(). This matches how the local session behaves: the
+ * DictationStreamManager splits long dictations at pauses, and everything
+ * shorter is one request on stop.
  *
  * Implements the StreamingTranscriptionSession contract used by
  * DictationStreamManager.
@@ -14,6 +15,7 @@ import { EventEmitter } from 'events';
 import { randomUUID } from 'crypto';
 
 import { transcribeAudio } from '../tts/stt.js';
+import { normalizeCustomOpenAIBaseURL } from '../tts/base-url.js';
 import { pcm16ToWav } from './audio.js';
 
 const OPENAI_COMPATIBLE_SAMPLE_RATE = 16000;
@@ -35,6 +37,12 @@ export class OpenAICompatibleTranscriptionSession extends EventEmitter {
   async connect() {
     if (!this.config.baseURL) {
       throw new Error('Custom STT server URL is not configured');
+    }
+    // Every transcription checks the URL again; refusing here tells the user
+    // before they dictate instead of after.
+    const url = normalizeCustomOpenAIBaseURL(this.config.baseURL);
+    if (url.error) {
+      throw new Error(url.error);
     }
     if (!this.config.model) {
       throw new Error('STT model is not configured');

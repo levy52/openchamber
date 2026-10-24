@@ -11,14 +11,15 @@ This file contains only always-on repository rules and routing. Detailed workflo
 These steps are mandatory. Before editing, you **MUST**:
 
 1. Follow this root guide.
-2. Load every matching project skill and every task-required reference from
-   those skills.
-3. Read the nearest `DOCUMENTATION.md` and package `README.md` when present.
+2. Load every project skill whose `description` matches the change, and every
+   reference those skills require. Any source change starts with
+   `openchamber-change-discipline`.
+3. Read the nearest `DOCUMENTATION.md` (under `packages/**`) for each module you
+   change, and the package `README.md` for package-level work.
 4. Follow local code and test precedent.
 
 If these sources materially conflict, stop and resolve the conflict instead of silently choosing one.
-Do not start editing when a matching skill or required reference has not been
-read. Skill loading is a required part of the task, not optional guidance.
+Do not start editing before every matching skill and required reference is read.
 
 ## Runtime Boundaries
 
@@ -28,8 +29,10 @@ read. Skill loading is a required part of the task, not optional guidance.
 - `packages/vscode`: extension host, webview, and runtime bridge.
 - `packages/mobile`: Capacitor iOS/Android shell; bundles the mobile web surface and connects to an existing OpenChamber server.
 - `packages/docs`: product documentation; not a Bun workspace.
+- `packages/sdk`: guest contract for third-party panels. Manifest parse, iframe envelope, `connectHost`. Host and guest import from here; do not copy these types into `packages/ui`.
+- `packages/extensions`: app-owned SDK extensions and their build registry, not a Bun workspace. See its `DOCUMENTATION.md` for trust, packaging, and migration rules.
 
-Shared UI calls official OpenCode APIs through `@opencode-ai/sdk/v2`. OpenChamber-owned capabilities use `RuntimeAPIs`, `runtimeFetch`, and shared browser/realtime transport helpers. Server-side upstream integrations may use their owning runtime modules.
+Shared UI calls official OpenCode APIs through `@opencode/client` (OpenCode 2.x) via `opencodeClient`; wire shapes stay inside `packages/ui/src/lib/opencode/`. OpenChamber-owned capabilities use `RuntimeAPIs`, `runtimeFetch`, and shared browser/realtime transport helpers. Server-side upstream integrations may use their owning runtime modules.
 
 Electron starts the OpenChamber backend in-process, never as a sidecar. Development may load loopback/HMR UI; packaged builds load staged assets through `openchamber-ui://` while the loopback server remains the API backend. Keep domain backends in web/runtime modules unless behavior is inherently native.
 
@@ -41,7 +44,9 @@ Shared contracts must define intentional behavior for every applicable runtime: 
 - Do not run git or GitHub commands unless the user explicitly asks.
 - Do not add dependencies unless explicitly requested.
 - Never add or log secrets, bearer tokens, pairing credentials, or sensitive user data.
+- Launch Google Chrome for automation with `--disable-features=MacAppCodeSignClone` (`scripts/perf/cdp.mjs` already does). Without it, every launch on macOS copies the 1.4 GB app into `$TMPDIR/../X/com.google.Chrome.code_sign_clone`, and a browser that is killed rather than quit leaves the copy behind.
 - Keep changes minimal and preserve unrelated worktree changes.
+- `changelog/` is read-only, and a fix, feature, or merged PR lands without a changelog line. Release notes are written only when the maintainer asks to update the changelog, through the `update-changelog` skill.
 - Enforce security and correctness in core/runtime logic, not only UI visibility or prompts.
 - Keep entrypoints and bridges thin; place domain logic in focused owning modules.
 - Update owning documentation when module ownership, contracts, or invariants change.
@@ -56,54 +61,23 @@ Shared contracts must define intentional behavior for every applicable runtime: 
 - One failed entity must not erase or block unrelated complete entities.
 - Runtime-specific differences must be intentional and visible in code.
 
-## Documentation Discovery
+## Communication
 
-Before changing a module, search for the nearest `DOCUMENTATION.md`; before package-level work, read its `README.md`. Discover docs dynamically under `packages/**/DOCUMENTATION.md` rather than relying on a static exhaustive map.
+You and the person you work with are two people solving a problem together. Talk like a trusted colleague: plain words, short sentences, mechanisms explained through what the user experiences. Warm and direct, never familiar. A reply is read in minutes, so the conclusion comes first and you stand behind it. Answer in the language you were addressed in; code, comments, and docs stay in English.
 
-High-value anchors:
-
-- Sync: `packages/ui/src/sync/DOCUMENTATION.md`
-- Stores: `packages/ui/src/stores/DOCUMENTATION.md`
-- CLI: `packages/web/bin/lib/DOCUMENTATION.md`
-- Performance measurement tooling: `scripts/perf/DOCUMENTATION.md`
-- VS Code runtime: `packages/vscode/src/DOCUMENTATION.md`
-- Electron: `packages/electron/README.md`
-- Mobile: `packages/mobile/README.md`
+Load the `communication-style` skill once, at the start of the session, before your first reply. It stays in context for the rest of the session: every reply, in any language, and every text people read follows it. Later turns use it as loaded; they do not load it again.
 
 ## Project Skills
 
-Project skills live under `.agents/skills/*/SKILL.md`. You **MUST** load every
-skill matching the character of the change before editing; multiple skills may
-apply, including companion skills required by another skill. Read every
-task-required reference named by those skills. Skills are canonical for their
-detailed workflows and checklists. Treating this table as optional advice is a
-process violation.
-
-| Trigger | Required skill |
-|---|---|
-| Any source, dependency, export, build-config, generated-asset, package-contract, or module-ownership change | `openchamber-change-discipline` |
-| CLI commands, prompts, terminal output, non-TTY, `--quiet`, or `--json` behavior | `clack-cli-patterns` |
-| Shared UI data access, OpenCode SDK, `RuntimeAPIs`, runtime fetch/auth/URLs, bridges/proxies, runtime switching, or server API routes | `ui-api-decoupling` |
-| Electron main/preload, IPC, native UI, updater, deep links, SSH/tunnels, packaging, or child processes | `desktop-shell` |
-| Session sync, bootstrap/reconnect, reducers, polling, optimistic state, queues, live status, reconciliation, or directory-scoped caches | `sync-state-invariants` |
-| Render/store/event hot paths, large lists, caching/indexing, high CPU/memory, lag, jank, freezes, or performance regressions | `performance-engineering` |
-| WebSocket, SSE, streaming transport, runtime transport internals, or private relay | `relay-transport` |
-| UI components, styling, colors, buttons, or icons | `theme-system` |
-| User-facing or accessible UI text, labels, aria, toasts, dialogs, or navigation copy | `locale-ui-patterns` |
-| Settings UI, settings dialogs, configuration surfaces, or settings search | `settings-ui-patterns` |
-| Sortable or drag-to-reorder behavior, especially `@dnd-kit` and touch/wrapping layouts | `drag-to-reorder` |
-| iOS Simulator build, launch, preview, gestures, or `serve-sim` control | `serve-sim` |
-
-Pure code-reading or explanation does not require implementation skills unless needed to interpret a specialized subsystem.
+Project skills live in `.agents/skills/*/SKILL.md`, and each skill's `description`
+says when it applies. If your tool does not list skill descriptions, read them in
+those files before you start. Pure code-reading or explanation needs no
+implementation skills unless a specialized subsystem has to be interpreted.
 
 ## Validation
 
-- Use `package.json` scripts as the command source of truth.
-- Prefer focused tests and package-scoped type-check/lint for executable source changes.
-- Use workspace-wide checks for cross-workspace contracts, root tooling, dependencies, or shared generated assets.
-- Run `bun run dead-code` when source files are added/deleted/renamed or exports, types, entrypoints, or import shape change; inspect its report because it is non-blocking.
-- Do not assume TypeScript/lint covers server JS, CLI JS, Electron helpers, or native behavior; run focused tests, syntax checks, builds, or runtime validation for the touched surface.
-- For docs-only or isolated config changes, run the narrowest relevant validation.
+- Use `package.json` scripts as the command source of truth. Which checks a change needs is in `openchamber-change-discipline`.
+- Before every commit of source changes, `bun run check:changed` passes. It runs type-check, lint, and dead code (Knip, kept at zero findings), then an anti-slop ratchet: the vendored `anti-slop` oxlint plugin (low-evidence typing: unjustified type assertions, `unknown`/`object`/`Record<string, unknown>` contracts, ad hoc `typeof` narrowing, module mocking) may report no more findings per rule across the changed files than at the base. Fix the new findings; the pre-existing backlog stays out of scope unless the task is that cleanup. Never silence a rule, weaken severity, or launder types to make a check pass.
 - Report exactly what was and was not validated. Static checks alone do not prove runtime, relay, performance, or platform correctness.
 
 ## Pull Request Handoff
@@ -111,5 +85,31 @@ Pure code-reading or explanation does not require implementation skills unless n
 Before creating or updating a pull request, read `CONTRIBUTING.md` and
 `.github/PULL_REQUEST_TEMPLATE.md`. Complete the template with concrete,
 current evidence for the final PR HEAD; do not make the reviewer reconstruct
-intent, affected surfaces, applicable guidance, validation, visual behavior,
-or failure and rollback considerations from the diff alone.
+intent, affected surfaces, validation, visual behavior, or failure and
+rollback considerations from the diff alone.
+
+A **product decision** belongs to the maintainer and is settled before the code,
+never inside the diff. A product decision is anything where two reasonable people
+could disagree about whether it should exist or how it should behave: a new
+button, panel, setting or command; a changed default; a shortcut or gesture that
+now does something else; different wording, ordering or grouping in the UI;
+anything that turns existing behavior on or off for everyone. Removing or
+bypassing behavior the code marks as deliberate is one too, and there the first
+question is whether it is a defect at all. A crash, wrong data, behavior that
+contradicts what it plainly claims, or a performance fix that keeps behavior
+identical is a bug, not a product decision.
+
+Where that decision is settled depends on who is working:
+
+- **Working with the maintainer or a team member** (anyone with repository
+  access): raise the product question in the session and get an answer there.
+  The decision already happened off GitHub; no discussion thread and no link is
+  expected on the pull request.
+- **Working as an outside contributor**: the decision happens in an agreed
+  [Ideas discussion](https://github.com/openchamber/openchamber/discussions/categories/ideas)
+  before the code, linked from the pull request. Without the maintainer's
+  go-ahead such a pull request is not reviewed, and a discussion opened
+  afterwards to describe finished work is closed along with it.
+
+When the call is unclear, ask before building. Deciding it silently is the one
+thing that is always wrong.

@@ -9,7 +9,6 @@ declare const self: ServiceWorkerGlobalScope & {
   __WB_MANIFEST: Array<string | { url: string; revision?: string }>;
 };
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const __precacheManifest = self.__WB_MANIFEST;
 
 type PushPayload = {
@@ -64,8 +63,38 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
-  const data = (event.notification.data ?? null) as { url?: string } | null;
-  const url = data?.url ?? '/';
+  // SAFETY: notification data is only ever written by our own showNotification
+  // and push payloads as { url, sessionId }; both fields are re-validated as
+  // trimmed strings below before use.
+  const data = (event.notification.data ?? null) as { url?: string; sessionId?: string } | null;
+  const rawUrl = typeof data?.url === 'string' ? data.url.trim() : '';
+  const rawSessionId = typeof data?.sessionId === 'string' ? data.sessionId.trim() : '';
+  const url = rawUrl || (rawSessionId ? `/?session=${encodeURIComponent(rawSessionId)}` : '/');
 
-  event.waitUntil(self.clients.openWindow(url));
+  event.waitUntil((async () => {
+    // Prefer focusing an already-open window (e.g. the installed PWA) and
+    // navigating it to the target, instead of always spawning a new window.
+    const target = new URL(url, self.location.origin).href;
+    const windowClients = await self.clients.matchAll({
+      type: 'window',
+      includeUncontrolled: true,
+    });
+
+    for (const client of windowClients) {
+      try {
+        if ('navigate' in client) {
+          await client.navigate(target);
+        }
+      } catch {
+        // navigate() can reject for uncontrolled clients; fall back to focus.
+      }
+      if ('focus' in client) {
+        return client.focus();
+      }
+    }
+
+    if (self.clients.openWindow) {
+      return self.clients.openWindow(target);
+    }
+  })());
 });

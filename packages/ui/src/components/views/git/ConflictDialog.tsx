@@ -10,11 +10,10 @@ import { Button } from '@/components/ui/button';
 
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useInputStore } from '@/sync/input-store';
-import { useUIStore } from '@/stores/useUIStore';
 import { toast } from '@/components/ui';
 import { Icon } from "@/components/icon/Icon";
 import { getConflictDetails, type MergeConflictDetails } from '@/lib/gitApi';
-import { renderMagicPrompt } from '@/lib/magicPrompts';
+import { loadMagicPrompts } from '@/lib/magicPrompts';
 import { useI18n } from '@/lib/i18n';
 
 interface ConflictDialogProps {
@@ -25,6 +24,7 @@ interface ConflictDialogProps {
   operation: 'merge' | 'rebase';
   onAbort: () => void;
   onClearState?: () => void;
+  onNavigatedToChat?: () => void;
 }
 
 export const ConflictDialog: React.FC<ConflictDialogProps> = ({
@@ -35,13 +35,13 @@ export const ConflictDialog: React.FC<ConflictDialogProps> = ({
   operation,
   onAbort,
   onClearState,
+  onNavigatedToChat,
 }) => {
   const { t } = useI18n();
   const openNewSessionDraft = useSessionUIStore((state) => state.openNewSessionDraft);
   const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
   const setPendingInputText = useInputStore((state) => state.setPendingInputText);
   const setPendingSyntheticParts = useInputStore((state) => state.setPendingSyntheticParts);
-  const setActiveMainTab = useUIStore((state) => state.setActiveMainTab);
 
   const [isLoading, setIsLoading] = React.useState(false);
   const [conflictDetails, setConflictDetails] = React.useState<MergeConflictDetails | null>(null);
@@ -79,12 +79,13 @@ export const ConflictDialog: React.FC<ConflictDialogProps> = ({
     const headRef = conflictDetails.headInfo || (operation === 'merge' ? 'MERGE_HEAD' : 'REBASE_HEAD');
     const continueCmd = operation === 'merge' ? 'git commit --no-edit' : 'git rebase --continue';
 
-    const visibleText = await renderMagicPrompt('git.conflict.resolve.visible', {
+    const prompts = await loadMagicPrompts(directory);
+    const visibleText = prompts.render('git.conflict.resolve.visible', {
       operation_label: operationLabel,
       head_ref: headRef,
     });
 
-    const instructionsText = await renderMagicPrompt('git.conflict.resolve.instructions', {
+    const instructionsText = prompts.render('git.conflict.resolve.instructions', {
       operation_label: operationLabel,
       directory,
       operation,
@@ -108,6 +109,17 @@ export const ConflictDialog: React.FC<ConflictDialogProps> = ({
     return { visibleText, instructionsText, payloadText };
   }, [conflictDetails, directory, operation]);
 
+  // The context, null without conflict details, or undefined when the magic
+  // prompts could not be read: that failure is shown here and the dialog stays.
+  const prepareConflictContext = async () => {
+    try {
+      return await buildConflictContext();
+    } catch (error) {
+      toast.error(t('magicPrompts.toast.loadFailed'), { description: error instanceof Error ? error.message : undefined });
+      return undefined;
+    }
+  };
+
   const handleAbort = () => {
     onAbort();
     onOpenChange(false);
@@ -119,7 +131,8 @@ export const ConflictDialog: React.FC<ConflictDialogProps> = ({
   };
 
   const handleResolveInCurrentSession = async () => {
-    const context = await buildConflictContext();
+    const context = await prepareConflictContext();
+    if (context === undefined) return;
     if (!context) {
       toast.error(t('gitView.conflict.noDetailsAvailable'));
       return;
@@ -137,13 +150,14 @@ export const ConflictDialog: React.FC<ConflictDialogProps> = ({
       { text: context.payloadText, synthetic: true },
     ]);
 
-    setActiveMainTab('chat');
     onClearState?.();
     onOpenChange(false);
+    onNavigatedToChat?.();
   };
 
   const handleResolveInNewSession = async () => {
-    const context = await buildConflictContext();
+    const context = await prepareConflictContext();
+    if (context === undefined) return;
     if (!context) {
       toast.error(t('gitView.conflict.noDetailsAvailable'));
       return;
@@ -158,10 +172,9 @@ export const ConflictDialog: React.FC<ConflictDialogProps> = ({
         { text: context.payloadText, synthetic: true },
       ],
     });
-    // Navigate to chat tab so user sees the new session
-    setActiveMainTab('chat');
     onClearState?.();
     onOpenChange(false);
+    onNavigatedToChat?.();
   };
 
   const operationLabel = operation === 'merge' ? t('gitView.operation.merge') : t('gitView.operation.rebase');

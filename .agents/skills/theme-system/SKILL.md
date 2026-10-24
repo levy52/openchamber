@@ -10,7 +10,7 @@ description: Use when creating or modifying OpenChamber UI components, styling, 
 - Use semantic OpenChamber theme tokens; never hardcode hex colors or generic Tailwind palette colors.
 - Use shared UI primitives before introducing feature-local controls.
 - Use the shared `Button`; do not create button wrappers such as `ButtonSmall` or `ButtonLarge`.
-- Every dropdown-style value-picker trigger (shows current value, opens a picker) takes its chrome from `dropdownTriggerVariants` in `packages/ui/src/components/ui/dropdown-trigger.ts` (sizes: `sm` dense h-6, `default` forms h-8; native `SelectTrigger` consumes it). Call sites add layout classes only (width/truncation) — never re-declare border/radius/bg/hover. Deliberately chrome-less pickers (chat composer, headers) are the only exception.
+- Every dropdown-style value-picker trigger takes its chrome from `dropdownTriggerVariants` in `packages/ui/src/components/ui/dropdown-trigger.ts`; call sites add layout classes only. Deliberately chrome-less pickers in composers or headers are the exception.
 - Use the sprite-based `Icon`; never import icons directly from `@remixicon/react`.
 - Apply hover tokens only to interactive elements.
 - Use status colors only for actual status/feedback.
@@ -24,7 +24,7 @@ description: Use when creating or modifying OpenChamber UI components, styling, 
 | Adding, converting, storing, or generating icons | `references/icons.md` |
 | Adding built-in or custom themes | `references/adding-themes.md` |
 
-Load every matching reference before editing. Settings work must also load `settings-ui-patterns`; user-facing or accessible text must load `locale-ui-patterns`.
+Load every matching reference before editing. How a screen should look and behave (depth and borders, which surface class to use, layout stability, sizing, composition, text density) is owned by `openchamber-ui-guidance`; load it for any visible UI change. User-facing or accessible text must load `locale-ui-patterns`. Spacing, positioning and directional icons follow `rtl-layout`, which owns how a layout works in both directions. Settings composition is owned by `settings-ui-patterns`, which declares `theme-system` as its one-way companion.
 
 ## Token Decision
 
@@ -61,6 +61,20 @@ Use `Button` from `packages/ui/src/components/ui/button.tsx`.
 
 Do not hardcode button height/padding when a size variant exists. Do not recreate selection/destructive styling with ad-hoc classes.
 
+A button that opens a page, panel, or search field is a toggle: while what it opened is on screen it carries `aria-pressed` and the selection tokens, and the next click closes it. Closing a search field also clears its query, so the list never stays filtered by text nobody can see.
+
+Controls in one row share one height. Every dropdown trigger on desktop is 28px (`dropdownTriggerVariants()` default, `SelectTrigger`), in forms and toolbars alike. Toolbars, filter rows and the context panel header use 28px throughout: `Button size="sm"`, `<Input inputSize="compact">`, and the active-pill tab strip (its default). Form inputs and buttons stay 32px (`default`). Pick the size variant instead of overriding `h-*` at the call site to match a neighbour; mobile/touch branches keep their own larger sizes (`mobile`, `touch`).
+
+Extensions draw these controls from their own copy, the SDK UI kit in `packages/sdk/src/ui`. A change to a shared primitive's size, radius, or states (button, input, dropdown trigger, select item, checkbox, tabs, badge) also changes its twin in `packages/sdk/src/ui/style.ts` in the same change: appearance in `GUEST_UI_LOOK_CSS`, which the server serves to installed extensions, sizes in `UI_SIZE_CSS`, which reach an extension when its author rebuilds. Then rebuild the SDK example bundles (`packages/sdk/DOCUMENTATION.md`).
+
+## Keyboard Navigation Contract
+
+- Menus, selects, and autocomplete pickers with ArrowDown/ArrowUp navigation must also support Ctrl+N/Ctrl+P, including submenus and searchable lists.
+- Keep this behavior in shared components so callers inherit it. Use the keyboard mapping in `packages/ui/src/components/ui/dropdown-navigation.ts`; feature code must not duplicate key detection.
+- Lists that own their active option or stop keyboard propagation must call the shared navigation helper at their own event boundary. Wrapping a custom list in a dropdown does not guarantee that its navigation events reach the wrapper.
+- Route both key pairs through the same selection logic, preserving disabled-item skipping, boundary or wrap behavior, highlight, and scroll visibility. Consume each navigation event once, only while the menu or picker is active; preserve IME text entry and other modifier chords.
+- Verify Ctrl+N/P alongside arrow keys in the real component, including search-input focus, submenus, and closed state. A key-mapping unit test alone does not verify event propagation or focus behavior.
+
 ## Icon Contract
 
 ```tsx
@@ -73,35 +87,29 @@ Use `IconName` for icon values stored in arrays, objects, state, or config. `Ico
 
 ## Animation Contract
 
-Animate only `transform` and `opacity`. The compositor drives those; every other
-property recalculates style on each frame for as long as the animation runs, and
-geometry properties add layout on top. Measured on this repository's fixture,
-identical at any element count from 1 to 32:
+Animate only `transform` and `opacity`. Use `transform: rotate(...)`, not the individual `rotate` property. Non-composited properties recalculate style continuously; geometry also triggers layout, and wrappers, `will-change`, `contain`, or stepped timing do not remove that cost. Animate only while conveying live information.
 
-| Animated property | Style recalculations/sec | Layouts/sec |
-|---|---|---|
-| `transform`, `opacity`, `filter` | 0 | 0 |
-| `rotate` (the individual property) | 60 | 0 |
-| `background-position`, `border-color`, `box-shadow` | 60 | 0 |
-| `width` and other geometry | 60 | 60 |
+Motion that can stay on screen for minutes follows the state it shows:
 
-- `rotate: 360deg` is not a cheap synonym for `transform: rotate(360deg)`.
-  Prefer the `transform` form.
-- Cost applies for the entire time an animation runs, so an indicator tied to a
-  long-running operation pays it continuously. An indicator that is not
-  conveying anything should not be animating.
-- `will-change`, wrapper elements, `contain`, and `steps()` timing do not make a
-  non-composited property cheap. Only changing the property does.
-- Verify with `bun run profile:animation` rather than reasoning about it; add a
-  variant to `scripts/perf/animation-fixture.html` for a technique not covered.
-  See `scripts/perf/DOCUMENTATION.md`.
+- **Steady state stands still**: connected, failed, degraded, "Unavailable", the provider logo while the agent works, read-aloud playing (its icon turns `--primary-text`). Show a static icon in the state's color.
+- **A wait that can last spins on the shared clock**: a running project action, worktree setup or removal, a space being made, CI checks, loading sessions or models, walkthrough generation, an OpenCode update. Render `Spinner` (`components/ui/spinner.tsx`): eight bars, four steps a second.
+- **A wait that cannot spin blinks**: a status dot (6 px, `size-1.5`), the recording dot, a loading skeleton. Apply `useWaitingBlink(active)`; it dims every other second. The splash logo steps instead: its roof tiers light up one at a time, once a second, through `useWaitingPhase`.
+- **Waiting text gets dots**: "Thinking", "Waiting for approval". Put `BusyDots` (`components/ui/busy-dots.tsx`) after the label; drop any "…" from the string.
+- **A spinner that lasts seconds** (a button after a click, a quick load, refresh) keeps `animate-spin`.
+- **Hidden stops.** A surface kept mounted while hidden wraps its content in `PauseClock` (`components/ui/pause-clock.tsx`); the context panel's zones already do. An `inert` subtree pauses its CSS animations (`index.css`).
 
-## Verification
+`Spinner`, `useWaitingBlink`, `BusyDots` and live counters (`useDurationTickerNow`) share one clock (`hooks/useDurationTicker.ts`): a page draws four frames a second while a spinner shows and one otherwise, however many indicators are on screen. Each tick re-renders the component that calls the hook, so it goes in the indicator itself, never in the page around it (`performance-engineering`, "Motion That Stays On Screen"). `lib/infiniteAnimations.test.ts` fails on any new infinite CSS animation outside the short ones it lists. The cost behind these rules is in `performance-engineering`, "Motion That Stays On Screen".
+
+For any other technique, load `performance-engineering` and `scripts/perf/DOCUMENTATION.md`, measure it with `bun run profile:animation`, and add a fixture variant when needed. This skill owns animation styling; `performance-engineering` owns performance evidence.
+
+## Completion Criteria
 
 - Animations are limited to `transform` and `opacity`, or their cost was measured and accepted.
+- Nothing that can stay on screen for minutes runs an infinite CSS animation: steady states stand still, waits use `Spinner`, `useWaitingBlink` or `BusyDots`.
 - No hardcoded/palette colors were introduced.
 - Buttons use shared variants and sizes.
+- Menus and pickers satisfy the keyboard navigation contract without caller-specific key handling for standard shared components.
 - Icons use `Icon`/`IconName`, and generated sprite changes are intentional.
 - Hover, selection, primary, and status semantics are distinct.
 - Light/dark/high-contrast and long-text states remain legible.
-- Relevant type-check, visual/runtime validation, and generated-asset checks ran.
+- Every applicable contract and loaded task reference was verified with relevant type-check, visual/runtime validation, and generated-asset checks.

@@ -5,14 +5,17 @@ import { Button } from '@/components/ui/button';
 import { OpenChamberLogo } from '@/components/ui/OpenChamberLogo';
 import { useI18n } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
+import { useWaitingBlink } from '@/hooks/useDurationTicker';
 
 import { connectionDisplayUrl, useMobileConnection } from './mobileConnections';
+import { useDebugPanelLongPress } from './mobileConnectionDebug';
+import { MobileConnectionDebugPanel } from './MobileConnectionDebugPanel';
 import { isQrScanSupported, parseConnectionPayload, scanConnectionQr } from './mobileQrScan';
 import { mobileConnectionInputClass, mobileInputKeyboardProps } from './mobileConnectionUi';
 import { MobileQrConnectionLoading, MobileQrScannerOverlay } from './MobileQrScannerOverlay';
 
 export type MobileConnectionNotice = {
-  kind: 'unreachable' | 'auth-expired';
+  kind: 'unreachable' | 'relay-limit' | 'auth-expired';
   label: string;
 };
 
@@ -28,6 +31,7 @@ export const MobileConnectionWelcome: React.FC<{
   const [connectionName, setConnectionName] = React.useState('');
   const [clientToken, setClientToken] = React.useState('');
   const [isScanning, setIsScanning] = React.useState(false);
+  const scanBlink = useWaitingBlink(isScanning);
   const [isCompletingScan, setIsCompletingScan] = React.useState(false);
   const scanAbortRef = React.useRef<AbortController | null>(null);
   const qrScanSupported = React.useMemo(() => isQrScanSupported(), []);
@@ -37,6 +41,10 @@ export const MobileConnectionWelcome: React.FC<{
   // Which saved connection is being connected to, for the per-row spinner.
   const [connectingId, setConnectingId] = React.useState<string | null>(null);
   const [password, setPassword] = React.useState('');
+  // Hidden diagnostics: long-press the logo to open the connection event log —
+  // reachable even when a user has been bounced back to this screen.
+  const [debugOpen, setDebugOpen] = React.useState(false);
+  const debugLongPress = useDebugPanelLongPress(React.useCallback(() => setDebugOpen(true), []));
 
   const handleSubmit = React.useCallback((event: React.FormEvent) => {
     event.preventDefault();
@@ -127,10 +135,13 @@ export const MobileConnectionWelcome: React.FC<{
     <>
     {isScanning ? <MobileQrScannerOverlay onCancel={() => scanAbortRef.current?.abort()} /> : null}
     {isCompletingScan ? <MobileQrConnectionLoading /> : null}
+    {debugOpen ? <MobileConnectionDebugPanel onClose={() => setDebugOpen(false)} /> : null}
     <main className="oc-keyboard-fill-screen flex min-h-dvh flex-col overflow-y-auto bg-background px-6 pb-[calc(var(--safe-area-inset-bottom,env(safe-area-inset-bottom,0px))+28px)] pt-[calc(var(--safe-area-inset-top,env(safe-area-inset-top,0px))+28px)] text-foreground">
       <div className="m-auto flex w-full max-w-[360px] shrink-0 flex-col items-center gap-9 py-8">
         <div className="flex flex-col items-center gap-5 text-center">
-          <OpenChamberLogo width={72} height={72} className="size-[72px]" />
+          <span {...debugLongPress} className="select-none" style={{ touchAction: 'manipulation' }}>
+            <OpenChamberLogo width={72} height={72} className="size-[72px]" />
+          </span>
           <h1 className="typography-h2 text-foreground">{t('mobile.connect.welcome.title')}</h1>
         </div>
 
@@ -145,7 +156,9 @@ export const MobileConnectionWelcome: React.FC<{
             <p className="min-w-0 flex-1 typography-small text-foreground">
               {notice.kind === 'auth-expired'
                 ? t('mobile.connect.notice.authExpired', { label: notice.label })
-                : t('mobile.connect.notice.unreachable', { label: notice.label })}
+                : notice.kind === 'relay-limit'
+                  ? t('mobile.connect.notice.relayLimit', { label: notice.label })
+                  : t('mobile.connect.notice.unreachable', { label: notice.label })}
             </p>
           </div>
         ) : null}
@@ -156,7 +169,7 @@ export const MobileConnectionWelcome: React.FC<{
               <span className="flex size-9 shrink-0 items-center justify-center rounded-[12px] bg-interactive-hover text-foreground">
                 <Icon name="lock" className="size-[18px]" />
               </span>
-              <div className="min-w-0 text-left">
+              <div className="min-w-0 text-start">
                 <p className="truncate typography-ui-label text-foreground">{pendingConnection.label}</p>
                 <p className="truncate typography-small text-muted-foreground">
                   {pendingConnection.candidates.some((c) => c.kind === 'direct') ? connectionDisplayUrl(pendingConnection) : t('mobile.connect.relay.badge')}
@@ -199,7 +212,7 @@ export const MobileConnectionWelcome: React.FC<{
                   onClick={() => void handleScanQr()}
                   disabled={isScanning || isBusy}
                 >
-                  <Icon name="scan-2" className={cn('size-[18px]', isScanning && 'animate-pulse')} />
+                  <Icon name="scan-2" className={cn('size-[18px]', scanBlink)} />
                   {isBusy ? t('mobile.connect.connecting') : t('mobile.connect.scanQr')}
                 </Button>
                 <p className="px-2 text-center typography-small text-muted-foreground">
@@ -223,7 +236,7 @@ export const MobileConnectionWelcome: React.FC<{
                         key={connection.id}
                         type="button"
                         disabled={isBusy}
-                        className="flex min-h-14 w-full items-center gap-3 border-b border-border/70 px-3.5 py-2.5 text-left last:border-b-0 hover:bg-interactive-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary disabled:opacity-70"
+                        className="flex min-h-14 w-full items-center gap-3 border-b border-border/70 px-3.5 py-2.5 text-start last:border-b-0 hover:bg-interactive-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-70"
                         onClick={() => {
                           setConnectingId(connection.id);
                           void conn.connect({ id: connection.id, candidates: connection.candidates, clientToken: connection.clientToken, label: connection.label })
@@ -258,7 +271,7 @@ export const MobileConnectionWelcome: React.FC<{
                   type="button"
                   onClick={() => setManualOpen((value) => !value)}
                   aria-expanded={manualOpen}
-                  className="mx-auto flex items-center gap-1 rounded-full px-2 py-1 typography-small text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                  className="mx-auto flex items-center gap-1 rounded-full px-2 py-1 typography-small text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   <span>{t('mobile.connect.manual.toggle')}</span>
                   <Icon name="arrow-down-s" className={cn('size-4 transition-transform duration-200', manualOpen && 'rotate-180')} />

@@ -5,8 +5,11 @@ import { Button } from '@/components/ui/button';
 import { useI18n } from '@/lib/i18n';
 import { isRelayModeActive } from '@/lib/relay/runtime-tunnel';
 import { cn } from '@/lib/utils';
+import { useWaitingBlink } from '@/hooks/useDurationTicker';
 
 import { connectionDisplayUrl, isActiveRuntimeConnection, useMobileConnection } from './mobileConnections';
+import { useDebugPanelLongPress } from './mobileConnectionDebug';
+import { MobileConnectionDebugPanel } from './MobileConnectionDebugPanel';
 import { isQrScanSupported, scanConnectionQr } from './mobileQrScan';
 import { mobileConnectionInputClass, mobileInputKeyboardProps } from './mobileConnectionUi';
 import { MobileQrConnectionLoading, MobileQrScannerOverlay } from './MobileQrScannerOverlay';
@@ -29,6 +32,7 @@ export const MobileInstancesSurface: React.FC<{
   const [clientToken, setClientToken] = React.useState('');
   const [password, setPassword] = React.useState('');
   const [isScanning, setIsScanning] = React.useState(false);
+  const scanBlink = useWaitingBlink(isScanning);
   const [isCompletingScan, setIsCompletingScan] = React.useState(false);
   const scanAbortRef = React.useRef<AbortController | null>(null);
   const qrScanSupported = React.useMemo(() => isQrScanSupported(), []);
@@ -37,6 +41,10 @@ export const MobileInstancesSurface: React.FC<{
   const [formOpen, setFormOpen] = React.useState(false);
   // Which row is being connected to, for the per-row spinner.
   const [connectingId, setConnectingId] = React.useState<string | null>(null);
+  // Hidden diagnostics: long-press a connection row to open the connection
+  // event log (the long-press swallows the row's normal connect tap).
+  const [debugOpen, setDebugOpen] = React.useState(false);
+  const debugLongPress = useDebugPanelLongPress(React.useCallback(() => setDebugOpen(true), []));
 
   // Populate/clear the form imperatively (on edit tap / cancel / save) rather than via
   // an effect keyed on the derived connection object. With an effect, any churn of the
@@ -189,11 +197,12 @@ export const MobileInstancesSurface: React.FC<{
     <>
     {isScanning ? <MobileQrScannerOverlay onCancel={() => scanAbortRef.current?.abort()} /> : null}
     {isCompletingScan ? <MobileQrConnectionLoading /> : null}
+    {debugOpen ? <MobileConnectionDebugPanel onClose={() => setDebugOpen(false)} /> : null}
     <div className="flex h-full flex-col overflow-hidden">
       <div className="flex-1 overflow-y-auto px-5 py-4">
         <div className="space-y-6">
           {connections.length > 0 ? (
-            <div className="overflow-hidden rounded-[18px] border border-border/70 bg-surface-elevated">
+            <div {...debugLongPress} className="overflow-hidden rounded-[18px] border border-border/70 bg-surface-elevated">
               {connections.map((connection) => {
                 const confirming = confirmingDeleteId === connection.id;
                 const isActive = isActiveRuntimeConnection(connection);
@@ -215,7 +224,7 @@ export const MobileInstancesSurface: React.FC<{
                   >
                     <button
                       type="button"
-                      className="flex min-w-0 flex-1 items-center gap-3 px-3.5 py-3 text-left transition-colors active:bg-interactive-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary disabled:opacity-60"
+                      className="flex min-w-0 flex-1 items-center gap-3 px-3.5 py-3 text-start transition-colors active:bg-interactive-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-60"
                       onClick={() => {
                         if (isActive) return;
                         setConnectingId(connection.id);
@@ -227,7 +236,7 @@ export const MobileInstancesSurface: React.FC<{
                       <span className="relative flex size-9 shrink-0 items-center justify-center rounded-[12px] bg-interactive-hover text-foreground">
                         <Icon name="server" className="size-[18px]" />
                         {isActive ? (
-                          <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-[var(--surface-elevated)] bg-[var(--status-success)]" aria-hidden />
+                          <span className="absolute -inset-e-0.5 -top-0.5 size-2.5 rounded-full border-2 border-[var(--surface-elevated)] bg-[var(--status-success)]" aria-hidden />
                         ) : null}
                       </span>
                       <span className="min-w-0 flex-1">
@@ -241,7 +250,7 @@ export const MobileInstancesSurface: React.FC<{
                       </span>
                       {isConnectingRow ? <Icon name="loader-4" className="size-5 shrink-0 animate-spin text-muted-foreground" /> : null}
                     </button>
-                    <div className="flex items-center gap-0.5 pr-2">
+                    <div className="flex items-center gap-0.5 pe-2">
                       {confirming ? (
                         <button
                           type="button"
@@ -257,7 +266,7 @@ export const MobileInstancesSurface: React.FC<{
                         <button
                           type="button"
                           aria-label={t('mobile.instances.edit')}
-                          className="flex size-9 items-center justify-center rounded-full text-muted-foreground transition-colors active:bg-interactive-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                          className="flex size-9 items-center justify-center rounded-full text-muted-foreground transition-colors active:bg-interactive-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                           onClick={() => {
                             setEditingId(connection.id);
                             setUrl(connectionDisplayUrl(connection));
@@ -275,7 +284,7 @@ export const MobileInstancesSurface: React.FC<{
                         aria-label={confirming
                           ? t('mobile.instances.cancelDeleteAria', { label: connection.label })
                           : t('mobile.instances.deleteAria', { label: connection.label })}
-                        className="flex size-9 items-center justify-center rounded-full text-muted-foreground transition-colors active:bg-interactive-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                        className="flex size-9 items-center justify-center rounded-full text-muted-foreground transition-colors active:bg-interactive-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                         onClick={() => toggleConfirmDelete(connection.id)}
                         style={{ touchAction: 'manipulation' }}
                       >
@@ -287,7 +296,7 @@ export const MobileInstancesSurface: React.FC<{
               })}
             </div>
           ) : (
-            <p className="rounded-[18px] border border-dashed border-border/70 px-4 py-6 text-center typography-small text-muted-foreground">
+            <p {...debugLongPress} className="rounded-[18px] border border-dashed border-border/70 px-4 py-6 text-center typography-small text-muted-foreground">
               {t('mobile.connect.saved.empty')}
             </p>
           )}
@@ -304,7 +313,7 @@ export const MobileInstancesSurface: React.FC<{
                   onClick={() => void handleScanInstance()}
                   disabled={isScanning}
                 >
-                  <Icon name="scan-2" className={cn('size-[18px]', isScanning && 'animate-pulse')} />
+                  <Icon name="scan-2" className={cn('size-[18px]', scanBlink)} />
                   {t('mobile.connect.scanQr')}
                 </Button>
               ) : null}

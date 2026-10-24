@@ -73,7 +73,7 @@ export default defineConfig({
       injectRegister: false,
       manifest: false,
       injectManifest: {
-        globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,ttf,otf,eot}'],
+        globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,ttf,otf,eot,wasm}'],
         // iOS Safari/PWA is much more reliable with a classic (non-module) SW bundle.
         rollupFormat: 'iife',
         // We already keep a custom manifest in index.html
@@ -87,7 +87,8 @@ export default defineConfig({
   ],
   resolve: {
     alias: [
-      { find: '@opencode-ai/sdk/v2', replacement: path.resolve(__dirname, '../../node_modules/@opencode-ai/sdk/dist/v2/client.js') },
+      { find: '@openchamber/sdk/schemas', replacement: path.resolve(__dirname, '../sdk/src/schemas.ts') },
+      { find: '@openchamber/sdk', replacement: path.resolve(__dirname, '../sdk/src/index.ts') },
       { find: '@openchamber/ui', replacement: path.resolve(__dirname, '../ui/src') },
       { find: '@web', replacement: path.resolve(__dirname, './src') },
       { find: '@', replacement: path.resolve(__dirname, '../ui/src') },
@@ -102,7 +103,7 @@ export default defineConfig({
     __APP_VERSION__: JSON.stringify(packageJson.version),
   },
   optimizeDeps: {
-    include: ['@opencode-ai/sdk/v2'],
+    include: ['@opencode/client'],
   },
   server: {
     port: 5173,
@@ -112,6 +113,10 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/health': {
+        target: `http://127.0.0.1:${process.env.OPENCHAMBER_PORT || 3001}`,
+        changeOrigin: true,
+      },
+      '/linear': {
         target: `http://127.0.0.1:${process.env.OPENCHAMBER_PORT || 3001}`,
         changeOrigin: true,
       },
@@ -144,6 +149,10 @@ export default defineConfig({
             return 'vendor-vite-runtime';
           }
           if (!id.includes('node_modules')) return undefined;
+          // A stylesheet stays with the chunk that imports it. Grouping KaTeX's
+          // eager stylesheet into `vendor-katex` made that chunk eager, and with
+          // it the 260KB KaTeX engine only the lazy markdown renderer uses.
+          if (id.endsWith('.css')) return undefined;
 
           // Resolve the real package from the LAST `node_modules/` segment.
           // bun's isolated install nests packages as
@@ -172,17 +181,18 @@ export default defineConfig({
           }
 
           // Split @pierre/diffs by usage as well: the eager tool renderer needs
-          // only its pure patch parser, while the Shiki-importing render stack
+          // only its pure patch parser, while the highlighting render stack
           // must stay loadable on demand. One merged vendor chunk would make
-          // the parser import download the whole stack eagerly.
-          if (packageName === '@pierre/diffs') {
+          // the parser import download the whole stack eagerly. Highlights
+          // ships its themes as separately imported modules, like Shiki's.
+          if (packageName === '@pierre/diffs' || packageName === '@pierre/highlights') {
             return undefined;
           }
 
           if (packageName === 'react' || packageName === 'react-dom') return 'vendor-react';
           if (packageName === 'zustand' || packageName === 'zustand/middleware') return 'vendor-zustand';
 
-          if (packageName === '@opencode-ai/sdk') return 'vendor-opencode-sdk';
+          if (packageName === '@opencode/client') return 'vendor-opencode-client';
           if (packageName.includes('remark') || packageName.includes('rehype') || packageName === 'react-markdown') return 'vendor-markdown';
           if (packageName === '@base-ui/react' || packageName.startsWith('@base-ui')) return 'vendor-base-ui';
 

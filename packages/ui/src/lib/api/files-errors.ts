@@ -1,5 +1,8 @@
+import { z } from 'zod';
+
 export type FilesystemErrorReason =
   | 'os-permission'
+  | 'already-exists'
   | 'not-found'
   | 'not-directory'
   | 'invalid-response'
@@ -23,13 +26,14 @@ export const isFilesystemError = (error: unknown): error is FilesystemError => (
     error
     && typeof error === 'object'
     && 'reason' in error
-    && typeof (error as { reason?: unknown }).reason === 'string'
+    && typeof error.reason === 'string'
   )
 );
 
 export const parseFilesystemErrorReason = (value: unknown): FilesystemErrorReason => {
   switch (value) {
     case 'os-permission':
+    case 'already-exists':
     case 'not-found':
     case 'not-directory':
     case 'invalid-response':
@@ -38,3 +42,21 @@ export const parseFilesystemErrorReason = (value: unknown): FilesystemErrorReaso
       return 'unknown';
   }
 };
+
+// Web rejects with an Error; the VS Code bridge rejects with a plain object
+// that carries the message.
+const messageCarrierSchema = z.object({ message: z.string() });
+
+export const isFileMissingError = (error: unknown): boolean => {
+  if (isFilesystemError(error) && error.reason === 'not-found') {
+    return true;
+  }
+  const carrier = messageCarrierSchema.safeParse(error);
+  const message = error instanceof Error ? error.message : carrier.success ? carrier.data.message : String(error ?? '');
+  const normalized = message.toLowerCase();
+  return normalized.includes('file not found')
+    || normalized.includes('enoent')
+    || normalized.includes('no such file')
+    || normalized.includes('does not exist');
+};
+

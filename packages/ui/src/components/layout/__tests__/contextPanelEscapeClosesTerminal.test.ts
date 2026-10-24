@@ -12,30 +12,35 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const contextPanelSource = readFileSync(join(__dirname, '..', 'ContextPanel.tsx'), 'utf-8');
+const surfacePanesSource = readFileSync(join(__dirname, '..', 'ContextSurfacePanes.tsx'), 'utf-8');
+const zoneEscapeSource = readFileSync(join(__dirname, '..', 'zoneEscape.ts'), 'utf-8');
 const mobileWorkspaceDrawerSource = readFileSync(
   join(__dirname, '..', '..', '..', 'apps', 'MobileWorkspaceDrawer.tsx'),
   'utf-8',
 );
 
 describe('issue #2644: Escape in terminal must not close the context panel', () => {
-  test('the context panel captures Escape at the panel level', () => {
+  test('each zone captures Escape on its frame and on its keep-alive panes', () => {
     expect(contextPanelSource).toContain('onKeyDownCapture={handlePanelKeyDownCapture}');
+    expect(contextPanelSource).toContain('closeZoneOnEscape(event, isOpen, handleClose)');
+    // The terminal is portalled in from ContextSurfacePanes, so its keys never
+    // pass through the frame: its pane wrapper runs the same handler.
+    expect(surfacePanesSource).toContain('onKeyDownCapture={handleKeyDownCapture}');
+    expect(surfacePanesSource).toContain('closeZoneOnEscape(event, isOpen, () => {');
   });
 
   test('the capture handler skips closing when the event target is inside the terminal', () => {
-    const start = contextPanelSource.indexOf('const handlePanelKeyDownCapture = React.useCallback(');
+    const start = zoneEscapeSource.indexOf('export const closeZoneOnEscape = (');
     expect(start).toBeGreaterThan(-1);
-    const end = contextPanelSource.indexOf('}, [handleClose]);', start);
-    expect(end).toBeGreaterThan(start);
-    const handler = contextPanelSource.slice(start, end);
+    const handler = zoneEscapeSource.slice(start);
 
     expect(handler).toContain("event.key !== 'Escape'");
     expect(handler).toContain('isTerminalEventTarget(event.target)');
     expect(handler).toContain('event.preventDefault()');
     expect(handler).toContain('event.stopPropagation()');
-    expect(handler).toContain('handleClose()');
+    expect(handler).toContain('close()');
 
-    // Guard must return before preventDefault/stopPropagation so ghostty-web's
+    // Guard must return before preventDefault/stopPropagation so the terminal input's
     // bubble-phase keydown listener can forward Escape to the PTY.
     const guardIndex = handler.indexOf('isTerminalEventTarget(event.target)');
     const preventIndex = handler.indexOf('event.preventDefault()');
@@ -43,16 +48,18 @@ describe('issue #2644: Escape in terminal must not close the context panel', () 
     expect(preventIndex).toBeGreaterThan(guardIndex);
   });
 
-  test('ContextPanel imports the shared terminal focus helper', () => {
-    expect(contextPanelSource).toContain("from '@/lib/terminalFocus'");
-    expect(contextPanelSource).toContain('isTerminalEventTarget');
+  test('the Escape handler imports the shared terminal focus helper', () => {
+    expect(zoneEscapeSource).toContain("from '@/lib/terminalFocus'");
+    expect(zoneEscapeSource).toContain('isTerminalEventTarget');
   });
 
   test('mobile drawer keeps its terminal Escape exception', () => {
-    const handlerStart = mobileWorkspaceDrawerSource.indexOf("if (event.key === 'Escape'");
+    const handlerStart = mobileWorkspaceDrawerSource.indexOf("if (event.key !== 'Escape'");
     expect(handlerStart).toBeGreaterThan(-1);
-    const handler = mobileWorkspaceDrawerSource.slice(handlerStart, handlerStart + 200);
-    expect(handler).toContain("tabRef.current !== 'terminal'");
+    const handler = mobileWorkspaceDrawerSource.slice(handlerStart, handlerStart + 300);
+    // The terminal tab returns before the drawer closes on Escape.
+    expect(handler).toContain("tabRef.current === 'terminal') return");
+    expect(handler).toContain('onCloseRef.current()');
   });
 });
 

@@ -18,9 +18,9 @@ import { toast } from '@/components/ui';
 import { Icon } from "@/components/icon/Icon";
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useInputStore } from '@/sync/input-store';
-import { useUIStore } from '@/stores/useUIStore';
+import { rankByQuery } from '@/lib/search/fuzzySearch';
 import { getGitCommitSummaries } from '@/lib/gitApi';
-import { renderMagicPrompt } from '@/lib/magicPrompts';
+import { loadMagicPrompts } from '@/lib/magicPrompts';
 import {
   abortIntegrate,
   computeIntegratePlan,
@@ -64,9 +64,14 @@ export const IntegrateCommitsSection: React.FC<{
 }) => {
   const { t } = useI18n();
   const currentSessionId = useSessionUIStore((s) => s.currentSessionId);
-  const setActiveMainTab = useUIStore((s) => s.setActiveMainTab);
   const [branchDropdownOpen, setBranchDropdownOpen] = React.useState(false);
+  const [branchSearch, setBranchSearch] = React.useState('');
   const searchInputRef = React.useRef<HTMLInputElement>(null);
+
+  const filteredBranches = React.useMemo(
+    () => rankByQuery(localBranches, branchSearch, (branch) => [branch]),
+    [localBranches, branchSearch]
+  );
 
   const [targetBranch, setTargetBranch] = React.useState<string>(defaultTargetBranch);
   React.useEffect(() => {
@@ -181,11 +186,13 @@ export const IntegrateCommitsSection: React.FC<{
   const openNewSessionDraft = useSessionUIStore((s) => s.openNewSessionDraft);
 
   const buildConflictContext = React.useCallback(async (payload: { state: IntegrateInProgress; details: IntegrateConflictDetails }) => {
-    const visibleText = await renderMagicPrompt('git.integrate.cherrypick.resolve.visible', {
+    // The temporary worktree belongs to the repository's project, so its prompts are the project's.
+    const prompts = await loadMagicPrompts(payload.state.repoRoot);
+    const visibleText = prompts.render('git.integrate.cherrypick.resolve.visible', {
       current_commit: payload.state.currentCommit,
       target_branch: payload.state.targetBranch,
     });
-    const instructionsText = await renderMagicPrompt('git.integrate.cherrypick.resolve.instructions', {
+    const instructionsText = prompts.render('git.integrate.cherrypick.resolve.instructions', {
       repo_root: payload.state.repoRoot,
       temp_worktree_path: payload.state.tempWorktreePath,
       source_branch: payload.state.sourceBranch,
@@ -216,7 +223,14 @@ export const IntegrateCommitsSection: React.FC<{
     payload: { state: IntegrateInProgress; details: IntegrateConflictDetails },
     useNewSession: boolean
   ) => {
-    const context = await buildConflictContext(payload);
+    let context: Awaited<ReturnType<typeof buildConflictContext>>;
+    try {
+      context = await buildConflictContext(payload);
+    } catch (error) {
+      // The magic prompts could not be read; nothing is opened or filled in.
+      toast.error(t('magicPrompts.toast.loadFailed'), { description: error instanceof Error ? error.message : undefined });
+      return;
+    }
 
     if (useNewSession) {
       // Open new session with the conflict context as initial prompt + synthetic parts
@@ -228,8 +242,6 @@ export const IntegrateCommitsSection: React.FC<{
           { text: context.payloadText, synthetic: true },
         ],
       });
-      // Navigate to chat tab so user sees the new session
-      setActiveMainTab('chat');
       return;
     }
 
@@ -244,8 +256,7 @@ export const IntegrateCommitsSection: React.FC<{
       { text: context.instructionsText, synthetic: true },
       { text: context.payloadText, synthetic: true },
     ]);
-    setActiveMainTab('chat');
-  }, [currentSessionId, setActiveMainTab, buildConflictContext, openNewSessionDraft, setPendingInputText, setPendingSyntheticParts, t]);
+  }, [currentSessionId, buildConflictContext, openNewSessionDraft, setPendingInputText, setPendingSyntheticParts, t]);
 
   const handleMove = React.useCallback(async () => {
     if (ui.kind !== 'ready') return;
@@ -380,10 +391,13 @@ export const IntegrateCommitsSection: React.FC<{
                 align="end"
                 className="w-72 p-0 max-h-[var(--available-height)] flex flex-col overflow-hidden"
               >
-                <Command className="h-full min-h-0">
+                {/* rankByQuery owns filtering/ordering; cmdk must not re-filter. */}
+                <Command className="h-full min-h-0" shouldFilter={false}>
                   <CommandInput
                     ref={searchInputRef}
                     placeholder={t('gitView.branch.searchPlaceholder')}
+                    value={branchSearch}
+                    onValueChange={setBranchSearch}
                     onKeyDown={(event) => event.stopPropagation()}
                   />
                   <CommandList
@@ -393,7 +407,7 @@ export const IntegrateCommitsSection: React.FC<{
                   >
                     <CommandEmpty>{t('gitView.branch.empty')}</CommandEmpty>
                     <CommandGroup heading={t('gitView.branch.localBranches')}>
-                      {localBranches.map((branch) => (
+                      {filteredBranches.map((branch) => (
                         <CommandItem
                           key={branch}
                           value={branch}
@@ -401,6 +415,7 @@ export const IntegrateCommitsSection: React.FC<{
                             setTargetBranch(branch);
                             persistTarget(branch);
                             setBranchDropdownOpen(false);
+                            setBranchSearch('');
                           }}
                         >
                           {branch}
@@ -469,7 +484,7 @@ export const IntegrateCommitsSection: React.FC<{
           )}
 
           {ui.kind === 'conflict' && (
-            <div className="rounded-md border border-border/60 bg-background/60 p-3 space-y-2">
+            <div className="rounded-md oc-tile p-3 space-y-2">
               <div className="typography-meta text-foreground">
                 {t('gitView.integrate.conflictsInFiles', { count: ui.details.unmergedFiles.length })}
               </div>
@@ -478,7 +493,7 @@ export const IntegrateCommitsSection: React.FC<{
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {ui.details.unmergedFiles.slice(0, 6).map((file) => (
-                  <span key={file} className="font-mono text-xs px-2 py-0.5 rounded bg-muted/40 text-muted-foreground">
+                  <span key={file} className="font-mono text-xs px-2 py-0.5 rounded oc-tile-inset text-muted-foreground">
                     {file}
                   </span>
                 ))}

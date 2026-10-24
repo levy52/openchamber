@@ -8,24 +8,13 @@ import {
 
 const baseOptions = {
   railOrder: [],
-  planModeEnabled: true,
   isVSCode: false,
   screenWidth: 1200,
   tabs: [],
+  sourceControlConnected: true,
 } as const;
 
 describe('getVisibleContextRailSurfaces', () => {
-  test('hides the plan surface while plan mode is disabled', () => {
-    const surfaces = getVisibleContextRailSurfaces({ ...baseOptions, planModeEnabled: false });
-    expect(surfaces.some((surface) => surface.id === 'plan')).toBe(false);
-    expect(surfaces.some((surface) => surface.id === 'context')).toBe(true);
-  });
-
-  test('shows the plan surface while plan mode is enabled', () => {
-    const surfaces = getVisibleContextRailSurfaces({ ...baseOptions, planModeEnabled: true });
-    expect(surfaces.some((surface) => surface.id === 'plan')).toBe(true);
-  });
-
   test('hides the walkthrough on VS Code and below the min width', () => {
     expect(getVisibleContextRailSurfaces({ ...baseOptions, isVSCode: true }).some((s) => s.id === 'walkthrough')).toBe(false);
     expect(
@@ -36,18 +25,52 @@ describe('getVisibleContextRailSurfaces', () => {
     ).toBe(true);
   });
 
+  test('offers no browser surface inside VS Code', () => {
+    expect(getVisibleContextRailSurfaces(baseOptions).some((s) => s.id === 'browser')).toBe(true);
+    // Nothing that makes the panel worth having works there, so offering it
+    // would promise the panel people see on the desktop.
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, isVSCode: true }).some((s) => s.id === 'browser')).toBe(false);
+  });
+
   test('hides content-driven surfaces until a matching tab exists', () => {
-    const preview = CONTEXT_SURFACES.find((surface) => surface.id === 'preview');
-    if (!preview) {
-      throw new Error('preview surface missing from registry');
+    const chat = CONTEXT_SURFACES.find((surface) => surface.id === 'chat');
+    if (!chat) {
+      throw new Error('chat surface missing from registry');
     }
-    expect(preview.availability).toBe('has-content');
-    expect(getVisibleContextRailSurfaces(baseOptions).some((s) => s.id === 'preview')).toBe(false);
-    expect(getVisibleContextRailSurfaces({ ...baseOptions, tabs: [{ mode: preview.mode }] }).some((s) => s.id === 'preview')).toBe(true);
+    expect(chat.availability).toBe('has-content');
+    expect(getVisibleContextRailSurfaces(baseOptions).some((s) => s.id === 'chat')).toBe(false);
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, tabs: [{ mode: chat.mode }] }).some((s) => s.id === 'chat')).toBe(true);
+  });
+
+  test('the browser surface can be opened from the rail with no tab yet', () => {
+    const browser = CONTEXT_SURFACES.find((surface) => surface.id === 'browser');
+    expect(browser?.availability).toBe('always');
+    expect(getVisibleContextRailSurfaces(baseOptions).some((s) => s.id === 'browser')).toBe(true);
   });
 
   test('respects the persisted user rail order', () => {
     const surfaces = getVisibleContextRailSurfaces({ ...baseOptions, railOrder: ['git', 'context'] });
     expect(surfaces.slice(0, 2).map((surface) => surface.id)).toEqual(['git', 'context']);
+  });
+
+  test('hides the Tracker until a repository host is connected or an item is open in it', () => {
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, sourceControlConnected: false }).some((s) => s.id === 'pr')).toBe(false);
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, sourceControlConnected: true }).some((s) => s.id === 'pr')).toBe(true);
+    const tabs: { mode: 'pr'; targetPath: string }[] = [{ mode: 'pr', targetPath: 'https://linear.app/acme/issue/ENG-7' }];
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, sourceControlConnected: false, tabs }).some((s) => s.id === 'pr')).toBe(true);
+  });
+
+  test('appends installed guest panels except on VS Code', () => {
+    const hello = {
+      id: 'plugin:hello' as const,
+      mode: 'plugin:hello' as const,
+      icon: 'window' as const,
+      label: 'Hello',
+      labelKey: 'contextRail.surface.plugin' as const,
+      descriptionKey: 'contextRail.surface.plugin.description' as const,
+      availability: 'always' as const,
+    };
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, extras: [hello] }).some((s) => s.id === 'plugin:hello')).toBe(true);
+    expect(getVisibleContextRailSurfaces({ ...baseOptions, extras: [hello], isVSCode: true }).some((s) => s.id === 'plugin:hello')).toBe(false);
   });
 });

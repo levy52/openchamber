@@ -10,14 +10,16 @@
  * report the caret and render the result.
  *
  * Exactly one trigger can be active, and order matters: the command palette
- * (a leading `/`) outranks the inline skill picker, which outranks snippets,
- * which outrank mentions. That precedence is the previous behavior, preserved.
+ * (a leading `/`) outranks the skill picker (`$`, anywhere in the text), which
+ * outranks snippets, which outrank mentions. Commands and skills use separate
+ * sigils so the palette lists commands only.
  */
 
 import {
     getFileMentionAutocompleteQuery,
     type FileMentionAutocompleteInputSource,
 } from '../../fileMentionAutocompleteState';
+import { lastPrefixSigilIndex, type TokenPrefix } from './prefixTokens';
 
 export type AutocompleteKind = 'command' | 'skill' | 'snippet' | 'mention';
 
@@ -30,6 +32,7 @@ export interface AutocompleteTrigger {
 export interface TriggerContext {
     /** Shell mode (`!cmd`) disables every picker. */
     inputMode: 'normal' | 'shell';
+    mentionsEnabled?: boolean;
     /** Whether the change that moved the caret came from a paste. */
     inputSource?: FileMentionAutocompleteInputSource;
     /** The text that change inserted, when known. */
@@ -63,17 +66,18 @@ function matchCommandPalette(value: string, cursorPosition: number): Autocomplet
 }
 
 /**
- * An inline `/skill` or `#snippet` still being typed: the nearest sigil before
- * the caret, at a word boundary, with no separator between it and the caret.
+ * A `$skill` or `#snippet` still being typed: the nearest sigil before the
+ * caret, at a word boundary, with no separator between it and the caret. The
+ * skill sigil matches every spelling a CJK IME produces for the same key.
  */
 function matchInlineToken(
     value: string,
     cursorPosition: number,
-    sigil: '/' | '#',
+    prefix: TokenPrefix,
     kind: AutocompleteKind,
 ): AutocompleteTrigger | null {
     const textBeforeCursor = value.substring(0, cursorPosition);
-    const sigilIndex = textBeforeCursor.lastIndexOf(sigil);
+    const sigilIndex = lastPrefixSigilIndex(textBeforeCursor, prefix);
     if (sigilIndex === -1) return null;
     if (!isWordBoundaryBefore(textBeforeCursor, sigilIndex)) return null;
 
@@ -81,6 +85,14 @@ function matchInlineToken(
     if (query.includes(' ') || query.includes('\n')) return null;
 
     return { kind, query };
+}
+
+/**
+ * The `#snippet` query being typed at the caret, or null. For text fields that
+ * offer only the snippet picker (comment inputs), with the composer's rule.
+ */
+export function matchSnippetTrigger(value: string, cursorPosition: number): string | null {
+    return matchInlineToken(value, cursorPosition, '#', 'snippet')?.query ?? null;
 }
 
 /**
@@ -96,7 +108,7 @@ export function resolveAutocompleteTrigger(
     if (context.inputMode === 'shell') return null;
 
     return matchCommandPalette(value, cursorPosition)
-        ?? matchInlineToken(value, cursorPosition, '/', 'skill')
+        ?? matchInlineToken(value, cursorPosition, '$', 'skill')
         ?? matchInlineToken(value, cursorPosition, '#', 'snippet')
         ?? matchMention(value, cursorPosition, context);
 }
@@ -106,6 +118,7 @@ function matchMention(
     cursorPosition: number,
     context: TriggerContext,
 ): AutocompleteTrigger | null {
+    if (context.mentionsEnabled === false) return null;
     const query = getFileMentionAutocompleteQuery({
         value,
         cursorPosition,
@@ -114,5 +127,3 @@ function matchMention(
     });
     return query === null ? null : { kind: 'mention', query };
 }
-
-export type { FileMentionAutocompleteInputSource };
