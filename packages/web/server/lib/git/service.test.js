@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import simpleGit from 'simple-git';
+import { simpleGit } from 'simple-git';
 import { createWorktreeBootstrapStore } from './worktree-bootstrap-storage.js';
 import { loadSourceSections, parseSource, sourceKey } from '../walkthrough/sources.js';
 import { registerGitRoutes } from './routes.js';
@@ -38,6 +38,12 @@ import {
   stashApply,
   listStashes,
   getWorktrees,
+  setWorktreeTaskTitle,
+  setWorktreePinned,
+  seedBranchTaskTitle,
+  markGeneratedBranchName,
+  readRenameableGeneratedBranch,
+  renameGeneratedWorktreeBranch,
   isGitRepository,
   isPatchEquivalentOfHead,
   observeWorktreeTopology,
@@ -46,6 +52,10 @@ import {
   removeWorktree,
   waitForWorktreeRemoval,
   snapshotWorktree,
+  archiveWorktree,
+  listWorktreeArchives,
+  restoreWorktreeArchive,
+  deleteWorktreeArchive,
   resolvePrimaryWorktreeRoot,
   resolveWorktreeTopLevel,
   resetToCommit,
@@ -1671,9 +1681,15 @@ describe('getWorktrees', () => {
       await observeWorktreeTopology(repo);
       expect(events).toHaveLength(1);
 
-      runGit(repo, ['worktree', 'remove', worktreePath]);
+      // Renaming the checked-out branch from a terminal (as an agent does
+      // for a generated name) shows up too.
+      runGit(worktreePath, ['branch', '-m', 'feature', 'fix/login-timeout']);
       await observeWorktreeTopology(repo);
       expect(events).toHaveLength(2);
+
+      runGit(repo, ['worktree', 'remove', worktreePath]);
+      await observeWorktreeTopology(repo);
+      expect(events).toHaveLength(3);
     } finally {
       unsubscribe();
     }
@@ -4739,6 +4755,133 @@ describe('snapshotWorktree', () => {
 });
 
 // ---------------------------------------------------------------------------
+// worktree archives
+// ---------------------------------------------------------------------------
+
+describe('worktree archives', () => {
+  const createArchivableWorktree = () => {
+    const repo = createTempDir();
+    runGit(repo, ['init', '-b', 'main']);
+    runGit(repo, ['config', 'user.email', 'test@example.com']);
+    runGit(repo, ['config', 'user.name', 'Test User']);
+    fs.writeFileSync(path.join(repo, 'README.md'), '# Test\n');
+    fs.writeFileSync(path.join(repo, 'gone.txt'), 'gone\n');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'secret.env\n');
+    runGit(repo, ['add', '.']);
+    runGit(repo, ['commit', '-m', 'Initial commit']);
+    const linked = path.join(createTempDir(), 'linked');
+    runGit(repo, ['worktree', 'add', '-b', 'feature/task', linked]);
+    runGit(repo, ['config', 'branch.feature/task.description', 'Login timeout fix']);
+    fs.writeFileSync(path.join(linked, 'README.md'), '# Changed\n');
+    fs.rmSync(path.join(linked, 'gone.txt'));
+    fs.writeFileSync(path.join(linked, 'new.txt'), 'untracked\n');
+    fs.writeFileSync(path.join(linked, 'secret.env'), 'TOKEN=1\n');
+    return { repo, linked };
+  };
+
+  it('archives a worktree with its changes and restores them into a new checkout of the branch', async () => {
+    if (!canRunGit()) return;
+    const { repo, linked } = createArchivableWorktree();
+
+    const archived = await archiveWorktree(repo, { directory: linked, id: 'a1', sessionIds: ['ses_1', 'ses_2'] });
+    expect(archived).toMatchObject({ id: 'a1', branch: 'feature/task', title: 'Login timeout fix', sessionIds: ['ses_1', 'ses_2'] });
+    expect(fs.existsSync(linked)).toBe(false);
+    expect(runGit(repo, ['branch', '--list', 'feature/task']).trim()).toBe('feature/task');
+
+    const [listed] = await listWorktreeArchives(repo);
+    expect(listed).toMatchObject({ id: 'a1', branch: 'feature/task', branchExists: true, title: 'Login timeout fix', sessionIds: ['ses_1', 'ses_2'] });
+    expect(fs.realpathSync(path.dirname(listed.path))).toBe(fs.realpathSync(path.dirname(linked)));
+
+    runGit(repo, ['worktree', 'add', linked, 'feature/task']);
+    await expect(restoreWorktreeArchive(linked, { id: 'a1' })).resolves.toEqual({ id: 'a1', conflicts: false });
+    expect(fs.readFileSync(path.join(linked, 'README.md'), 'utf8')).toBe('# Changed\n');
+    expect(fs.readFileSync(path.join(linked, 'new.txt'), 'utf8')).toBe('untracked\n');
+    expect(fs.existsSync(path.join(linked, 'gone.txt'))).toBe(false);
+    // Ignored files are not kept; the project's setup commands bring them back.
+    expect(fs.existsSync(path.join(linked, 'secret.env'))).toBe(false);
+    expect(runGit(linked, ['status', '--porcelain']).split('\n').filter(Boolean).sort()).toEqual([' D gone.txt', ' M README.md', '?? new.txt']);
+    expect(await listWorktreeArchives(repo)).toEqual([]);
+    // No cherry-pick is left in progress.
+    expect(() => runGit(linked, ['rev-parse', '--verify', '--quiet', 'CHERRY_PICK_HEAD'])).toThrow();
+  });
+
+  it('applies the changes over commits the branch got after archiving', async () => {
+    if (!canRunGit()) return;
+    const { repo, linked } = createArchivableWorktree();
+    await archiveWorktree(repo, { directory: linked, id: 'a2' });
+
+    runGit(repo, ['worktree', 'add', linked, 'feature/task']);
+    fs.writeFileSync(path.join(linked, 'later.txt'), 'later\n');
+    runGit(linked, ['add', 'later.txt']);
+    runGit(linked, ['commit', '-m', 'later']);
+
+    await expect(restoreWorktreeArchive(linked, { id: 'a2' })).resolves.toEqual({ id: 'a2', conflicts: false });
+    expect(fs.readFileSync(path.join(linked, 'later.txt'), 'utf8')).toBe('later\n');
+    expect(fs.readFileSync(path.join(linked, 'README.md'), 'utf8')).toBe('# Changed\n');
+  });
+
+  it('leaves conflicts in the checkout, which then holds the changes, and drops the archive', async () => {
+    if (!canRunGit()) return;
+    const { repo, linked } = createArchivableWorktree();
+    await archiveWorktree(repo, { directory: linked, id: 'a3', sessionIds: ['ses_1'] });
+
+    runGit(repo, ['worktree', 'add', linked, 'feature/task']);
+    fs.writeFileSync(path.join(linked, 'README.md'), '# Other\n');
+    runGit(linked, ['commit', '-am', 'other']);
+
+    await expect(restoreWorktreeArchive(linked, { id: 'a3' })).resolves.toEqual({ id: 'a3', conflicts: true });
+    expect(fs.readFileSync(path.join(linked, 'README.md'), 'utf8')).toContain('# Changed');
+    expect(runGit(linked, ['ls-files', '--unmerged']).trim()).not.toBe('');
+    // Kept, it would still claim sessions that are back at work.
+    expect(await listWorktreeArchives(repo)).toEqual([]);
+  });
+
+  it('keeps the archive and fails when git refuses to apply its changes', async () => {
+    if (!canRunGit()) return;
+    const { repo, linked } = createArchivableWorktree();
+    await archiveWorktree(repo, { directory: linked, id: 'a4' });
+
+    runGit(repo, ['worktree', 'add', linked, 'feature/task']);
+    // Something the setup commands wrote where the archive has its own file.
+    fs.writeFileSync(path.join(linked, 'new.txt'), 'written by setup\n');
+
+    await expect(restoreWorktreeArchive(linked, { id: 'a4' })).rejects.toMatchObject({ code: 'WORKTREE_ARCHIVE_NOT_APPLIED' });
+    expect(fs.readFileSync(path.join(linked, 'new.txt'), 'utf8')).toBe('written by setup\n');
+    expect((await listWorktreeArchives(repo)).map((entry) => entry.id)).toEqual(['a4']);
+  });
+
+  it('refuses the primary checkout, a folder git does not register, and a taken id', async () => {
+    if (!canRunGit()) return;
+    const { repo, linked } = createArchivableWorktree();
+    await expect(archiveWorktree(repo, { directory: repo, id: 'p1' })).rejects.toThrow('primary');
+    const stray = createTempDir();
+    await expect(archiveWorktree(repo, { directory: stray, id: 'p2' })).rejects.toThrow();
+    expect(fs.existsSync(stray)).toBe(true);
+    await expect(archiveWorktree(repo, { directory: linked, id: '../x' })).rejects.toThrow('Invalid worktree archive id');
+
+    await archiveWorktree(repo, { directory: linked, id: 'p3' });
+    runGit(repo, ['worktree', 'add', linked, 'feature/task']);
+    await expect(archiveWorktree(repo, { directory: linked, id: 'p3' })).rejects.toThrow();
+    expect(fs.existsSync(linked)).toBe(true);
+  });
+
+  it('deletes an archive with its branch, but never a branch a checkout uses', async () => {
+    if (!canRunGit()) return;
+    const { repo, linked } = createArchivableWorktree();
+    await archiveWorktree(repo, { directory: linked, id: 'd1' });
+    await expect(deleteWorktreeArchive(repo, { id: 'd1', deleteBranch: true })).resolves.toEqual({ id: 'd1', branchDeleted: true });
+    expect(runGit(repo, ['branch', '--list', 'feature/task']).trim()).toBe('');
+    expect(await listWorktreeArchives(repo)).toEqual([]);
+
+    const second = createArchivableWorktree();
+    await archiveWorktree(second.repo, { directory: second.linked, id: 'd2' });
+    runGit(second.repo, ['worktree', 'add', second.linked, 'feature/task']);
+    await expect(deleteWorktreeArchive(second.repo, { id: 'd2', deleteBranch: true })).resolves.toEqual({ id: 'd2', branchDeleted: false });
+    await expect(deleteWorktreeArchive(second.repo, { id: 'd2' })).rejects.toThrow('not found');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // checkoutCommit
 // ---------------------------------------------------------------------------
 
@@ -6161,16 +6304,17 @@ describe('git environment through simple-git', () => {
       EDITOR: 'project-editor',
       GIT_TERMINAL_PROMPT: '1',
       GIT_DIR: '/elsewhere/.git',
+      GIT_PROJECT_FLAG: 'from-project',
     }));
     configureGitEnvironment({ forDirectory });
     try {
       await withProcessEnv({ EDITOR: undefined, GIT_TERMINAL_PROMPT: undefined }, async () => {
-        const { repo, readHookLog } = createRepositoryLoggingHookEnv(['PROJECT_TOOL', 'EDITOR', 'GIT_TERMINAL_PROMPT', 'PATH']);
+        const { repo, readHookLog } = createRepositoryLoggingHookEnv(['PROJECT_TOOL', 'EDITOR', 'GIT_TERMINAL_PROMPT', 'GIT_PROJECT_FLAG', 'PATH']);
         await commit(repo, 'init', { addAll: true });
-        const [projectTool, editor, prompt, hookPath] = readHookLog().split('|');
+        const [projectTool, editor, prompt, projectFlag, hookPath] = readHookLog().split('|');
         // The commit landed in this repository, not in GIT_DIR's.
         expect((await getLog(repo, { maxCount: 1 })).all).toHaveLength(1);
-        expect([projectTool, editor, prompt]).toEqual(['from-project', '<unset>', '0']);
+        expect([projectTool, editor, prompt, projectFlag]).toEqual(['from-project', '<unset>', '0', 'from-project']);
         expect(hookPath.split(':')).toContain('/opt/project-tools/bin');
         expect(forDirectory).toHaveBeenCalledWith(repo);
       });
@@ -6204,23 +6348,43 @@ describe('git environment through simple-git', () => {
     }
   });
 
-  it('keeps working, and passes them to git, when the process env sets editor, pager, ssh or askpass programs', async () => {
+  it('keeps working, and passes them to git, when the process env sets editor, pager, ssh or askpass programs, a config path or other GIT_ variables', async () => {
     if (!canRunGit() || process.platform === 'win32') return;
     const programs = {
       EDITOR: 'vim',
+      VISUAL: 'vim',
       GIT_EDITOR: 'vim',
       PAGER: 'less',
       GIT_PAGER: 'less',
       GIT_SSH_COMMAND: 'ssh -i /tmp/openchamber-test-key -o IdentitiesOnly=yes',
       GIT_ASKPASS: '/usr/bin/true',
       SSH_ASKPASS: '/usr/bin/true',
+      GIT_SSH: '/usr/bin/ssh',
+      GIT_PROXY_COMMAND: '/usr/bin/true',
+      GIT_SEQUENCE_EDITOR: 'vim',
+      GIT_EXTERNAL_DIFF: '/usr/bin/true',
+      GIT_TEMPLATE_DIR: createTempDir(),
+      GIT_EXEC_PATH: execFileSync('git', ['--exec-path'], { encoding: 'utf8' }).trim(),
+      PREFIX: '/usr',
+      GIT_CONFIG_GLOBAL: os.devNull,
+      GIT_CONFIG_SYSTEM: os.devNull,
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'openchamber.test',
+      GIT_CONFIG_VALUE_0: 'from-server',
+      GIT_CONFIG_PARAMETERS: "'openchamber.parameter'='from-server'",
+      GIT_INHERITED_FLAG: 'from-server',
     };
     // Git itself hands hooks GIT_EDITOR=: when a commit message needs no editor.
     const observed = Object.keys(programs).filter((name) => name !== 'GIT_EDITOR');
+    const { repo, readHookLog } = createRepositoryLoggingHookEnv(observed);
     await withProcessEnv(programs, async () => {
-      const { repo, readHookLog } = createRepositoryLoggingHookEnv(observed);
       await commit(repo, 'init', { addAll: true });
-      expect(readHookLog()).toBe(observed.map((name) => programs[name]).join('|'));
+      const values = readHookLog().split('|');
+      const logged = Object.fromEntries(observed.map((name, index) => [name, values[index]]));
+      // Git appends the -c options of the command it runs the hook from.
+      expect(logged.GIT_CONFIG_PARAMETERS.startsWith(programs.GIT_CONFIG_PARAMETERS)).toBe(true);
+      delete logged.GIT_CONFIG_PARAMETERS;
+      expect(logged).toEqual(Object.fromEntries(Object.keys(logged).map((name) => [name, programs[name]])));
       const status = await getStatus(repo);
       expect(status.current).toBe('main');
     });
@@ -6262,5 +6426,155 @@ describe('git environment inside an AppImage', () => {
         else process.env[key] = value;
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Worktree task titles
+// ---------------------------------------------------------------------------
+
+describe('worktree task titles', () => {
+  if (!canRunGit()) {
+    it.skip('git binary not available', () => {});
+    return;
+  }
+
+  const createLinkedWorktree = () => {
+    const repo = createTempDir();
+    runGit(repo, ['init', '-b', 'main']);
+    runGit(repo, ['config', 'user.email', 'test@example.com']);
+    runGit(repo, ['config', 'user.name', 'Test User']);
+    runGit(repo, ['commit', '--allow-empty', '-m', 'init']);
+    const linked = path.join(createTempDir(), 'linked');
+    runGit(repo, ['worktree', 'add', '-b', 'feature/task', linked]);
+    return { repo, linked };
+  };
+
+  it('lists the first line of the branch description as the title', async () => {
+    const { repo, linked } = createLinkedWorktree();
+    runGit(repo, ['config', 'branch.feature/task.description', 'Login timeout fix\nsecond line']);
+
+    const entries = await getWorktrees(repo);
+    const entry = entries.find((worktree) => fs.realpathSync(worktree.path) === fs.realpathSync(linked));
+    expect(entry?.title).toBe('Login timeout fix');
+    expect(entries.find((worktree) => worktree !== entry)?.title).toBeUndefined();
+  });
+
+  it('lets the agent name the task until the user does, and never after', async () => {
+    const { repo, linked } = createLinkedWorktree();
+
+    expect(await setWorktreeTaskTitle(linked, { title: 'First name', by: 'agent' })).toMatchObject({ applied: true, title: 'First name' });
+    expect(await setWorktreeTaskTitle(linked, { title: 'Better name', by: 'agent' })).toMatchObject({ applied: true, title: 'Better name' });
+
+    expect(await setWorktreeTaskTitle(linked, { title: 'Mine', by: 'user' })).toMatchObject({ applied: true, title: 'Mine', by: 'user' });
+    expect(await setWorktreeTaskTitle(linked, { title: 'Agent again', by: 'agent' })).toMatchObject({ applied: false, title: 'Mine' });
+
+    // A description written with git itself is the user's too.
+    runGit(repo, ['config', 'branch.feature/task.description', 'From git']);
+    expect(await setWorktreeTaskTitle(linked, { title: 'Agent', by: 'agent' })).toMatchObject({ applied: false, title: 'From git' });
+
+    // The user clearing it gives the naming back to the agent.
+    expect(await setWorktreeTaskTitle(linked, { title: '', by: 'user' })).toMatchObject({ applied: true, title: '' });
+    expect(await setWorktreeTaskTitle(linked, { title: 'Agent', by: 'agent' })).toMatchObject({ applied: true, title: 'Agent' });
+  });
+
+  it('seeds a new worktree with its pull request or issue title, which the agent may replace and the user keeps', async () => {
+    const { repo, linked } = createLinkedWorktree();
+    // Written through the project's own checkout, before anyone opens the worktree.
+    await seedBranchTaskTitle(repo, 'feature/task', 'Fix session timeout when reconnecting after sleep');
+    const entry = (await getWorktrees(repo)).find((worktree) => fs.realpathSync(worktree.path) === fs.realpathSync(linked));
+    expect(entry?.title).toBe('Fix session timeout when reconnecting after sleep');
+
+    expect(await setWorktreeTaskTitle(linked, { title: 'Sleep reconnect timeout', by: 'agent' })).toMatchObject({ applied: true });
+
+    await setWorktreeTaskTitle(linked, { title: 'Mine', by: 'user' });
+    await seedBranchTaskTitle(repo, 'feature/task', 'Another issue title');
+    expect(await setWorktreeTaskTitle(linked, { title: 'Agent', by: 'agent' })).toMatchObject({ applied: false, title: 'Mine' });
+  });
+
+  it('offers a generated, unpushed branch for renaming, and stops once it is renamed or pushed', async () => {
+    const { repo, linked } = createLinkedWorktree();
+    expect(await readRenameableGeneratedBranch(linked)).toBeNull();
+
+    await markGeneratedBranchName(repo, 'feature/task');
+    expect(await readRenameableGeneratedBranch(linked)).toBe('feature/task');
+    expect(await readRenameableGeneratedBranch(linked, 'feature/task')).toBe('feature/task');
+
+    // The record travels with the branch but names the old name.
+    runGit(linked, ['branch', '-m', 'feature/task', 'fix/login-timeout']);
+    expect(await readRenameableGeneratedBranch(linked)).toBeNull();
+
+    // A branch with an upstream is followed by a remote: not offered.
+    runGit(linked, ['branch', '-m', 'fix/login-timeout', 'feature/task']);
+    expect(await readRenameableGeneratedBranch(linked)).toBe('feature/task');
+    runGit(repo, ['config', 'branch.feature/task.remote', 'origin']);
+    expect(await readRenameableGeneratedBranch(linked)).toBeNull();
+  });
+
+  it('renames only a generated, unpushed branch, to a name git accepts', async () => {
+    const { repo, linked } = createLinkedWorktree();
+    expect(await renameGeneratedWorktreeBranch(linked, 'fix/login-timeout')).toBeNull();
+    expect(runGit(linked, ['branch', '--show-current']).trim()).toBe('feature/task');
+
+    await markGeneratedBranchName(repo, 'feature/task');
+    await expect(renameGeneratedWorktreeBranch(linked, 'bad..name')).rejects.toMatchObject({ status: 400 });
+    await expect(renameGeneratedWorktreeBranch(linked, 'feature/task')).rejects.toMatchObject({ status: 400 });
+    await expect(renameGeneratedWorktreeBranch(linked, 'main')).rejects.toMatchObject({ status: 409 });
+
+    expect(await renameGeneratedWorktreeBranch(linked, 'fix/login-timeout')).toEqual({ from: 'feature/task', to: 'fix/login-timeout' });
+    expect(runGit(linked, ['branch', '--show-current']).trim()).toBe('fix/login-timeout');
+    // Renamed, it is the agent's own name now and is not renamed again.
+    expect(await renameGeneratedWorktreeBranch(linked, 'fix/other')).toBeNull();
+  });
+
+  it('records a generated name even while another git process holds the config lock', async () => {
+    const { repo, linked } = createLinkedWorktree();
+    const lock = path.join(repo, '.git', 'config.lock');
+    fs.writeFileSync(lock, '');
+    // Git holds the lock for a moment, as a worktree being made in the background does.
+    setTimeout(() => fs.rmSync(lock), 120);
+    await markGeneratedBranchName(repo, 'feature/task', 'feature/');
+    expect(await readRenameableGeneratedBranch(linked)).toBe('feature/task');
+  });
+
+  it('keeps the recorded prefix of an issue branch when renaming it', async () => {
+    const { repo, linked } = createLinkedWorktree();
+    runGit(linked, ['branch', '-m', 'feature/task', 'issue-180-merry-salamander']);
+    await markGeneratedBranchName(repo, 'issue-180-merry-salamander', 'issue-180-');
+
+    expect(await renameGeneratedWorktreeBranch(linked, 'fix/documentation-catalog'))
+      .toEqual({ from: 'issue-180-merry-salamander', to: 'issue-180-documentation-catalog' });
+  });
+
+  it('takes a name that already carries the prefix as it is', async () => {
+    const { repo, linked } = createLinkedWorktree();
+    runGit(linked, ['branch', '-m', 'feature/task', 'issue-180-merry-salamander']);
+    await markGeneratedBranchName(repo, 'issue-180-merry-salamander', 'issue-180-');
+
+    expect(await renameGeneratedWorktreeBranch(linked, 'issue-180-docs-catalog'))
+      .toEqual({ from: 'issue-180-merry-salamander', to: 'issue-180-docs-catalog' });
+  });
+
+  it('refuses a detached worktree, which has no branch to hold a title', async () => {
+    const { repo } = createLinkedWorktree();
+    const detached = path.join(createTempDir(), 'detached');
+    runGit(repo, ['worktree', 'add', '--detach', detached]);
+    await expect(setWorktreeTaskTitle(detached, { title: 'Name', by: 'user' })).rejects.toMatchObject({ status: 409 });
+    await expect(setWorktreePinned(detached, true)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('pins a worktree in its branch config, listed with the time it was pinned', async () => {
+    const { repo, linked } = createLinkedWorktree();
+    const entryOf = async () => (await getWorktrees(repo)).find((worktree) => fs.realpathSync(worktree.path) === fs.realpathSync(linked));
+
+    expect((await entryOf())?.pinnedAt).toBeUndefined();
+    expect(await setWorktreePinned(linked, true, 1234)).toEqual({ pinned: true, branch: 'feature/task' });
+    expect((await entryOf())?.pinnedAt).toBe(1234);
+    // Pinning again keeps the first pin's time.
+    await setWorktreePinned(linked, true, 5678);
+    expect((await entryOf())?.pinnedAt).toBe(1234);
+
+    expect(await setWorktreePinned(linked, false)).toEqual({ pinned: false, branch: 'feature/task' });
+    expect((await entryOf())?.pinnedAt).toBeUndefined();
   });
 });

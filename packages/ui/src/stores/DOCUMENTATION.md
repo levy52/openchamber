@@ -233,6 +233,23 @@ host switcher, a mobile instance switch). Four rules hold that:
   no host (disconnected) records none. A host whose home lookup failed still
   has a directory, and it is recorded.
 
+`useSessionTabsStore` keeps the header's working sets of session tabs on the
+device. With "Separate tabs for each project, worktree and space" off there is
+one set, `global`. With it on each project root, worktree, isolated space and
+the chats get their own, keyed by instance and folder
+(`lib/sessionTabScope.ts`), so switching servers never mixes their tabs and
+another browser keeps its own sets (tabs are what one window looks at;
+drafts and pins, which are data, live on the server). The shown set is
+`tabIds`/`previewTabId`, so every action works on what the strip shows;
+`enterScope` swaps it with the stored one. A worktree or space shown for the
+first time opens with the sessions the user started there as pinned tabs, no
+subagents; a project root opens with none, since it can hold hundreds. The
+strip enters a new scope only once the global session list has loaded, so a
+seed is never taken from a partial list and stored empty for good. At most 40
+other scopes are kept, the least recently shown dropped first. `removeTabs`
+clears a gone session from every set. Version 1 moved the version-0 single
+set into the global scope.
+
 ### Session / project coordination stores
 
 `useMultiRunStore` creates ID-bound multi-run members. Runs are projected from
@@ -398,6 +415,15 @@ an unchanged record leaves a pick made after it in place across session
 switches and reloads. Following moves the agent only (`setAgent(name, {
 keepModel: true })`): the session keeps running on its own model, so neither
 the agent's pinned nor its remembered model is applied, and Auto stays.
+
+The agent shown is the agent sent. The picker labels an open session with its
+`sessionAgentSelections` entry, while a send carries the config store's
+`currentAgentName`, which other sessions, directory snapshots and agent-list
+reloads also write. `ModelControls` therefore brings `currentAgentName` back to
+the session's entry whenever the two differ, through `setAgent` so the
+session's remembered model for that agent comes with it (`keepModel` under
+Auto). Without it, returning to a session could show Build and send the agent
+another session left behind.
 
 The model follows the same rule through `isSessionModelSwitched` /
 `markSessionModelFollowed`, keyed `provider/model#variant`. A record model the
@@ -566,7 +592,7 @@ Important properties:
 - `startWatching()` / `stopWatching()` are for true live PR consumers only. Nothing polls a watched entry: `noteBranchActivity(directory)` (an agent turn finished there) and `noteWindowReturned()` (answers older than `60s`) refresh it, both wired by `lib/trackedItems/interest.ts`
 - `refreshTargets()` supports one-shot multi-target bootstrap without turning on live watching
 - an entry's open pull or merge request is a tracked item carrying its provider id and instance, read with the bound account (`getBranchTrackedPull`, `useBranchTrackedPulls`); the server pushes its live state and `applyTrackedPulls` lays it on every entry of that request, skipping entries whose full refresh is newer and leaving semantically unchanged entries untouched.
-- PRs, merge requests and issues linked to sessions (any source-control provider) and tracker work items (Linear issues) are not in this store. A tracked thread is `{ provider, instance, kind, owner, repo, number, accountId? }` with an open provider id (`sourceControlProviderIdSchema`, so `linear` never reads as a thread) and a required instance. A tracked work item is `{ provider, kind: 'work-item', identifier }` keyed `${provider}|${IDENTIFIER}`; a Linear record stored before work items had a `kind` reads as one, under the same key, and its live state is `{ identifier, title, state: { name, category } }` (a record in the older `state.type` shape is dropped: it is a cache, and the server answers again). A GitHub thread without `instance` (the only shape that ever left it out, on the wire and in stored records) reads as github.com, so `trackedItemKey` produces the same strings and stored records stay valid. The server follows them (`packages/web/server/lib/tracked-items/`) and pushes changes over the OpenChamber event stream; `useTrackedItemsStore` holds what it sent, persisted for 12 h (at most 300 records, re-parsed on hydration, an older answer never replaces a newer one), keyed by runtime and item key. Surfaces declare what they show with `useTrackedItems` (`lib/trackedItems/interest.ts`), which sends the union only when it changes and again after a reconnect, and reads with `useTrackedPullVisualSummaries` / `useTrackedIssueStates` / `useTrackedWorkItemStates`. Pull and merge request badges go through `getLinkedChangeRequestVisualSummary`, the same colour rule as a branch's PR.
+- PRs, merge requests, issues and discussions linked to sessions (any source-control provider) and tracker work items (Linear issues) are not in this store. A tracked thread is `{ provider, instance, kind, owner, repo, number, accountId? }` (`kind` `pull`, `issue` or `discussion`; a discussion's live state is `{ title, state: open | resolved | outdated | duplicate, answered }`) with an open provider id (`sourceControlProviderIdSchema`, so `linear` never reads as a thread) and a required instance. A tracked work item is `{ provider, kind: 'work-item', identifier }` keyed `${provider}|${IDENTIFIER}`; a Linear record stored before work items had a `kind` reads as one, under the same key, and its live state is `{ identifier, title, state: { name, category } }` (a record in the older `state.type` shape is dropped: it is a cache, and the server answers again). A GitHub thread without `instance` (the only shape that ever left it out, on the wire and in stored records) reads as github.com, so `trackedItemKey` produces the same strings and stored records stay valid. The server follows them (`packages/web/server/lib/tracked-items/`) and pushes changes over the OpenChamber event stream; `useTrackedItemsStore` holds what it sent, persisted for 12 h (at most 300 records, re-parsed on hydration, an older answer never replaces a newer one), keyed by runtime and item key. Surfaces declare what they show with `useTrackedItems` (`lib/trackedItems/interest.ts`), which sends the union only when it changes and again after a reconnect, and reads with `useTrackedPullVisualSummaries` / `useTrackedIssueStates` / `useTrackedWorkItemStates`; `useTrackedIssueStates` reads a discussion as an issue's badge does (resolved is completed, outdated and duplicate not planned), so every issue badge shows one unchanged. Pull and merge request badges go through `getLinkedChangeRequestVisualSummary`, the same colour rule as a branch's PR.
 - runtime reset disposes timers, watchers, API references, and request ownership while inert namespaced snapshots remain isolated
 - auth and context requests are deduplicated per provider instance and reject completions from an older runtime generation
 - context failures preserve the last complete cached result instead of becoming authoritative empty data

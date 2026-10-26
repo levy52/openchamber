@@ -82,7 +82,9 @@ An identity is one repository's complete answer: signature, provider account (`a
 ### Worktree Operations
 - `resolveWorktreeTopLevel(directory)`: `{ root, prefix }` from one `git rev-parse --show-toplevel --show-prefix`: the checkout root and where `directory` sits inside it (`''` at the root, `ai` for `<root>/ai`). When git fails the answer is `{ root: directory }` without `prefix`, so a failed read is never taken for "at the repository root"; `GET /api/git/toplevel` passes that through and callers of `prefix` treat its absence as unknown.
 - `getWorktrees(directory)`: List all git worktrees for a repository. A directory outside any repository (or one that does not exist) is an authoritative empty list; any other git failure throws so callers keep their last known topology instead of clearing it. `GET /api/git/worktrees` answers such a failure with 500. A bare repository has no `--show-toplevel` answer, so the listing runs from the directory itself; the bare entry git lists for the repository's own directory is not a checkout and is left out of the result.
-- `observeWorktreeTopology(directory)`: Compare the repository's registered linked-worktree set with the last one seen for it and notify `subscribeWorktreeTopologyChanges` listeners when it changed. The set is fingerprinted from the `worktrees` directory under the common Git directory (mtime plus entry names), so the check is a stat and a readdir; the common directory is resolved with `git rev-parse --git-common-dir` once per requested directory and cached. The first observation only records a baseline. Never throws.
+- Task titles: a worktree's task title is its branch's description (`branch.<name>.description`, the first line, at most 120 characters), so every client reads it, `git branch -m` carries it and deleting the branch drops it. `getWorktrees` returns it as `title` from one `git config --get-regexp` read; a failed read lists the worktrees without titles. `setWorktreeTaskTitle(directory, { title, by })` writes it: `by: 'user'` always (an empty title clears it) and forgets the agent's copy; `by: 'agent'` only while the description is empty or still the one the agent set (`branch.<name>.openchamberAgentTitle`), otherwise it answers `applied: false` with the user's title. A detached worktree has no branch and is refused with 409. A worktree made for a pull request or an issue starts with that item's title: `POST /api/git/worktrees` takes it as `taskTitle` and, once the worktree exists, `seedBranchTaskTitle` writes it as the agent's (so the agent may replace it with a short name, and a user's title is never overwritten). A branch whose name OpenChamber generated (Quick worktree's `agile-chipmunk`; the client sends it as `generatedBranchName`) is recorded with `markGeneratedBranchName` (`branch.<name>.openchamberGeneratedName` holds that very name, so a rename, which carries the record along, ends it). The dialog's branch for an issue, discussion or tracker item is generated too (`issue-180-merry-salamander`); the client sends the item part as `generatedBranchPrefix`, recorded in `branch.<name>.openchamberGeneratedPrefix`, and the rename keeps it: a name without it becomes the prefix plus the name's last path segment (`fix/docs-catalog` → `issue-180-docs-catalog`), so the issue number survives whatever naming the agent picked. These records are written while a worktree made with `returnAfterDirectoryCreated` is still being set up by git in the background, which locks `.git/config` for its own writes; `writeGitConfigValue` therefore tries a write that hits that lock again for about a second and a half before giving up, else the record was silently lost and the branch never counted as generated. `readRenameableGeneratedBranch` returns the worktree's branch only while that record matches and the branch was never pushed (no upstream, no remote branch of that name): then the session context asks the agent to rename it after the task (`../session-knowledge`), which `work.name` does through `renameGeneratedWorktreeBranch`: it renames only such a branch, to a name `git check-ref-format --branch` accepts and no other branch holds, and answers null for any other branch. A write publishes a topology change so clients list again. `PUT /api/git/worktrees/title` is the user's rename.
+- Pinned worktrees: the user pins a worktree's task to the top of the sidebar, kept beside its title in the branch's config (`branch.<name>.openchamberPinned`, the time it was pinned), for the same reasons. `getWorktrees` returns it as `pinnedAt` from one more `git config --get-regexp` read; a failed read pins nothing. `setWorktreePinned(directory, pinned)` (`PUT /api/git/worktrees/pin`, body `{ pinned }`) writes or clears it and publishes the topology change; pinning a pinned worktree keeps the first time. A detached worktree is refused with 409.
+- `observeWorktreeTopology(directory)`: Compare the repository's registered linked-worktree set with the last one seen for it and notify `subscribeWorktreeTopologyChanges` listeners when it changed. The set is fingerprinted from the `worktrees` directory under the common Git directory (mtime, entry names and each entry's HEAD, so renaming a checked-out branch from a terminal counts as a change), so the check is a stat and a readdir; the common directory is resolved with `git rev-parse --git-common-dir` once per requested directory and cached. The first observation only records a baseline. Never throws.
 - `subscribeWorktreeTopologyChanges(listener)`: Listener receives `{ directories, at }`, where `directories` are every directory of that repository the server has observed, so clients can map them onto registered projects. Returns an unsubscribe function.
 - `validateWorktreeCreate(directory, input)`: Validate worktree creation parameters (mode, branchName, startRef, upstream config).
 - A new branch made from a named branch (`mode: 'new'` with a local or remote-tracking `startRef`) records that branch as its parent in `branch.<name>.gh-merge-base`. A write that fails leaves the reflog to answer and never fails the creation; deleting the branch removes the key with the rest of its config.
@@ -180,6 +182,52 @@ the `.git` path; they are not a filesystem transaction. Writes through file
 descriptors opened before the claim, changes to private recovery entries after
 the final ownership check, and metadata deletion after the final directory check
 are outside this guarantee.
+
+### Worktree archives
+
+An archived worktree is gone from disk but restorable. `archiveWorktree` records
+the checkout under `refs/openchamber/archive/<id>`: a snapshot commit of every
+change git does not ignore (the run snapshot's throwaway index, so the real
+index is untouched), whose parent is the commit the branch stood on and whose
+message is `OpenChamber worktree archive` followed by a JSON record (old path,
+branch, task title, time, the session ids the client archived with it). It
+first waits for the checkout's background population, since a snapshot taken
+before the files land records them as deleted, and refuses a checkout whose
+setup failed. Then the worktree is removed as `removeWorktree` removes it,
+keeping the branch. A removal that fails deletes the ref again only when the
+worktree is provably whole (still registered, on disk, in the snapshot's very
+state): `git worktree remove --force` deletes files before it gives up on a
+busy one, so otherwise the archive is kept and the call fails with
+`WORKTREE_ARCHIVE_PARTIAL`, the snapshot being the only copy of what went.
+Only a linked worktree git registers for this repository is archived, never
+the primary checkout or a stray folder, and one worktree is archived once at a
+time (`WORKTREE_ARCHIVE_IN_PROGRESS` for a second call).
+
+`listWorktreeArchives` reads the refs (`GET /api/git/worktrees/archives`).
+`restoreWorktreeArchive` runs in a new checkout of the archive's branch (or of
+its head commit, when the branch is gone) that the client created through the
+normal worktree creation, so setup commands run. It first waits for that
+checkout's background population (`waitForActiveWorktreeBootstrap`) and refuses
+a failed one: changes applied while git still fills the folder raced the
+checkout. It then `cherry-pick --no-commit`s the snapshot, which applies it on
+top of whatever the branch gained since, and unstages it, and deletes the ref.
+A conflict leaves git's conflict state, which holds both sides, and deletes
+the ref too: kept, the archive would still claim sessions that are back at
+work. When git refuses to apply anything (files the setup commands wrote would
+be overwritten), the ref stays and the call fails with
+`WORKTREE_ARCHIVE_NOT_APPLIED`; the client then removes the checkout it made,
+so a retry finds the branch free. `deleteWorktreeArchive` deletes the ref and, with `deleteBranch`, the
+local branch unless a checkout uses it again.
+
+#### Why the ref is the record
+
+The repository is the only store: every client of it sees the same archives,
+nothing can drift from git when branches are cleaned up by hand, and the ref
+keeps the snapshot from `gc` until the archive is deleted. `git stash` was the
+obvious alternative and was rejected: the stash stack is shared by every
+worktree of the repository, so another session could pop or drop the entry.
+Files git ignores (`node_modules`, `.env`) are not kept; the project's setup
+commands bring them back on restore.
 
 ### Worktree topology change tracking
 There is no filesystem watcher and no polling. The server notices worktree changes in two ways, and both scale with what users are doing rather than with the number of registered projects:
@@ -466,7 +514,7 @@ installed.
 
 The following functions are internal helpers used by exported functions:
 - `buildGitEnv(directory)`: Build Git environment with the directory's variables from Settings laid over the inherited environment (`../environment`, wired through `configureGitEnvironment`; the names simple-git refuses, see `createGit`, and the repository-location variables `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, ... are left out of that overlay), SSH_AUTH_SOCK resolution and `GIT_TERMINAL_PROMPT=0` (unless the server was started with it set; a Settings variable cannot turn it back on): the server has no terminal a user could answer, so a Git command that would ask for a username or password fails instead of waiting forever on a console nobody sees. Credential helpers, including GUI ones, still run before Git would prompt. Inside a Linux AppImage it also drops what the AppImage launcher added to `PATH`, `LD_LIBRARY_PATH`, `GSETTINGS_SCHEMA_DIR` and `XDG_DATA_DIRS` (`stripAppImageLauncherEnv`, #4177), so hooks run with the user's values.
-- `createGit(directory)`: Create simple-git instance with the `buildGitEnv(directory)` environment. simple-git ignores an `env` constructor option, so the env goes through `.env()`. simple-git then rejects any command whose env holds a variable that runs a program (`EDITOR`, `PAGER`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `PREFIX`, `GIT_CONFIG_*`, ...) unless the matching `allowUnsafe*` category is on, and those categories also guard `-c` and other arguments. `toSimpleGitEnv` keeps both: variables passed through unchanged from the server's environment sit on the env object's prototype, which simple-git's check (a spread of own keys) skips and `child_process.spawn` (a `for...in`, covered by Node's own tests) still passes to git; anything OpenChamber sets or changes is an own key and is checked. Do not enable env-related `allowUnsafe*` categories to make a variable work, and do not drop such variables: users rely on them for custom SSH keys and GUI credential prompts. `service.test.js` ("git environment through simple-git") fails if either simple-git internal changes.
+- `createGit(directory, { extraEnv })`: Create simple-git instance with the `buildGitEnv(directory)` environment plus `extraEnv` (a temporary `GIT_INDEX_FILE`, for example). simple-git ignores an `env` constructor option, so the env goes through `.env()`, once: simple-git 4 refuses a `GIT_*` name that is not in `allowEnvironment`, so a variable added later with `.env(name, value)` makes the command throw. simple-git 4 passes git only what `allowEnvironment` names among `GIT_*` variables and the variables that run a program (`EDITOR`, `VISUAL`, `PAGER`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `PREFIX`, `GIT_CONFIG_GLOBAL`, ...), and it rejects a command whose env holds a program-running variable unless that variable's `allowUnsafe*` category is on. `simpleGitEnvOptions` names every variable of the built env in `allowEnvironment`, and turns on the category of each program-running variable whose value is the server's own, unchanged: git would inherit it without an explicit env anyway, and users rely on them for custom SSH keys, GUI credential prompts and alternative global config files. A program-running variable OpenChamber sets or changes keeps its category off and is still refused. Those categories also guard `-c` and other arguments, so a server started with `EDITOR` set accepts `-c core.editor=...` in simple-git arguments; OpenChamber builds those arguments itself and never passes such a key. A server-inherited `GIT_CONFIG_COUNT` entry whose key simple-git guards (`credential.helper`, `core.sshCommand`, ...) makes simple-git commands fail with simple-git's message; simple-git 3 passed it through. `SIMPLE_GIT_REFUSED_ENV_CATEGORIES` copies the table of program-running names in `@simple-git/argv-parser`; compare it on every simple-git update, because a name missing from the copy makes every simple-git command fail on a machine whose environment sets it. `service.test.js` ("git environment through simple-git") sets every name in the copy except `GIT_CONFIG`, and fails on the first one simple-git refuses. `GIT_CONFIG` stays out because Git then refuses `git config --local` and `--global` ("only one config file at a time"), which breaks the author check before a commit on simple-git 3 and 4 alike.
 - `normalizeDirectoryPath(value)`: Normalize directory paths (supports ~ expansion).
 - `cleanBranchName(branch)`: Remove refs/heads/ or refs/ prefixes.
 - `parseWorktreePorcelain(raw)`: Parse `git worktree list --porcelain` output.
@@ -585,8 +633,7 @@ The following functions are internal helpers used by exported functions:
 - Apply this conversion to repository roots, Git metadata paths, and worktree list paths. Repository-relative filenames, diff content, and user-supplied paths keep their existing handling. Custom MSYS mount points are outside this conversion.
 - On Windows, `buildGitEnv` appends `noglob` to the child process's `MSYS` options so MSYS2 passes revision arguments such as `HEAD^{commit}` and `branch@{upstream}` literally. Other options and the parent environment remain unchanged. Both simple-git and direct Git commands use this environment.
 - Git for Windows' `cmd\git.exe` is a launcher that starts the real `mingw64\bin\git.exe`, so each call shows as a pair of processes (each with a hidden conhost). Keep spawning the launcher: calling the mingw binary directly drops `usr/bin` from `PATH` and breaks ssh and hooks, and needs validation on Windows before anyone tries it.
-- Before passing an explicit environment to simple-git, `createGit` removes the inherited editor, pager, askpass, SSH-command, executable/template/proxy/diff and Git-config overrides rejected by simple-git's environment scan. Matching is case-insensitive. This prevents common shell and editor environments from rejecting every repository operation without disabling argument security checks. The parent and direct Git command environments remain unchanged.
-- Simple-git operations therefore do not use `GIT_SSH_COMMAND`, `GIT_SSH`, or askpass environment overrides. Configure SSH through the repository identity or standard SSH configuration and agent instead; `SSH_AUTH_SOCK` remains available. Git config environment overrides are also omitted, while normal config files retain their existing behavior.
+- simple-git commands get the same inherited editor, pager, askpass, SSH-command and Git-config variables as direct Git commands (see `createGit`). Matching of these names is case-insensitive. Only the project overlay from Settings leaves them out.
 
 ### Error Handling
 - All exported functions should throw errors with descriptive messages.

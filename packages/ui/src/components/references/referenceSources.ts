@@ -41,6 +41,7 @@ import { currentTrackerAccountId, useTrackerAuthStore } from '@/stores/useTracke
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { normalizeProjectPath, resolveProjectForSessionDirectory } from '@/lib/projectResolution';
+import { useSpaceProjectDirectory } from '@/lib/spaces/spaces-store';
 import {
     rememberedRepositoryProvider,
     rememberRepositoryProvider,
@@ -239,11 +240,12 @@ export function useRepositoryReferenceProvider(directory: string | null): Source
     // A worktree shares its project's host, so the answer is kept per project.
     const projects = useProjectsStore((state) => state.projects);
     const worktreesByProject = useSessionUIStore((state) => state.availableWorktreesByProject);
+    const spaceProjectDirectory = useSpaceProjectDirectory(directory);
     const projectPath = React.useMemo(() => {
         if (!directory) return null;
-        const project = resolveProjectForSessionDirectory(projects, worktreesByProject, directory);
+        const project = resolveProjectForSessionDirectory(projects, worktreesByProject, directory, spaceProjectDirectory);
         return normalizeProjectPath(project?.path ?? directory);
-    }, [directory, projects, worktreesByProject]);
+    }, [directory, projects, spaceProjectDirectory, worktreesByProject]);
     const runtimeKey = getRuntimeKey();
     const remembered = React.useSyncExternalStore(
         subscribeRepositoryProviderMemory,
@@ -374,6 +376,15 @@ export function useRepositoryAcrossReferenceList(options: {
     return { ...list, items: live.items.length === 0 ? NO_ACROSS_ITEMS : live.items, followed: live.followed, contexts };
 }
 
+/**
+ * The provider a list across the repositories under a folder asks, the one
+ * `useRepositoryAcrossReferenceList` reads; null while the folders' contexts
+ * load, or without folders.
+ */
+export function useRepositoryAcrossProvider(directories: readonly string[] | null): SourceControlProvider | null {
+    return useRepositoryReadContexts(directories ?? NO_DIRECTORIES).provider;
+}
+
 /** One tracker's work items; the key carries the tracker and its account, so another account never sees this list. */
 export function useTrackerReferenceList(options: {
     enabled: boolean;
@@ -412,7 +423,7 @@ export function useTrackerReferenceList(options: {
 }
 
 /**
- * Comments of the previewed issue or PR, and a PR's size and review. A cached
+ * Comments of the previewed issue, PR or discussion, and a PR's size and review. A cached
  * answer shows at once; the host is asked only once `settled` says the
  * highlight stopped on the item.
  *
@@ -438,11 +449,11 @@ export function useRepositoryReferenceDetail(directory: string | null, reference
     const fetch = React.useCallback(async (): Promise<RepositoryReferenceDetail> => {
         if (!readable || !reference) throw new Error('The repository is not available here');
         if (!detailed) return fetchListBackedReferenceDetail(sourceControl, readable, reference);
-        const result = await sourceControl.referenceDetail(readable, { owner, repo, number });
+        const result = await sourceControl.referenceDetail(readable, kind === 'discussion' ? { owner, repo, number, kind } : { owner, repo, number });
         if (!result.connected) throw new Error(`${readable.provider} is not connected`);
         if (!result.detail) throw new Error('Not found');
         return result.detail;
-    }, [detailed, number, owner, readable, reference, repo, sourceControl]);
+    }, [detailed, kind, number, owner, readable, reference, repo, sourceControl]);
     const latest = useCachedValue(repositoryDetails, key, fetch, settled);
     // An older revision is its own answer; the latest one keeps its key, so it is shared as before.
     const pickedRevision = features.revisions && kind === 'pull' && !detailed ? revision : null;
